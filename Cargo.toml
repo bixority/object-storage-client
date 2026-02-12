@@ -12,7 +12,7 @@ base64 = "0.22.1"
 bytes = "1.11.1"
 chrono = { version = "0.4.43", features = ["serde"] }
 futures = "0.3.31"
-pyo3 = { version = "0.27.2", features = ["extension-module"] }
+pyo3 = { version = "0.28.0", features = ["extension-module"] }
 tokio = { version = "1.49.0", features = ["full"] }
 tracing = "0.1.44"
 walkdir = "2.5.0"

@@ -1,28 +1,49 @@
 [package]
-name = "object-storage-client"
-version = "0.1.0"
+authors = ["Olegs Korsaks <bixority@proton.me>"]
+categories = ["api-bindings", "filesystem"]
+description = "Unified object storage client API"
 edition = "2024"
-
-[dependencies]
-anyhow = "1.0.101"
-async-trait = "0.1.89"
-aws-config = "1.8.14"
-aws-sdk-s3 = "1.123.0"
-base64 = "0.22.1"
-bytes = "1.11.1"
-chrono = { version = "0.4.43", features = ["serde"] }
-futures = "0.3.31"
-pyo3 = { version = "0.27.2", features = ["extension-module"] }
-tokio = { version = "1.49.0", features = ["full"] }
-tracing = "0.1.44"
-walkdir = "2.5.0"
+keywords = ["object-store", "s3", "gcs", "azure", "python"]
+license = "GPL-3.0-only"
+name = "object-storage-client"
+readme = "README.md"
+repository = "https://github.com/bixority/object-storage-client"
+version = "0.0.1"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["cdylib", "rlib"]
+name = "object_storage_client"
+
+
+[dependencies]
+bytes = "1.11.1"
+futures = "0.3.32"
+object_store = { version = "0.13.1", features = ["aws", "gcp", "azure", "http"] }
+pyo3 = { version = "0.28.2", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"] }
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+url = "2.5.8"
+clap = { version = "4.5.60", features = ["derive"] }
+anyhow = "1.0.102"
+
+[[bin]]
+name = "osc"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.26.0"
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
+
+
+[profile.dev]
+opt-level = 0
+incremental = true
+debug = true
 
 [profile.release]
 codegen-units = 1
 debug = false
-lto = true
+lto = "fat"
 opt-level = "z"
 strip = true

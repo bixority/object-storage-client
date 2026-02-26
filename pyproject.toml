@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "object-storage-client"
+dynamic = ["version"]
+description = "Unified object storage client API"
+authors = [
+    { name = "Olegs Korsaks", email = "bixority@proton.me" }
+]
+license-files = [ "LICENSE" ]
+readme = "README.md"
+requires-python = ">=3.14.3,<3.15.0"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+]
+keywords = ["object-store", "s3", "gcs", "azure", "python"]
+
+[project.urls]
+Homepage = "https://github.com/bixority/object-storage-client"
+Repository = "https://github.com/bixority/object-storage-client"
+Documentation = "https://github.com/bixority/object-storage-client/blob/main/README.md"
+
+[tool.maturin]
+features = ["python"]
+module-name = "object_storage_client"

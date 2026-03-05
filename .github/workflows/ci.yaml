@@ -141,11 +141,27 @@ jobs:
           - os: ubuntu-latest
             arch: x86_64
             target: x86_64-unknown-linux-gnu
-            compatibility: manylinux2014
+            compatibility: manylinux_2_17
+            py-abi: cp313
+            python-version: "3.13"
+          - os: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            compatibility: manylinux_2_17
+            py-abi: cp314
+            python-version: "3.14"
           - os: macos-latest
             arch: aarch64
             target: aarch64-apple-darwin
             compatibility: off
+            py-abi: cp313
+            python-version: "3.13"
+          - os: macos-latest
+            arch: aarch64
+            target: aarch64-apple-darwin
+            compatibility: off
+            py-abi: cp314
+            python-version: "3.14"
     #          - os: windows-latest
     #            arch: x86_64
     #            target: x86_64-pc-windows-msvc
@@ -173,6 +189,12 @@ jobs:
             --config-setting="target=${{ matrix.target }}" \
             --config-setting="compatibility=${{ matrix.compatibility }}" \
             --python ${{ matrix.python-version }}
+        env:
+          MATURIN_PY_ABI: ${{ matrix.py-abi }}
+          MATURIN_COMPATIBILITY: ${{ matrix.compatibility }}
+
+      - name: List built wheels
+        run: ls -R dist/
 
       - name: Upload wheels
         uses: actions/upload-artifact@v5
@@ -188,6 +210,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v5
+      - name: Clean dist directory
+        run: rm -rf dist && mkdir dist
       - uses: actions/download-artifact@v5
         with:
           pattern: wheels-*

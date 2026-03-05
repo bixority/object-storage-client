@@ -158,7 +158,10 @@ impl ObjectStorageClient {
     pub async fn list(&self, url: &str) -> Result<Vec<String>> {
         let parsed_url = Url::parse(url)?;
         let (store, path) = Self::get_store(&parsed_url)?;
-        let prefix = path.to_string();
+        let mut prefix = path.to_string();
+        if !prefix.is_empty() && !prefix.ends_with('/') {
+            prefix.push('/');
+        }
         let mut list_stream = store.as_ref().list(Some(&path));
         let mut results = Vec::new();
         while let Some(meta) = list_stream.next().await {

@@ -202,7 +202,19 @@ impl ObjectStorageClient {
             && from_parsed_url.host_str() == to_parsed_url.host_str();
 
         if same_store {
-            from_store.as_ref().copy(&from_path, &to_path).await?;
+            match from_store.as_ref().copy(&from_path, &to_path).await {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("os error 18") => {
+                    // Fallback for cross-device copy
+                    let result = from_store.as_ref().get(&from_path).await?;
+                    let bytes = result.bytes().await?;
+                    to_store
+                        .as_ref()
+                        .put(&to_path, PutPayload::from(bytes))
+                        .await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
         } else {
             // Cross-provider copy
             let result = from_store.as_ref().get(&from_path).await?;
@@ -235,7 +247,20 @@ impl ObjectStorageClient {
             && from_parsed_url.host_str() == to_parsed_url.host_str();
 
         if same_store {
-            from_store.as_ref().rename(&from_path, &to_path).await?;
+            match from_store.as_ref().rename(&from_path, &to_path).await {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("os error 18") => {
+                    // Fallback for cross-device move
+                    let result = from_store.as_ref().get(&from_path).await?;
+                    let bytes = result.bytes().await?;
+                    to_store
+                        .as_ref()
+                        .put(&to_path, PutPayload::from(bytes))
+                        .await?;
+                    from_store.as_ref().delete(&from_path).await?;
+                }
+                Err(e) => return Err(e.into()),
+            }
         } else {
             // Cross-provider move
             let result = from_store.as_ref().get(&from_path).await?;

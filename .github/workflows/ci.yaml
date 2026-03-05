@@ -167,7 +167,7 @@ jobs:
         run: |
           uv build \
             --wheel \
-            --locked \
+            --config-setting="rustc-args=--locked"
             --target ${{ matrix.target }} \
             --python ${{ matrix.python-version }}
 

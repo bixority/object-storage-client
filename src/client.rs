@@ -66,6 +66,13 @@ impl ObjectStorageClient {
                     host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
                 let builder =
                     object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+                
+                let builder = if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+                    builder.with_skip_signature(true)
+                } else {
+                    builder
+                };
+
                 let store = builder.build()?;
                 Ok((Arc::new(store), object_path))
             }
@@ -74,6 +81,15 @@ impl ObjectStorageClient {
                     host.ok_or_else(|| Error::Generic("Missing bucket in GCS URL".into()))?;
                 let builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket);
+
+                let builder = if std::env::var("GOOGLE_SERVICE_ACCOUNT").is_err()
+                    && std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_err()
+                {
+                    builder.with_skip_signature(true)
+                } else {
+                    builder
+                };
+
                 let store = builder.build()?;
                 Ok((Arc::new(store), object_path))
             }
@@ -82,6 +98,16 @@ impl ObjectStorageClient {
                     host.ok_or_else(|| Error::Generic("Missing container in Azure URL".into()))?;
                 let builder = object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_container_name(container);
+
+                let builder = if std::env::var("AZURE_STORAGE_ACCOUNT_NAME").is_err()
+                    && std::env::var("AZURE_STORAGE_ACCESS_KEY").is_err()
+                    && std::env::var("AZURE_STORAGE_SAS_TOKEN").is_err()
+                {
+                    builder.with_skip_signature(true)
+                } else {
+                    builder
+                };
+
                 let store = builder.build()?;
                 Ok((Arc::new(store), object_path))
             }
@@ -155,11 +181,19 @@ impl ObjectStorageClient {
     pub async fn list(&self, url: &str) -> Result<Vec<String>> {
         let parsed_url = Url::parse(url)?;
         let (store, path) = Self::get_store(&parsed_url)?;
+        let prefix = path.to_string();
         let mut list_stream = store.as_ref().list(Some(&path));
         let mut results = Vec::new();
         while let Some(meta) = list_stream.next().await {
             let meta = meta?;
-            results.push(meta.location.to_string());
+            let mut location = meta.location.to_string();
+            if !prefix.is_empty() && location.starts_with(&prefix) {
+                location = location[prefix.len()..].to_string();
+            }
+            if location.starts_with('/') {
+                location = location[1..].to_string();
+            }
+            results.push(location);
         }
         Ok(results)
     }
@@ -203,7 +237,7 @@ impl ObjectStorageClient {
 
         if same_store {
             match from_store.as_ref().copy(&from_path, &to_path).await {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) if e.to_string().contains("os error 18") => {
                     // Fallback for cross-device copy
                     let result = from_store.as_ref().get(&from_path).await?;
@@ -248,7 +282,7 @@ impl ObjectStorageClient {
 
         if same_store {
             match from_store.as_ref().rename(&from_path, &to_path).await {
-                Ok(_) => {}
+                Ok(()) => {}
                 Err(e) if e.to_string().contains("os error 18") => {
                     // Fallback for cross-device move
                     let result = from_store.as_ref().get(&from_path).await?;

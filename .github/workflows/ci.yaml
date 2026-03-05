@@ -141,9 +141,11 @@ jobs:
           - os: ubuntu-latest
             arch: x86_64
             target: x86_64-unknown-linux-gnu
+            compatibility: manylinux2014
           - os: macos-latest
             arch: aarch64
             target: aarch64-apple-darwin
+            compatibility: off
     #          - os: windows-latest
     #            arch: x86_64
     #            target: x86_64-pc-windows-msvc
@@ -169,6 +171,7 @@ jobs:
             --wheel \
             --config-setting="rustc-args=--locked" \
             --config-setting="target=${{ matrix.target }}" \
+            --config-setting="compatibility=${{ matrix.compatibility }}" \
             --python ${{ matrix.python-version }}
 
       - name: Upload wheels

@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage-client"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "bytes",

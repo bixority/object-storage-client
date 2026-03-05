@@ -157,28 +157,25 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Install Python
-        uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
+          enable-cache: true
           python-version: "${{ matrix.python-version }}"
-
-      - name: Install maturin
-        run: pip install maturin
 
       - name: Build wheel
         run: |
-          maturin build \
-            --release \
+          uv build \
+            --wheel \
             --locked \
             --target ${{ matrix.target }} \
-            --features python \
-            --interpreter python3
+            --python ${{ matrix.python-version }}
 
       - name: Upload wheels
         uses: actions/upload-artifact@v5
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.arch }}-py${{ matrix.python-version }})
-          path: target/wheels/*.whl
+          path: dist/*.whl
 
   # optional publish to PyPI
   publish-to-pypi:
@@ -192,21 +189,15 @@ jobs:
         with:
           path: dist
 
-      - name: Install Python + maturin
-        uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.14"
 
-      - run: pip install maturin
-
       - name: Build source distribution (sdist)
-        run: maturin sdist --out dist
+        run: uv build --sdist --python 3.14
 
       - name: Publish to PyPI
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          # Upload built wheels from matrix builds
-          find dist -name "*.whl" -exec maturin upload --skip-existing {} +
-          # Upload source distribution produced above
-          find dist -name "*.tar.gz" -exec maturin upload --skip-existing {} +
+          # Upload built wheels and sdist
+          uv publish dist/* --token ${{ secrets.PYPI_API_TOKEN }}

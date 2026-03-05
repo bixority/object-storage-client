@@ -16,6 +16,7 @@ classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
 ]
 keywords = ["object-store", "s3", "gcs", "azure", "python"]
@@ -27,4 +28,4 @@ Documentation = "https://github.com/bixority/object-storage-client/blob/main/REA
 
 [tool.maturin]
 features = ["python"]
-module-name = "object_storage_client"
+module-name = "object_storage_client._internal"

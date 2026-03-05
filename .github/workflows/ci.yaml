@@ -1,232 +1,149 @@
-name: Build and push release
+name: Build and publish release
 
 on:
   release:
-    types: [ published ]
+    types: [published]
 
 permissions:
   contents: read
-
-env:
-  REGISTRY: ghcr.io
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+
   test:
-    name: Test
-    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+
     strategy:
+      fail-fast: false
       matrix:
-        build: [ stable, beta, nightly ]
-        include:
-          - build: stable
-            os: ubuntu-latest
-            rust: stable
-          - build: beta
-            os: ubuntu-latest
-            rust: beta
-          - build: nightly
-            os: ubuntu-latest
-            rust: nightly
-#          - build: macos
-#            os: macos-latest
-#            rust: stable
+        toolchain: [stable, beta, nightly]
+
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust (rustup)
-        run: rustup update ${{ matrix.rust }} --no-self-update && rustup default ${{ matrix.rust }}
-        shell: bash
-      - name: Run cargo test
-        run: cargo test
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all-features
 
   rustfmt:
-    name: Rustfmt
+    name: Rustfmt + Clippy
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+
       - name: Install Rust
-        run: rustup update stable && rustup default stable && rustup component add rustfmt clippy
-      - name: Rustfmt
-        run: cargo fmt -- --check
-      - name: Clippy
-        run: cargo clippy -- -D warnings -W clippy::pedantic
-
-  prepare:
-    needs:
-      - test
-      - rustfmt
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Get lowercase GitHub username
-        id: repository
-        uses: ASzc/change-string-case-action@v6
+        uses: dtolnay/rust-toolchain@stable
         with:
-          string: ${{ github.repository }}
+          components: rustfmt, clippy
 
-      - name: Set outputs
-        id: set-outputs
-        run: |
-          echo 'image=ghcr.io/${{ steps.repository.outputs.lowercase }}' >> "${GITHUB_OUTPUT}"
-          # Only enable push on release event with action 'published'
-          echo 'push=${{ github.event_name == 'release' && github.event.action == 'published' }}' >> "${GITHUB_OUTPUT}"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
-      - name: Get short SHA
-        id: short-sha
-        run: echo "short_sha=${GITHUB_SHA:0:12}" >> $GITHUB_ENV && echo "short_sha=${GITHUB_SHA:0:12}" >> $GITHUB_OUTPUT
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: Extract tag name
-        id: extract_tag
-        if: github.event_name == 'release'
-        run: |
-          echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
 
-      - name: Extract branch name
-        shell: bash
-        run: echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
-        id: extract_branch
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ steps.set-outputs.outputs.image }}
-          tags: |
-            type=raw,value=${{ steps.extract_tag.outputs.tag }}
-    #            type=raw,value=latest
-
-    outputs:
-      image: ${{ steps.set-outputs.outputs.image }}
-      push: ${{ steps.set-outputs.outputs.push }}
-      meta-version: ${{ steps.meta.outputs.version }}
-      meta-labels: ${{ steps.meta.outputs.labels }}
-      meta-json: ${{ steps.meta.outputs.json }}
-      tag: ${{ steps.extract_tag.outputs.tag }}  # Save the extracted tag name to outputs
 
   publish-crate:
-    name: Publish Crate to Codeberg
-    needs:
-      - prepare
+    name: Publish crate to Codeberg
+    needs: [test, rustfmt]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Publish crate to codeberg
+      - name: Publish crate
         run: cargo publish --registry bixority-codeberg
         env:
           CARGO_REGISTRIES_BIXORITY_CODEBERG_TOKEN: Bearer ${{ secrets.CODEBERG_TOKEN }}
 
+
   build-wheels:
-    name: Build wheels (${{ matrix.os }} - ${{ matrix.arch }} - py${{ matrix.python-version }})
+    name: Build wheels (${{ matrix.os }} / py${{ matrix.python }})
     needs: publish-crate
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14"]
-        os: [ubuntu-latest, macos-latest]
-        include:
-          - os: ubuntu-latest
-            arch: x86_64
-            target: x86_64-unknown-linux-gnu
-            compatibility: manylinux_2_17
-            py-abi: cp313
-            python-version: "3.13"
-          - os: ubuntu-latest
-            arch: x86_64
-            target: x86_64-unknown-linux-gnu
-            compatibility: manylinux_2_17
-            py-abi: cp314
-            python-version: "3.14"
-          - os: macos-latest
-            arch: aarch64
-            target: aarch64-apple-darwin
-            compatibility: off
-            py-abi: cp313
-            python-version: "3.13"
-          - os: macos-latest
-            arch: aarch64
-            target: aarch64-apple-darwin
-            compatibility: off
-            py-abi: cp314
-            python-version: "3.14"
-    #          - os: windows-latest
-    #            arch: x86_64
-    #            target: x86_64-pc-windows-msvc
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.13", "3.14"]
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
         with:
-          toolchain: stable
-          components: rustfmt, clippy
+          command: build
+          manylinux: auto
+          args: >
+            --release
+            --strip
+            --interpreter python${{ matrix.python }}
+            --out dist
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v6
         with:
-          enable-cache: true
-          python-version: "${{ matrix.python-version }}"
-
-      - name: Build wheel
-        run: |
-          uv build \
-            --wheel \
-            --config-setting="rustc-args=--locked" \
-            --config-setting="target=${{ matrix.target }}" \
-            --config-setting="compatibility=${{ matrix.compatibility }}" \
-            --python ${{ matrix.python-version }}
-        env:
-          MATURIN_PY_ABI: ${{ matrix.py-abi }}
-          MATURIN_COMPATIBILITY: ${{ matrix.compatibility }}
-
-      - name: List built wheels
-        run: ls -R dist/
-
-      - name: Upload wheels
-        uses: actions/upload-artifact@v5
-        with:
-          name: wheels-${{ matrix.os }}-${{ matrix.arch }}-py${{ matrix.python-version }}
+          name: wheels-${{ matrix.os }}-py${{ matrix.python }}
           path: dist/*.whl
 
-  # optional publish to PyPI
+
+  build-sdist:
+    name: Build source distribution
+    needs: publish-crate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+
   publish-to-pypi:
     name: Publish to PyPI
+    needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    needs: build-wheels
     if: startsWith(github.ref, 'refs/tags/v')
+
     steps:
-      - uses: actions/checkout@v5
-      - name: Clean dist directory
-        run: rm -rf dist && mkdir dist
-      - uses: actions/download-artifact@v5
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
         with:
-          pattern: wheels-*
           path: dist
           merge-multiple: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.14"
-
-      - name: Build source distribution (sdist)
-        run: uv build --sdist --python 3.14
+        run: pip install uv
 
       - name: Publish to PyPI
-        run: |
-          # Upload built wheels and sdist
-          uv publish dist/* --token ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish dist/* --token ${{ secrets.PYPI_API_TOKEN }}

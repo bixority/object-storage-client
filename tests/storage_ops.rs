@@ -2,20 +2,21 @@ use object_storage_client::ObjectStorageClient;
 use tempfile::tempdir;
 
 #[tokio::test]
+#[ignore="functional"]
 async fn test_object_lifecycle() -> anyhow::Result<()> {
     // Setup a temporary directory to act as our local storage "bucket"
     let tmp_dir = tempdir()?;
     let bucket_path = tmp_dir.path().to_string_lossy();
     let bucket_url = if cfg!(windows) {
-        format!("file:///{}", bucket_path.replace("\\", "/"))
+        format!("file:///{}", bucket_path.replace('\\', "/"))
     } else {
-        format!("file://{}", bucket_path)
+        format!("file://{bucket_path}")
     };
 
     let client = ObjectStorageClient::new();
 
     // 1. Create a file and put it to storage
-    let file_url = format!("{}/test_file.txt", bucket_url);
+    let file_url = format!("{bucket_url}/test_file.txt");
     let content = b"Hello, Object Storage!";
     client.put(&file_url, content.to_vec()).await?;
 
@@ -27,7 +28,7 @@ async fn test_object_lifecycle() -> anyhow::Result<()> {
     );
 
     // 3. Move it
-    let moved_file_url = format!("{}/moved_test_file.txt", bucket_url);
+    let moved_file_url = format!("{bucket_url}/moved_test_file.txt");
     client.move_object(&file_url, &moved_file_url).await?;
 
     // 4. List again to check the movement

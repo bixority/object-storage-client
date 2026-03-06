@@ -28,4 +28,5 @@ Documentation = "https://github.com/bixority/object-storage-client/blob/main/REA
 
 [tool.maturin]
 features = ["python"]
-module-name = "object_storage_client._internal"
+python-source = "python"
+module-name = "object_storage_client._object_storage_client"

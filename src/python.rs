@@ -139,7 +139,7 @@ impl ObjectStorageClient {
 }
 
 #[pymodule]
-fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _object_storage_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ObjectStorageClient>()?;
     Ok(())
 }

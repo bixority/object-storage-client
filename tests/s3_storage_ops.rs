@@ -8,7 +8,7 @@ use object_storage_client::ObjectStorageClient;
 /// `AWS_REGION`=...
 /// Then run with: cargo test --test `s3_storage_ops` -- --ignored
 #[tokio::test]
-#[ignore="functional"]
+#[ignore = "functional"]
 async fn test_s3_object_lifecycle() -> anyhow::Result<()> {
     let bucket = std::env::var("S3_BUCKET")
         .expect("S3_BUCKET environment variable must be set to run this test");

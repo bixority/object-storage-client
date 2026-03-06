@@ -2,7 +2,7 @@ use object_storage_client::ObjectStorageClient;
 use tempfile::tempdir;
 
 #[tokio::test]
-#[ignore="functional"]
+#[ignore = "functional"]
 async fn test_object_lifecycle() -> anyhow::Result<()> {
     // Setup a temporary directory to act as our local storage "bucket"
     let tmp_dir = tempdir()?;

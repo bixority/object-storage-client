@@ -22,7 +22,7 @@ async fn test_s3_object_lifecycle() -> anyhow::Result<()> {
     // 1. Create a file and put it to storage
     let file_url = format!("{bucket_url}test_file_s3.txt");
     let content = b"Hello, S3 Object Storage!";
-    client.put(&file_url, content).await?;
+    client.put(&file_url, &content[..]).await?;
 
     // 2. List it in bucket
     let list = client.list(&bucket_url).await?;

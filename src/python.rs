@@ -1,4 +1,5 @@
 use crate::client::ObjectStorageClient as InternalClient;
+use bytes::Bytes;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
@@ -27,24 +28,36 @@ impl ObjectStorageClient {
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-            let result = Python::try_attach(|py| {
+            let result = pyo3::Python::attach(|py| {
                 let py_bytes = PyBytes::new(py, &bytes);
                 py_bytes.into_any().unbind()
             });
-            match result {
-                Some(res) => Ok(res),
-                None => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "Failed to attach to Python",
-                )),
-            }
+            Ok(result)
         })
     }
 
-    fn put<'py>(&self, py: Python<'py>, url: String, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+    fn put<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        data: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
+
+        #[allow(deprecated)]
+        let bytes = if let Ok(py_bytes) = data.downcast::<PyBytes>() {
+            Bytes::copy_from_slice(py_bytes.as_bytes())
+        } else if let Ok(vec) = data.extract::<Vec<u8>>() {
+            Bytes::from(vec)
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Expected bytes or list of integers",
+            ));
+        };
+
         future_into_py(py, async move {
             inner
-                .put(&url, &data)
+                .put(&url, bytes)
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             Ok(())
@@ -81,7 +94,7 @@ impl ObjectStorageClient {
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-            let result = Python::try_attach(|py| {
+            let result = pyo3::Python::attach(|py| {
                 let dict = PyDict::new(py);
                 dict.set_item("location", meta.location.to_string())?;
                 dict.set_item("last_modified", meta.last_modified.to_rfc3339())?;
@@ -94,14 +107,7 @@ impl ObjectStorageClient {
                 }
                 Ok(dict.into_any().unbind())
             });
-            match result {
-                Some(res) => {
-                    res.map_err(|e: PyErr| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-                }
-                None => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "Failed to attach to Python",
-                )),
-            }
+            result.map_err(|e: PyErr| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 

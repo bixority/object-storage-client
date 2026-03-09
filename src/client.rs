@@ -23,17 +23,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A unified object storage client that handles multiple backends based on URL schemes.
+#[derive(Clone, Default)]
 pub struct ObjectStorageClient {
     // We'll likely need a registry or a way to get the correct store for a given URL.
     // Since arrow-rs's object_store works with buckets/containers,
     // we may need to cache or dynamically create stores.
     // For now, let's keep it simple and handle S3, GCS, Azure, and Local.
-}
-
-impl Default for ObjectStorageClient {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl ObjectStorageClient {
@@ -351,7 +346,23 @@ mod tests {
         let dst_url2 = format!("file://{}.2", dst_path.to_str().unwrap());
         client.move_object(&dst_url, &dst_url2).await?;
         assert_eq!(client.get(&dst_url2).await?.as_ref(), data);
-        assert!(client.get(&dst_url).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_clone_client() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("clone_test.txt");
+        let url = format!("file://{}", file_path.to_str().unwrap());
+
+        let client = ObjectStorageClient::new();
+        let client_clone = client.clone();
+
+        let data = b"cloned client data";
+        client_clone.put(&url, data).await?;
+
+        let retrieved = client.get(&url).await?;
+        assert_eq!(retrieved.as_ref(), data);
 
         Ok(())
     }

@@ -96,7 +96,7 @@ impl ObjectStorageClient {
 
             let result = pyo3::Python::attach(|py| {
                 let dict = PyDict::new(py);
-                dict.set_item("location", meta.location.to_string())?;
+                dict.set_item("location", meta.location.clone())?;
                 dict.set_item("last_modified", meta.last_modified.to_rfc3339())?;
                 dict.set_item("size", meta.size)?;
                 if let Some(e_tag) = meta.e_tag {

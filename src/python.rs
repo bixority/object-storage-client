@@ -44,7 +44,7 @@ impl ObjectStorageClient {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
             inner
-                .put(&url, data)
+                .put(&url, &data)
                 .await
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
             Ok(())

@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read source file {}", src.display()))?;
             let dst_url = to_url(&dst);
             println!("Uploading {} to {dst_url}", src.display());
-            client.put(&dst_url, data).await?;
+            client.put(&dst_url, &data).await?;
         }
         Commands::Get { src, dst } => {
             let src_url = to_url(&src);

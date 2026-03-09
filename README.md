@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Upload data
     let data = b"Hello from Rust!";
-    client.put("s3://my-bucket/hello.txt", data.to_vec()).await?;
+    client.put("s3://my-bucket/hello.txt", &data).await?;
 
     // Download data
     let retrieved = client.get("s3://my-bucket/hello.txt").await?;

@@ -125,10 +125,10 @@ impl ObjectStorageClient {
     /// - The URL is invalid.
     /// - The scheme is unsupported.
     /// - There is an error putting the object to the store.
-    pub async fn put(&self, url: &str, data: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, url: &str, data: &[u8]) -> Result<()> {
         let parsed_url = Url::parse(url)?;
         let (store, path) = Self::get_store(&parsed_url)?;
-        store.as_ref().put(&path, PutPayload::from(data)).await?;
+        store.as_ref().put(&path, PutPayload::from(data.to_vec())).await?;
         Ok(())
     }
 
@@ -305,7 +305,7 @@ mod tests {
 
         // Put
         let data = b"hello world";
-        client.put(&url, data.to_vec()).await?;
+        client.put(&url, data).await?;
 
         // Get
         let retrieved = client.get(&url).await?;
@@ -339,7 +339,7 @@ mod tests {
         let data = b"copy move test";
 
         // Test Copy
-        client.put(&src_url, data.to_vec()).await?;
+        client.put(&src_url, data).await?;
         client.copy(&src_url, &dst_url).await?;
         assert_eq!(client.get(&dst_url).await?.as_ref(), data);
         assert_eq!(client.get(&src_url).await?.as_ref(), data);

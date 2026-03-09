@@ -128,7 +128,10 @@ impl ObjectStorageClient {
     pub async fn put(&self, url: &str, data: &[u8]) -> Result<()> {
         let parsed_url = Url::parse(url)?;
         let (store, path) = Self::get_store(&parsed_url)?;
-        store.as_ref().put(&path, PutPayload::from(data.to_vec())).await?;
+        store
+            .as_ref()
+            .put(&path, PutPayload::from(data.to_vec()))
+            .await?;
         Ok(())
     }
 

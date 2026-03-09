@@ -16,7 +16,7 @@ name = "object_storage_client"
 
 
 [dependencies]
-bytes = "1.11.1"
+bytes = "1.11"
 futures = "0.3.32"
 object_store = { version = "0.13.1", features = ["aws", "gcp", "azure", "http"] }
 pyo3 = { version = "0.28.2", features = ["extension-module"], optional = true }

@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.0.15"
+version = "0.0.16"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -17,15 +17,15 @@ name = "object_storage_client"
 
 [dependencies]
 bytes = "1.11"
-futures = "0.3.32"
-object_store = { version = "0.13.1", features = ["aws", "gcp", "azure", "http"] }
-pyo3 = { version = "0.28.2", features = ["extension-module"], optional = true }
-pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime"], optional = true }
-thiserror = "2.0.18"
-tokio = { version = "1.50.0", features = ["full"] }
-url = "2.5.8"
-clap = { version = "4.5.60", features = ["derive"] }
-anyhow = "1.0.102"
+futures = "0.3"
+object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
+thiserror = "2.0"
+tokio = { version = "1.50", features = ["full"] }
+url = "2.5"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
 
 [features]
 python = ["dep:pyo3", "dep:pyo3-async-runtimes"]
@@ -35,8 +35,8 @@ name = "osc"
 path = "src/main.rs"
 
 [dev-dependencies]
-tempfile = "3.26.0"
-tokio = { version = "1.50.0", features = ["full", "test-util"] }
+tempfile = "3.26"
+tokio = { version = "1.50", features = ["full", "test-util"] }
 
 
 [profile.dev]

@@ -80,7 +80,7 @@ impl ObjectStorageClient {
         };
         let object_path = ObjectPath::from(path);
 
-        let key = (scheme.to_string(), host.map(std::string::ToString::to_string));
+        let key = (scheme.to_string(), host.map(ToString::to_string));
         if let Some(store) = self.stores.get(&key) {
             return Ok((Arc::clone(store.value()), object_path));
         }

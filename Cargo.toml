@@ -37,7 +37,7 @@ name = "osc"
 path = "src/main.rs"
 
 [dev-dependencies]
-tempfile = "3.26"
+tempfile = "3.27"
 tokio = { version = "1.50", features = ["full", "test-util"] }
 
 

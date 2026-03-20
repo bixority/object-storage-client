@@ -87,10 +87,16 @@ impl ObjectStorageClient {
 
         let store: Arc<dyn ObjectStore> = match scheme {
             "s3" => {
+                let s3_secure = std::env::var("S3_SECURE").unwrap_or_else(|_| "true".into());
+
                 let bucket =
                     host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
-                let builder =
+                let mut builder =
                     object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+
+                if s3_secure == "false" {
+                    builder = builder.with_allow_http(true);
+                }
 
                 Arc::new(builder.build()?)
             }

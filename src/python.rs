@@ -20,7 +20,7 @@ impl ObjectStorageClient {
         }
     }
 
-    fn get<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+    fn get_object<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let bytes = inner
@@ -36,7 +36,7 @@ impl ObjectStorageClient {
         })
     }
 
-    fn put<'py>(
+    fn put_object<'py>(
         &self,
         py: Python<'py>,
         url: String,
@@ -64,7 +64,7 @@ impl ObjectStorageClient {
         })
     }
 
-    fn delete<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+    fn delete_object<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
             inner
@@ -75,7 +75,7 @@ impl ObjectStorageClient {
         })
     }
 
-    fn list<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+    fn list_objects<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
             let results = inner
@@ -111,7 +111,7 @@ impl ObjectStorageClient {
         })
     }
 
-    fn copy<'py>(
+    fn copy_object<'py>(
         &self,
         py: Python<'py>,
         from_url: String,

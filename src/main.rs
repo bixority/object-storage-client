@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use object_storage_client::ObjectStorageClient;
 use std::fs;
 use std::path::PathBuf;
+
+use tokio::io::{self, AsyncWrite, AsyncWriteExt, BufWriter};
 
 #[derive(Parser)]
 #[command(name = "osc")]
@@ -14,59 +17,75 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Copy an object from source to destination
-    Cp {
-        /// Source URL or path
-        src: String,
-        /// Destination URL or path
-        dst: String,
-    },
-    /// Move an object from source to destination
-    Mv {
-        /// Source URL or path
-        src: String,
-        /// Destination URL or path
-        dst: String,
-    },
-    /// Upload a local file to object storage
-    Put {
-        /// Local file path
-        src: PathBuf,
-        /// Destination URL
-        dst: String,
-    },
-    /// Download an object to local filesystem
-    Get {
-        /// Source URL
-        src: String,
-        /// Local file path
-        dst: PathBuf,
-    },
-    /// List objects under a prefix
-    Ls {
-        /// URL prefix
-        url: String,
-    },
-    /// Delete an object
-    Rm {
-        /// URL to delete
-        url: String,
-    },
+    Cp { src: String, dst: String },
+    Mv { src: String, dst: String },
+    Put { src: PathBuf, dst: String },
+    Get { src: String, dst: PathBuf },
+    GetStream { src: String, dst: Option<PathBuf> },
+    Ls { url: String },
+    Rm { url: String },
 }
 
 fn to_url(s: &str) -> String {
     if s.contains("://") {
         s.to_string()
     } else {
-        // Convert local path to file:// URL
         let path = fs::canonicalize(s).unwrap_or_else(|_| {
             std::env::current_dir().map_or_else(|_| PathBuf::from(s), |p| p.join(s))
         });
+
         let mut path_str = path.to_string_lossy().into_owned();
         if !path_str.starts_with('/') {
             path_str = format!("/{path_str}");
         }
+
         format!("file://{path_str}")
+    }
+}
+
+enum Output {
+    Stdout(io::Stdout),
+
+    /// Buffered writer reduces syscall overhead (portable optimization)
+    BufferedFile(BufWriter<tokio::fs::File>),
+}
+
+impl Output {
+    fn new_file(file: tokio::fs::File) -> Self {
+        Self::BufferedFile(BufWriter::with_capacity(64 * 1024, file))
+    }
+}
+
+impl AsyncWrite for Output {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        match &mut *self {
+            Output::Stdout(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Output::BufferedFile(f) => std::pin::Pin::new(f).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            Output::Stdout(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Output::BufferedFile(f) => std::pin::Pin::new(f).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        match &mut *self {
+            Output::Stdout(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Output::BufferedFile(f) => std::pin::Pin::new(f).poll_shutdown(cx),
+        }
     }
 }
 
@@ -79,40 +98,87 @@ async fn main() -> Result<()> {
         Commands::Cp { src, dst } => {
             let src_url = to_url(&src);
             let dst_url = to_url(&dst);
-            println!("Copying {src_url} to {dst_url}");
+
+            println!("Copy {src_url} -> {dst_url}");
             client.copy(&src_url, &dst_url).await?;
         }
+
         Commands::Mv { src, dst } => {
             let src_url = to_url(&src);
             let dst_url = to_url(&dst);
-            println!("Moving {src_url} to {dst_url}");
+
+            println!("Move {src_url} -> {dst_url}");
             client.move_object(&src_url, &dst_url).await?;
         }
+
         Commands::Put { src, dst } => {
-            let data = fs::read(&src)
-                .with_context(|| format!("Failed to read source file {}", src.display()))?;
+            let data =
+                fs::read(&src).with_context(|| format!("failed to read {}", src.display()))?;
+
             let dst_url = to_url(&dst);
-            println!("Uploading {} to {dst_url}", src.display());
+
+            println!("Upload {} -> {dst_url}", src.display());
             client.put(&dst_url, data).await?;
         }
+
         Commands::Get { src, dst } => {
             let src_url = to_url(&src);
-            println!("Downloading {src_url} to {}", dst.display());
+
+            println!("Download {src_url} -> {}", dst.display());
+
             let data = client.get(&src_url).await?;
-            fs::write(&dst, data)
-                .with_context(|| format!("Failed to write destination file {}", dst.display()))?;
+
+            fs::write(&dst, data).with_context(|| format!("failed to write {}", dst.display()))?;
         }
+
+        Commands::GetStream { src, dst } => {
+            let src_url = to_url(&src);
+
+            println!("Streaming {src_url}");
+
+            let mut stream = client
+                .get_stream(&src_url)
+                .await
+                .context("failed to start stream")?;
+
+            let mut output: Output = match dst {
+                Some(path) => {
+                    println!("Writing to file {}", path.display());
+
+                    let file = tokio::fs::File::create(&path)
+                        .await
+                        .with_context(|| format!("failed to create {}", path.display()))?;
+
+                    Output::new_file(file)
+                }
+                None => Output::Stdout(tokio::io::stdout()),
+            };
+
+            // streaming loop (zero-copy from Bytes -> &[u8])
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.context("stream error")?;
+
+                output.write_all(&bytes).await?;
+            }
+
+            output.flush().await?;
+        }
+
         Commands::Ls { url } => {
-            let target_url = to_url(&url);
-            let list = client.list(&target_url).await?;
+            let target = to_url(&url);
+
+            let list = client.list(&target).await?;
+
             for item in list {
                 println!("{item}");
             }
         }
+
         Commands::Rm { url } => {
-            let target_url = to_url(&url);
-            println!("Deleting {target_url}");
-            client.delete(&target_url).await?;
+            let target = to_url(&url);
+
+            println!("Delete {target}");
+            client.delete(&target).await?;
         }
     }
 

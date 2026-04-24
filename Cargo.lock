@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage-client"
-version = "0.0.22"
+version = "0.0.23"
 dependencies = [
  "anyhow",
  "bytes",
@@ -921,6 +921,8 @@ dependencies = [
  "clap",
  "dashmap",
  "futures",
+ "futures-core",
+ "futures-util",
  "object_store",
  "pyo3",
  "pyo3-async-runtimes",

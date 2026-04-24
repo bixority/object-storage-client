@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use std::sync::Arc;
 use thiserror::Error;
@@ -126,6 +127,25 @@ impl ObjectStorageClient {
 
         self.stores.insert(key, Arc::clone(&store));
         Ok((store, object_path))
+    }
+
+    /// Stream object's data from the given URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme is unsupported.
+    /// - There is an error fetching the object from the store.
+    pub async fn get_stream(
+        &self,
+        url: &str,
+    ) -> Result<BoxStream<'static, object_store::Result<Bytes>>> {
+        let parsed_url = Url::parse(url)?;
+        let (store, path) = self.get_store(&parsed_url)?;
+        let result = store.get(&path).await?;
+        let stream = result.into_stream();
+        Ok(stream)
     }
 
     /// Downloads an object's data from the given URL.
@@ -381,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn test_store_caching() -> Result<()> {
         let client = ObjectStorageClient::new();
-        let url = Url::parse("file:///tmp").unwrap();
+        let url = Url::parse("file:///tmp")?;
 
         let (store1, _) = client.get_store(&url)?;
         let (store2, _) = client.get_store(&url)?;
@@ -391,7 +411,7 @@ mod tests {
         assert!(Arc::ptr_eq(&store1, &store2));
 
         // Different URL but same store (scheme + host)
-        let url3 = Url::parse("file:///other").unwrap();
+        let url3 = Url::parse("file:///other")?;
         let (store3, _) = client.get_store(&url3)?;
         assert!(Arc::ptr_eq(&store1, &store3));
 
@@ -402,7 +422,7 @@ mod tests {
     async fn test_clone_client() -> Result<()> {
         let client = ObjectStorageClient::new();
         let client_clone = client.clone();
-        let url = Url::parse("file:///tmp").unwrap();
+        let url = Url::parse("file:///tmp")?;
 
         let (store1, _) = client.get_store(&url)?;
         let (store2, _) = client_clone.get_store(&url)?;

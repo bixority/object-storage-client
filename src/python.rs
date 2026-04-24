@@ -1,9 +1,73 @@
 use crate::client::ObjectStorageClient as InternalClient;
 use bytes::Bytes;
+use futures::StreamExt;
+use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+
+fn to_py_err(e: impl std::fmt::Display) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+type PinnedByteStream = Arc<
+    Mutex<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = object_store::Result<bytes::Bytes>> + Send + 'static>,
+        >,
+    >,
+>;
+
+/// Async byte-stream returned by :py:meth:`ObjectStorageClient.get_object_stream`.
+///
+/// Implements the async iterator protocol, so you can use it directly in
+/// ``async for``:
+///
+/// ```text
+/// stream = await client.get_object_stream("s3://bucket/key")
+/// async for chunk in stream:
+///     process(chunk)
+/// ```
+#[pyclass]
+pub struct ByteStream {
+    inner: PinnedByteStream,
+}
+
+#[pymethods]
+impl ByteStream {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        future_into_py(py, async move {
+            let mut locked = inner.lock().await;
+            match locked.next().await {
+                Some(Ok(bytes)) => Ok(Some(bytes.to_vec())),
+                Some(Err(e)) => Err(to_py_err(e)),
+                None => Ok(None::<Vec<u8>>),
+            }
+        })
+    }
+
+    /// Fetch the next chunk manually.
+    ///
+    /// Returns empty ``bytes`` on EOF.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        future_into_py(py, async move {
+            let mut locked = inner.lock().await;
+            match locked.next().await {
+                Some(Ok(bytes)) => Ok(bytes.to_vec()),
+                Some(Err(e)) => Err(to_py_err(e)),
+                None => Ok(Vec::<u8>::new()),
+            }
+        })
+    }
+}
 
 #[pyclass]
 pub struct ObjectStorageClient {
@@ -23,16 +87,19 @@ impl ObjectStorageClient {
     fn get_object<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let bytes = inner
-                .get(&url)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-            let result = pyo3::Python::attach(|py| {
-                let py_bytes = PyBytes::new(py, &bytes);
-                py_bytes.into_any().unbind()
-            });
+            let bytes = inner.get(&url).await.map_err(to_py_err)?;
+            let result = pyo3::Python::attach(|py| PyBytes::new(py, &bytes).into_any().unbind());
             Ok(result)
+        })
+    }
+
+    fn get_object_stream<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        future_into_py(py, async move {
+            let stream = inner.get_stream(&url).await.map_err(to_py_err)?;
+            Ok(ByteStream {
+                inner: Arc::new(Mutex::new(Box::pin(stream))),
+            })
         })
     }
 
@@ -44,22 +111,16 @@ impl ObjectStorageClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
 
-        #[allow(deprecated)]
-        let bytes = if let Ok(py_bytes) = data.downcast::<PyBytes>() {
+        let bytes = if let Ok(py_bytes) = data.cast::<PyBytes>() {
             Bytes::copy_from_slice(py_bytes.as_bytes())
         } else if let Ok(vec) = data.extract::<Vec<u8>>() {
             Bytes::from(vec)
         } else {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Expected bytes or list of integers",
-            ));
+            return Err(PyTypeError::new_err("Expected bytes or list of integers"));
         };
 
         future_into_py(py, async move {
-            inner
-                .put(&url, bytes)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            inner.put(&url, bytes).await.map_err(to_py_err)?;
             Ok(())
         })
     }
@@ -67,10 +128,7 @@ impl ObjectStorageClient {
     fn delete_object<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            inner
-                .delete(&url)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            inner.delete(&url).await.map_err(to_py_err)?;
             Ok(())
         })
     }
@@ -78,10 +136,7 @@ impl ObjectStorageClient {
     fn list_objects<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let results = inner
-                .list(&url)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let results = inner.list(&url).await.map_err(to_py_err)?;
             Ok(results)
         })
     }
@@ -89,14 +144,10 @@ impl ObjectStorageClient {
     fn head<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            let meta = inner
-                .head(&url)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
+            let meta = inner.head(&url).await.map_err(to_py_err)?;
             let result = pyo3::Python::attach(|py| {
                 let dict = PyDict::new(py);
-                dict.set_item("location", meta.location.clone())?;
+                dict.set_item("location", &meta.location)?;
                 dict.set_item("last_modified", meta.last_modified.to_rfc3339())?;
                 dict.set_item("size", meta.size)?;
                 if let Some(e_tag) = meta.e_tag {
@@ -107,7 +158,7 @@ impl ObjectStorageClient {
                 }
                 Ok(dict.into_any().unbind())
             });
-            result.map_err(|e: PyErr| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            result.map_err(|e: PyErr| to_py_err(e))
         })
     }
 
@@ -119,10 +170,7 @@ impl ObjectStorageClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         future_into_py(py, async move {
-            inner
-                .copy(&from_url, &to_url)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            inner.copy(&from_url, &to_url).await.map_err(to_py_err)?;
             Ok(())
         })
     }
@@ -138,7 +186,7 @@ impl ObjectStorageClient {
             inner
                 .move_object(&from_url, &to_url)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(to_py_err)?;
             Ok(())
         })
     }
@@ -147,5 +195,6 @@ impl ObjectStorageClient {
 #[pymodule]
 fn _object_storage_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ObjectStorageClient>()?;
+    m.add_class::<ByteStream>()?;
     Ok(())
 }

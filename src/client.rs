@@ -95,6 +95,18 @@ impl ObjectStorageClient {
                 let mut builder =
                     object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
 
+                if let Ok(region) = std::env::var("S3_REGION") {
+                    builder = builder.with_region(region);
+                }
+
+                if let Ok(access_key_id) = std::env::var("S3_ACCESS_KEY_ID") {
+                    builder = builder.with_access_key_id(access_key_id);
+                }
+
+                if let Ok(secret_access_key) = std::env::var("S3_SECRET_ACCESS_KEY") {
+                    builder = builder.with_secret_access_key(secret_access_key);
+                }
+
                 if s3_secure == "false" {
                     builder = builder.with_allow_http(true);
                 }

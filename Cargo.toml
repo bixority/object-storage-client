@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.0.23"
+version = "0.0.24"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -28,8 +28,8 @@ clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
 dashmap = "6.1"
 chrono = { version = "0.4", features = ["serde"] }
-futures-util = "0.3.32"
-futures-core = "0.3.32"
+futures-util = "0.3"
+futures-core = "0.3"
 
 [features]
 python = ["dep:pyo3", "dep:pyo3-async-runtimes"]

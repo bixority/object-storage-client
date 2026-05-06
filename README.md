@@ -6,14 +6,15 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
-- **Multi-Language**: Native Rust library with Python 3.14 bindings.
+- **Multi-Language**: Native Rust library with Python 3.13+ bindings.
+- **Streaming**: Async streaming support for both Rust and Python.
 - **CLI**: `osc` command-line tool for quick operations.
 
 ## Supported Schemes
 
 - `s3://bucket/path` (AWS S3)
 - `gs://bucket/path` or `gcs://bucket/path` (Google Cloud Storage)
-- `az://container/path` (Azure Blob Storage)
+- `az://`, `wasb://`, `wasbs://`, `abfs://`, or `abfss://` (Azure Blob Storage)
 - `http://host/path` or `https://host/path` (HTTP/HTTPS)
 - `file:///absolute/path` or `local_path` (Local Filesystem)
 
@@ -48,6 +49,11 @@ cargo install --path .
   osc cp s3://source-bucket/image.png az://dest-container/image.png
   ```
 
+- **Move an object**:
+  ```bash
+  osc mv s3://my-bucket/old_name.txt s3://my-bucket/new_name.txt
+  ```
+
 - **List objects**:
   ```bash
   osc ls s3://my-bucket/logs/
@@ -56,6 +62,11 @@ cargo install --path .
 - **Delete an object**:
   ```bash
   osc rm s3://my-bucket/temp_file.tmp
+  ```
+
+- **Stream an object**:
+  ```bash
+  osc get-stream gs://my-bucket/large_file.bin
   ```
 
 ---
@@ -98,11 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Python 3.14 Usage
+## Python 3.13+ Usage
 
 ### Installation
 
-You can install the package using `pip`. Note that it requires Python 3.14.
+You can install the package using `pip`. Note that it requires Python 3.13+.
 
 ```bash
 pip install git+https://github.com/bixority/object-storage-client
@@ -124,15 +135,20 @@ async def main():
     client = ObjectStorageClient()
 
     # Upload data
-    await client.put("s3://my-bucket/python_test.txt", b"Hello from Python 3.14!")
+    await client.put_object("s3://my-bucket/python_test.txt", b"Hello from Python!")
 
     # Download data
-    data = await client.get("s3://my-bucket/python_test.txt")
+    data = await client.get_object("s3://my-bucket/python_test.txt")
     print(f"Retrieved: {data.decode()}")
 
     # List objects
-    items = await client.list("s3://my-bucket/")
+    items = await client.list_objects("s3://my-bucket/")
     print(f"Bucket items: {items}")
+
+    # Stream data
+    stream = await client.get_object_stream("s3://my-bucket/python_test.txt")
+    async for chunk in stream:
+        print(f"Chunk size: {len(chunk)}")
 
     # Cross-provider move (GCS to S3)
     await client.move_object("gs://my-gcs-bucket/data.csv", "s3://my-s3-bucket/data.csv")
@@ -146,7 +162,7 @@ if __name__ == "__main__":
 ### Prerequisites
 
 - Rust 1.85+ (or latest stable)
-- Python 3.14+
+- Python 3.13+
 - `maturin` (for Python bindings)
 
 ### Building

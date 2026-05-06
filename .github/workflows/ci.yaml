@@ -71,27 +71,36 @@ jobs:
         include:
           - os: linux-aarch64
             python: "3.13"
+            arch: aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
+            manylinux: 2_28
           - os: linux-aarch64
             python: "3.14"
+            arch: aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
+            manylinux: 2_28
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        if: matrix.arch
+        uses: docker/setup-qemu-action@v4
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.target }}
-          zig: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
-          container: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'off' || '' }}
-          manylinux: auto
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          sccache: true
           args: >
             --release
             --strip
+            --locked
+            --compatibility pypi
             --interpreter python${{ matrix.python }}
             --out dist
 

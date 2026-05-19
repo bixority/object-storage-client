@@ -100,7 +100,7 @@ impl ObjectStorageClient {
                 }
 
                 if let Ok(access_key_id) = std::env::var("S3_ACCESS_KEY_ID") {
-                    builder = builder.with_access_key_id(access_key_id);
+                    builder = builder.with_token("").with_access_key_id(access_key_id);
                 }
 
                 if let Ok(secret_access_key) = std::env::var("S3_SECRET_ACCESS_KEY") {

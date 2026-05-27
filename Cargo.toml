@@ -43,13 +43,20 @@ tokio = { version = "1.52", features = ["full", "test-util"] }
 
 
 [profile.dev]
-opt-level = 0
-incremental = true
 debug = true
+incremental = true
+opt-level = 0
 
 [profile.release]
 codegen-units = 1
 debug = false
 lto = "fat"
-opt-level = "z"
+opt-level = 3
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+codegen-units = 1
+debug = false
+opt-level = 3
 strip = true

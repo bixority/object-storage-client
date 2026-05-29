@@ -27,7 +27,20 @@ The `osc` tool allows you to interact with object storage directly from your ter
 
 ### Installation
 
-If you have the source code, you can install it using Cargo:
+Install the `osc` binary directly from the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client) with Cargo. Point Cargo at the registry with an environment variable, then install:
+
+```bash
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+cargo install object-storage-client --registry bixority
+```
+
+Alternatively, install straight from Git:
+
+```bash
+cargo install --git https://codeberg.org/bixority/object-storage-client
+```
+
+Or, if you have the source code, install it from the local checkout:
 
 ```bash
 cargo install --path .
@@ -85,11 +98,25 @@ cargo install --path .
 
 ### Installation
 
-Add `object-storage-client` to your `Cargo.toml`:
+The crate is published to the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client). Point Cargo at the registry with an environment variable:
+
+```bash
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+```
+
+Then add `object-storage-client` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-object-storage-client = { git = "https://github.com/bixority/object-storage-client" }
+object-storage-client = { version = "0.0.31", registry = "bixority" }
+tokio = { version = "1.0", features = ["full"] }
+```
+
+Alternatively, you can depend on it directly from Git:
+
+```toml
+[dependencies]
+object-storage-client = { git = "https://codeberg.org/bixority/object-storage-client" }
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -139,10 +166,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Installation
 
-You can install the package using `pip`. Note that it requires Python 3.13+.
+The package is published on [PyPI](https://pypi.org/project/object-storage-client/). Note that it requires Python 3.13+.
 
 ```bash
-pip install git+https://github.com/bixority/object-storage-client
+pip install object-storage-client
 ```
 
 Or if you are developing locally, you can use `maturin`:

@@ -5,7 +5,9 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::aws::AmazonS3;
 use object_store::signer::Signer;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
+use object_store::{
+    Attribute, GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -51,6 +53,20 @@ impl From<ObjectMeta> for Metadata {
             version: meta.version,
         }
     }
+}
+
+/// The size and content type of a stored object, as reported by a HEAD request.
+///
+/// Returned by [`ObjectStorageClient::get_object_metadata`]. Unlike [`Metadata`], this
+/// carries the `Content-Type` (read from the object's attributes), which the
+/// plain `head` operation does not expose — useful for verifying that a
+/// completed upload wrote the bytes and content type a presigned URL was
+/// issued for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMetadata {
+    pub size_bytes: u64,
+    /// The stored `Content-Type`, or `None` if the backend reported none.
+    pub content_type: Option<String>,
 }
 
 /// A resolved storage backend: the object store plus, when the backend supports
@@ -320,6 +336,44 @@ impl ObjectStorageClient {
         Ok(meta.into())
     }
 
+    /// Returns the object's size and content type, or `None` if it does not
+    /// exist.
+    ///
+    /// Unlike [`Self::head`], this also reports the stored `Content-Type` and
+    /// treats a missing object as `None` rather than an error. It issues a
+    /// single HEAD request via [`GetOptions::head`], reading the size from the
+    /// object metadata and the content type from the object attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme is unsupported.
+    /// - The store fails for a reason other than the object not existing.
+    pub async fn get_object_metadata(&self, url: &str) -> Result<Option<ObjectMetadata>> {
+        let parsed_url = Url::parse(url)?;
+        let (store, path) = self.get_store(&parsed_url)?;
+        let options = GetOptions {
+            head: true,
+            ..Default::default()
+        };
+
+        match store.get_opts(&path, options).await {
+            Ok(result) => {
+                let content_type = result
+                    .attributes
+                    .get(&Attribute::ContentType)
+                    .map(|value| value.as_ref().to_string());
+                Ok(Some(ObjectMetadata {
+                    size_bytes: result.meta.size,
+                    content_type,
+                }))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Copies an object from one URL to another.
     /// Supports cross-provider copies.
     ///
@@ -534,9 +588,23 @@ mod tests {
         let list = client.list(&dir_url).await?;
         assert!(list.iter().any(|p| p.ends_with("test.txt")));
 
+        // Head object (size + content type, present)
+        let stored = client.get_object_metadata(&url).await?;
+        assert_eq!(
+            stored,
+            Some(ObjectMetadata {
+                size_bytes: data.len() as u64,
+                // LocalFileSystem reports no content type.
+                content_type: None,
+            })
+        );
+
         // Delete
         client.delete(&url).await?;
         assert!(fs::metadata(&file_path).is_err());
+
+        // Head object on a missing object yields None rather than an error.
+        assert_eq!(client.get_object_metadata(&url).await?, None);
 
         Ok(())
     }

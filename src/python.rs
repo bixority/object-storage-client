@@ -189,6 +189,38 @@ impl ObjectStorageClient {
         })
     }
 
+    /// Return the object's size and content type, or ``None`` if it does not
+    /// exist.
+    ///
+    /// On success returns a dict ``{"size_bytes": int, "content_type": str}``;
+    /// ``content_type`` is the empty string when the backend reports none.
+    /// Unlike :py:meth:`head`, a missing object yields ``None`` rather than
+    /// raising ``FileNotFoundError``.
+    fn get_object_metadata<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let stored = inner
+                .get_object_metadata(&url)
+                .await
+                .map_err(client_to_py_err)?;
+
+            pyo3::Python::attach(|py| match stored {
+                Some(stored) => {
+                    let dict = PyDict::new(py);
+                    dict.set_item("size_bytes", stored.size_bytes)?;
+                    dict.set_item("content_type", stored.content_type.unwrap_or_default())?;
+                    Ok(dict.into_any().unbind())
+                }
+                None => Ok(py.None()),
+            })
+        })
+    }
+
     fn copy_object<'py>(
         &self,
         py: Python<'py>,

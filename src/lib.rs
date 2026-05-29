@@ -3,5 +3,5 @@ pub mod client;
 pub mod python;
 mod sign;
 
-pub use client::ObjectStorageClient;
+pub use client::{ObjectMetadata, ObjectStorageClient};
 pub use sign::{SignMethod, SignOptions};

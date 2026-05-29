@@ -441,7 +441,7 @@ mod tests {
         assert!("PATCH".parse::<SignMethod>().is_err());
     }
 
-    /// Reproduces the canonical AWS SigV4 "Example: GET Object" pre-signed URL
+    /// Reproduces the canonical AWS `SigV4` "Example: GET Object" pre-signed URL
     /// from the AWS documentation, pinning the signing timestamp so the
     /// resulting signature can be compared against the published value. This
     /// guards the whole canonical-request / string-to-sign / signing pipeline.
@@ -461,7 +461,7 @@ mod tests {
         let signed = presign_s3_at(
             &base,
             &Method::GET,
-            Duration::from_secs(86400),
+            Duration::from_hours(24),
             &cred,
             "us-east-1",
             BoundHeaders::default(),
@@ -494,7 +494,7 @@ mod tests {
         let signed = presign_s3(
             &base,
             &Method::PUT,
-            Duration::from_secs(900),
+            Duration::from_mins(15),
             &test_credential(),
             "us-east-1",
             BoundHeaders {
@@ -516,7 +516,7 @@ mod tests {
         let signed = presign_s3(
             &base,
             &Method::GET,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             &test_credential(),
             "eu-west-1",
             BoundHeaders::default(),
@@ -533,7 +533,7 @@ mod tests {
         let signed = presign_s3(
             &base,
             &Method::PUT,
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &cred,
             "us-east-1",
             BoundHeaders {

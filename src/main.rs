@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use object_storage_client::ObjectStorageClient;
+use object_storage_client::{ObjectStorageClient, SignMethod};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tokio::io::{self, AsyncWrite, AsyncWriteExt, BufWriter};
 
@@ -17,13 +18,42 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Cp { src: String, dst: String },
-    Mv { src: String, dst: String },
-    Put { src: PathBuf, dst: String },
-    Get { src: String, dst: PathBuf },
-    GetStream { src: String, dst: Option<PathBuf> },
-    Ls { url: String },
-    Rm { url: String },
+    Cp {
+        src: String,
+        dst: String,
+    },
+    Mv {
+        src: String,
+        dst: String,
+    },
+    Put {
+        src: PathBuf,
+        dst: String,
+    },
+    Get {
+        src: String,
+        dst: PathBuf,
+    },
+    GetStream {
+        src: String,
+        dst: Option<PathBuf>,
+    },
+    Ls {
+        url: String,
+    },
+    Rm {
+        url: String,
+    },
+    /// Generate a pre-signed URL (S3, GCS and Azure only).
+    Sign {
+        url: String,
+        /// HTTP method the URL authorizes: GET, PUT, POST, DELETE or HEAD.
+        #[arg(short, long, default_value = "GET")]
+        method: String,
+        /// Validity duration in seconds.
+        #[arg(short, long, default_value_t = 3600)]
+        expires_in: u64,
+    },
 }
 
 fn to_url(s: &str) -> String {
@@ -179,6 +209,24 @@ async fn main() -> Result<()> {
 
             println!("Delete {target}");
             client.delete(&target).await?;
+        }
+
+        Commands::Sign {
+            url,
+            method,
+            expires_in,
+        } => {
+            let target = to_url(&url);
+            let signed_method: SignMethod = method
+                .parse()
+                .with_context(|| format!("invalid HTTP method: {method}"))?;
+
+            let signed = client
+                .get_pre_signed_url(&target, signed_method, Duration::from_secs(expires_in))
+                .await
+                .context("failed to generate pre-signed URL")?;
+
+            println!("{signed}");
         }
     }
 

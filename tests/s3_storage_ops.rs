@@ -1,4 +1,5 @@
-use object_storage_client::ObjectStorageClient;
+use object_storage_client::{ObjectStorageClient, SignMethod};
+use std::time::Duration;
 
 /// This test is ignored by default because it requires S3 credentials and a bucket.
 /// To run it, set the following environment variables:
@@ -61,6 +62,42 @@ async fn test_s3_object_lifecycle() -> anyhow::Result<()> {
             .any(|item| item == "moved_test_file_s3.txt"),
         "Deleted file should NOT be in the list"
     );
+
+    Ok(())
+}
+
+/// Verifies that a pre-signed GET URL can be generated for S3 and used to
+/// retrieve an object without supplying credentials directly.
+///
+/// Requires the same environment variables as `test_s3_object_lifecycle`.
+/// Run with: `cargo test --test s3_storage_ops -- --ignored`
+#[tokio::test]
+#[ignore = "functional"]
+async fn test_s3_presigned_url_roundtrip() -> anyhow::Result<()> {
+    let bucket = std::env::var("S3_BUCKET")
+        .expect("S3_BUCKET environment variable must be set to run this test");
+    let bucket = bucket.trim_end_matches('/');
+
+    let client = ObjectStorageClient::new();
+    let file_url = format!("s3://{bucket}/presign_test.txt");
+    let content = b"presigned content";
+
+    client.put(&file_url, &content[..]).await?;
+
+    let signed = client
+        .get_pre_signed_url(&file_url, SignMethod::Get, Duration::from_secs(300))
+        .await?;
+
+    assert!(
+        signed.contains("X-Amz-Signature"),
+        "signed URL must contain a SigV4 signature, got: {signed}"
+    );
+
+    // The signed URL should be usable by any plain HTTP client without creds.
+    let body = reqwest::get(&signed).await?.bytes().await?;
+    assert_eq!(body.as_ref(), content);
+
+    client.delete(&file_url).await?;
 
     Ok(())
 }

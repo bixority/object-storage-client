@@ -2,8 +2,11 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use http::Method;
+use object_store::signer::Signer;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
@@ -18,11 +21,60 @@ pub enum Error {
     #[error("Unsupported scheme: {0}")]
     UnsupportedScheme(String),
 
+    #[error("Pre-signed URLs are not supported for scheme: {0}")]
+    SigningUnsupported(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// HTTP method a pre-signed URL authorizes.
+///
+/// This is a backend-agnostic abstraction over the HTTP verb so that callers
+/// (including the Python and CLI front-ends) do not need to depend on the
+/// `http`/`reqwest` crates directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignMethod {
+    /// Download an object.
+    Get,
+    /// Upload (overwrite) an object.
+    Put,
+    /// Upload via an HTTP POST (e.g. browser form uploads).
+    Post,
+    /// Delete an object.
+    Delete,
+    /// Fetch object metadata only.
+    Head,
+}
+
+impl SignMethod {
+    fn into_http(self) -> Method {
+        match self {
+            Self::Get => Method::GET,
+            Self::Put => Method::PUT,
+            Self::Post => Method::POST,
+            Self::Delete => Method::DELETE,
+            Self::Head => Method::HEAD,
+        }
+    }
+}
+
+impl std::str::FromStr for SignMethod {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "GET" => Ok(Self::Get),
+            "PUT" => Ok(Self::Put),
+            "POST" => Ok(Self::Post),
+            "DELETE" => Ok(Self::Delete),
+            "HEAD" => Ok(Self::Head),
+            other => Err(Error::Generic(format!("Invalid HTTP method: {other}"))),
+        }
+    }
+}
 
 /// Metadata for an object in storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,11 +98,19 @@ impl From<ObjectMeta> for Metadata {
     }
 }
 
+/// A resolved storage backend: the object store plus, when the backend supports
+/// it, a [`Signer`] for generating pre-signed URLs.
+#[derive(Clone)]
+struct Backend {
+    store: Arc<dyn ObjectStore>,
+    signer: Option<Arc<dyn Signer>>,
+}
+
 /// A unified object storage client that handles multiple backends based on URL schemes.
 #[derive(Clone, Default)]
 pub struct ObjectStorageClient {
-    /// Cache for `ObjectStore` instances based on (scheme, host).
-    stores: Arc<DashMap<StoreKey, Arc<dyn ObjectStore>>>,
+    /// Cache for resolved backends based on (scheme, host).
+    stores: Arc<DashMap<StoreKey, Backend>>,
 }
 
 type StoreKey = (String, Option<String>);
@@ -63,7 +123,7 @@ impl ObjectStorageClient {
         }
     }
 
-    /// Resolves the correct `ObjectStore` for a given URL.
+    /// Resolves the correct backend (store + optional signer) for a given URL.
     ///
     /// # Errors
     ///
@@ -71,7 +131,7 @@ impl ObjectStorageClient {
     /// - The URL scheme is unsupported.
     /// - The URL is missing required components (e.g., bucket name for S3/GCS).
     /// - There is an error building the underlying `ObjectStore`.
-    fn get_store(&self, url: &Url) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
+    fn get_backend(&self, url: &Url) -> Result<(Backend, ObjectPath)> {
         let scheme = url.scheme();
         let host = url.host_str();
         let path = if scheme == "file" {
@@ -82,11 +142,11 @@ impl ObjectStorageClient {
         let object_path = ObjectPath::from(path);
 
         let key = (scheme.to_string(), host.map(ToString::to_string));
-        if let Some(store) = self.stores.get(&key) {
-            return Ok((Arc::clone(store.value()), object_path));
+        if let Some(backend) = self.stores.get(&key) {
+            return Ok((backend.value().clone(), object_path));
         }
 
-        let store: Arc<dyn ObjectStore> = match scheme {
+        let backend = match scheme {
             "s3" => {
                 let s3_secure = std::env::var("S3_SECURE").unwrap_or_else(|_| "true".into());
 
@@ -111,7 +171,11 @@ impl ObjectStorageClient {
                     builder = builder.with_allow_http(true);
                 }
 
-                Arc::new(builder.build()?)
+                let store = Arc::new(builder.build()?);
+                Backend {
+                    signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
+                    store,
+                }
             }
             "gs" | "gcs" => {
                 let bucket =
@@ -119,7 +183,11 @@ impl ObjectStorageClient {
                 let builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket);
 
-                Arc::new(builder.build()?)
+                let store = Arc::new(builder.build()?);
+                Backend {
+                    signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
+                    store,
+                }
             }
             "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
                 let container =
@@ -127,18 +195,41 @@ impl ObjectStorageClient {
                 let builder = object_store::azure::MicrosoftAzureBuilder::from_env()
                     .with_container_name(container);
 
-                Arc::new(builder.build()?)
+                let store = Arc::new(builder.build()?);
+                Backend {
+                    signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
+                    store,
+                }
             }
             "http" | "https" => {
                 let builder = object_store::http::HttpBuilder::new().with_url(url.as_str());
-                Arc::new(builder.build()?)
+                Backend {
+                    store: Arc::new(builder.build()?),
+                    signer: None,
+                }
             }
-            "file" => Arc::new(object_store::local::LocalFileSystem::new()),
+            "file" => Backend {
+                store: Arc::new(object_store::local::LocalFileSystem::new()),
+                signer: None,
+            },
             _ => return Err(Error::UnsupportedScheme(scheme.to_string())),
         };
 
-        self.stores.insert(key, Arc::clone(&store));
-        Ok((store, object_path))
+        self.stores.insert(key, backend.clone());
+        Ok((backend, object_path))
+    }
+
+    /// Resolves the correct `ObjectStore` for a given URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL scheme is unsupported.
+    /// - The URL is missing required components (e.g., bucket name for S3/GCS).
+    /// - There is an error building the underlying `ObjectStore`.
+    fn get_store(&self, url: &Url) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
+        let (backend, path) = self.get_backend(url)?;
+        Ok((backend.store, path))
     }
 
     /// Stream object's data from the given URL.
@@ -346,6 +437,90 @@ impl ObjectStorageClient {
         }
         Ok(())
     }
+
+    /// Generates a pre-signed URL granting time-limited access to the object at
+    /// `url` for the given HTTP `method`, valid for `expires_in`.
+    ///
+    /// The returned URL embeds the credentials needed for the request, so it can
+    /// be handed to a client that has no access to the storage credentials
+    /// (e.g. a browser performing a direct upload or download).
+    ///
+    /// Supported for S3 (`s3://`), Google Cloud Storage (`gs://`/`gcs://`) and
+    /// Azure Blob Storage (`az://`, `wasb(s)://`, `abfs(s)://`). Local and
+    /// plain HTTP backends do not support signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme is unsupported, or does not support pre-signed URLs.
+    /// - The backend fails to sign the request.
+    pub async fn get_pre_signed_url(
+        &self,
+        url: &str,
+        method: SignMethod,
+        expires_in: Duration,
+    ) -> Result<String> {
+        let parsed_url = Url::parse(url)?;
+        let (backend, path) = self.get_backend(&parsed_url)?;
+        let signer = backend
+            .signer
+            .ok_or_else(|| Error::SigningUnsupported(parsed_url.scheme().to_string()))?;
+        let pre_signed_url = signer
+            .signed_url(method.into_http(), &path, expires_in)
+            .await?;
+        Ok(pre_signed_url.into())
+    }
+
+    /// Generates pre-signed URLs for multiple objects sharing the same backend
+    /// (scheme and host), using a single signer.
+    ///
+    /// All `urls` must resolve to the same backend; otherwise an error is
+    /// returned. This is more efficient than calling [`Self::get_pre_signed_url`]
+    /// in a loop when signing many objects in the same bucket/container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `urls` is empty, or any URL is invalid.
+    /// - The URLs resolve to different backends.
+    /// - The scheme is unsupported, or does not support pre-signed URLs.
+    /// - The backend fails to sign the requests.
+    pub async fn get_pre_signed_urls(
+        &self,
+        urls: &[&str],
+        method: SignMethod,
+        expires_in: Duration,
+    ) -> Result<Vec<String>> {
+        let Some((first, rest)) = urls.split_first() else {
+            return Err(Error::Generic("No URLs provided for signing".into()));
+        };
+
+        let first_url = Url::parse(first)?;
+        let (backend, first_path) = self.get_backend(&first_url)?;
+        let signer = backend
+            .signer
+            .ok_or_else(|| Error::SigningUnsupported(first_url.scheme().to_string()))?;
+
+        let mut paths = Vec::with_capacity(urls.len());
+        paths.push(first_path);
+
+        for url in rest {
+            let parsed = Url::parse(url)?;
+            if parsed.scheme() != first_url.scheme() || parsed.host_str() != first_url.host_str() {
+                return Err(Error::Generic(
+                    "All URLs must belong to the same backend (scheme and host)".into(),
+                ));
+            }
+            let (_, path) = self.get_backend(&parsed)?;
+            paths.push(path);
+        }
+
+        let pre_signed_url = signer
+            .signed_urls(method.into_http(), &paths, expires_in)
+            .await?;
+        Ok(pre_signed_url.into_iter().map(Into::into).collect())
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +603,45 @@ mod tests {
         assert!(Arc::ptr_eq(&store1, &store3));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_pre_signed_url_unsupported_for_local() {
+        let client = ObjectStorageClient::new();
+        let err = client
+            .get_pre_signed_url(
+                "file:///tmp/foo.txt",
+                SignMethod::Get,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("local filesystem must not support signing");
+
+        assert!(matches!(err, Error::SigningUnsupported(scheme) if scheme == "file"));
+    }
+
+    #[tokio::test]
+    async fn test_sign_method_from_str() {
+        assert_eq!("get".parse::<SignMethod>().unwrap(), SignMethod::Get);
+        assert_eq!("PUT".parse::<SignMethod>().unwrap(), SignMethod::Put);
+        assert_eq!("Delete".parse::<SignMethod>().unwrap(), SignMethod::Delete);
+        assert!("PATCH".parse::<SignMethod>().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_pre_signed_urls_rejects_mixed_backends() {
+        let client = ObjectStorageClient::new();
+        let err = client
+            .get_pre_signed_urls(
+                &["file:///tmp/a.txt", "s3://bucket/b.txt"],
+                SignMethod::Get,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("mixed backends must be rejected");
+
+        // The first URL (file) is resolved first and is itself unsupported.
+        assert!(matches!(err, Error::SigningUnsupported(_)));
     }
 
     #[tokio::test]

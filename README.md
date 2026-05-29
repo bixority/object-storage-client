@@ -6,6 +6,7 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
+- **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
 - **Multi-Language**: Native Rust library with Python 3.13+ bindings.
 - **Streaming**: Async streaming support for both Rust and Python.
 - **CLI**: `osc` command-line tool for quick operations.
@@ -69,6 +70,15 @@ cargo install --path .
   osc get-stream gs://my-bucket/large_file.bin
   ```
 
+- **Generate a pre-signed URL** (S3, GCS, Azure):
+  ```bash
+  # Pre-signed download URL, valid for the default 1 hour
+  osc sign s3://my-bucket/report.pdf
+
+  # Pre-signed upload URL (PUT), valid for 15 minutes
+  osc sign --method PUT --expires-in 900 s3://my-bucket/upload.bin
+  ```
+
 ---
 
 ## Rust Usage
@@ -102,6 +112,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Cross-provider copy (S3 to Local)
     client.copy("s3://my-bucket/hello.txt", "file:///tmp/hello_local.txt").await?;
+
+    // Pre-signed URL: time-limited, credential-free access (S3/GCS/Azure)
+    use object_storage_client::SignMethod;
+    use std::time::Duration;
+
+    // Pre-signed download (GET) link, valid for one hour
+    let download_url = client
+        .get_pre_signed_url("s3://my-bucket/hello.txt", SignMethod::Get, Duration::from_secs(3600))
+        .await?;
+    println!("Share this download link: {download_url}");
+
+    // Pre-signed upload (PUT) link, valid for 15 minutes
+    let upload_url = client
+        .get_pre_signed_url("s3://my-bucket/upload.bin", SignMethod::Put, Duration::from_secs(900))
+        .await?;
+    println!("Upload directly to: {upload_url}");
 
     Ok(())
 }
@@ -152,6 +178,13 @@ async def main():
 
     # Cross-provider move (GCS to S3)
     await client.move_object("gs://my-gcs-bucket/data.csv", "s3://my-s3-bucket/data.csv")
+
+    # Pre-signed URL (S3/GCS/Azure): hand out credential-free, time-limited access
+    download_url = await client.get_pre_signed_url("s3://my-bucket/python_test.txt")
+    upload_url = await client.get_pre_signed_url(
+        "s3://my-bucket/upload.bin", method="PUT", expires_in_secs=900
+    )
+    print(f"Download: {download_url}\nUpload: {upload_url}")
 
 if __name__ == "__main__":
     asyncio.run(main())

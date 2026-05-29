@@ -1,4 +1,5 @@
 use crate::client::ObjectStorageClient as InternalClient;
+use crate::client::SignMethod;
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::Error as ObjectStoreError;
@@ -7,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 fn object_store_to_py_err(e: ObjectStoreError) -> PyErr {
@@ -218,6 +220,34 @@ impl ObjectStorageClient {
                 .await
                 .map_err(client_to_py_err)?;
             Ok(())
+        })
+    }
+
+    /// Generate a pre-signed URL for ``url``.
+    ///
+    /// ``method`` is one of ``"GET"``, ``"PUT"``, ``"POST"``, ``"DELETE"`` or
+    /// ``"HEAD"`` (case-insensitive). ``expires_in_secs`` is how long the URL
+    /// remains valid, in seconds (default one hour).
+    ///
+    /// Supported for ``s3://``, ``gs://``/``gcs://`` and Azure schemes.
+    #[pyo3(signature = (url, method="GET", expires_in_secs=3600))]
+    fn get_pre_signed_url<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        method: &str,
+        expires_in_secs: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let method: SignMethod = method.parse().map_err(client_to_py_err)?;
+        let expires_in = Duration::from_secs(expires_in_secs);
+
+        future_into_py(py, async move {
+            let signed = inner
+                .get_pre_signed_url(&url, method, expires_in)
+                .await
+                .map_err(client_to_py_err)?;
+            Ok(signed)
         })
     }
 }

@@ -1,5 +1,7 @@
 pub mod client;
 #[cfg(feature = "python")]
 pub mod python;
+mod sign;
 
-pub use client::{ObjectStorageClient, SignMethod};
+pub use client::ObjectStorageClient;
+pub use sign::{SignMethod, SignOptions};

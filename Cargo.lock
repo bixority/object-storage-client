@@ -1027,7 +1027,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage-client"
-version = "0.0.31"
+version = "0.0.32"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1038,9 +1038,11 @@ dependencies = [
  "futures-util",
  "http",
  "object_store",
+ "percent-encoding",
  "pyo3",
  "pyo3-async-runtimes",
  "reqwest 0.13.4",
+ "ring",
  "tempfile",
  "thiserror",
  "tokio",

@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.0.31"
+version = "0.0.32"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -25,6 +25,8 @@ futures = "0.3"
 futures-util = "0.3"
 http = "1"
 object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+percent-encoding = "2.3"
+ring = "0.17"
 pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
 thiserror = "2.0"

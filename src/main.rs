@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use object_storage_client::{ObjectStorageClient, SignMethod};
+use object_storage_client::{ObjectStorageClient, SignMethod, SignOptions};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,6 +53,12 @@ enum Commands {
         /// Validity duration in seconds.
         #[arg(short, long, default_value_t = 3600)]
         expires_in: u64,
+        /// Bind a required Content-Length (bytes) into the signature (S3 only).
+        #[arg(long)]
+        content_length: Option<u64>,
+        /// Bind a required Content-Type into the signature (S3 only).
+        #[arg(long)]
+        content_type: Option<String>,
     },
 }
 
@@ -215,14 +221,25 @@ async fn main() -> Result<()> {
             url,
             method,
             expires_in,
+            content_length,
+            content_type,
         } => {
             let target = to_url(&url);
             let signed_method: SignMethod = method
                 .parse()
                 .with_context(|| format!("invalid HTTP method: {method}"))?;
+            let options = SignOptions {
+                content_length,
+                content_type,
+            };
 
             let signed = client
-                .get_pre_signed_url(&target, signed_method, Duration::from_secs(expires_in))
+                .get_pre_signed_url(
+                    &target,
+                    signed_method,
+                    Duration::from_secs(expires_in),
+                    &options,
+                )
                 .await
                 .context("failed to generate pre-signed URL")?;
 

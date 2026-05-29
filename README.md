@@ -90,6 +90,12 @@ cargo install --path .
 
   # Pre-signed upload URL (PUT), valid for 15 minutes
   osc sign --method PUT --expires-in 900 s3://my-bucket/upload.bin
+
+  # Pre-signed upload URL binding the exact size and type the client must send
+  # (S3 only): the upload is rejected unless Content-Length and Content-Type
+  # match, so the object store enforces size/type up front.
+  osc sign --method PUT --content-length 1048576 \
+      --content-type application/pdf s3://my-bucket/upload.pdf
   ```
 
 ---
@@ -141,18 +147,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.copy("s3://my-bucket/hello.txt", "file:///tmp/hello_local.txt").await?;
 
     // Pre-signed URL: time-limited, credential-free access (S3/GCS/Azure)
-    use object_storage_client::SignMethod;
+    use object_storage_client::{SignMethod, SignOptions};
     use std::time::Duration;
 
     // Pre-signed download (GET) link, valid for one hour
     let download_url = client
-        .get_pre_signed_url("s3://my-bucket/hello.txt", SignMethod::Get, Duration::from_secs(3600))
+        .get_pre_signed_url(
+            "s3://my-bucket/hello.txt",
+            SignMethod::Get,
+            Duration::from_secs(3600),
+            &SignOptions::default(),
+        )
         .await?;
     println!("Share this download link: {download_url}");
 
-    // Pre-signed upload (PUT) link, valid for 15 minutes
+    // Pre-signed upload (PUT) link binding the exact size and type the client
+    // must send (S3 only); the store rejects mismatched uploads up front.
     let upload_url = client
-        .get_pre_signed_url("s3://my-bucket/upload.bin", SignMethod::Put, Duration::from_secs(900))
+        .get_pre_signed_url(
+            "s3://my-bucket/upload.bin",
+            SignMethod::Put,
+            Duration::from_secs(900),
+            &SignOptions {
+                content_length: Some(1_048_576),
+                content_type: Some("application/octet-stream".to_string()),
+            },
+        )
         .await?;
     println!("Upload directly to: {upload_url}");
 
@@ -208,8 +228,14 @@ async def main():
 
     # Pre-signed URL (S3/GCS/Azure): hand out credential-free, time-limited access
     download_url = await client.get_pre_signed_url("s3://my-bucket/python_test.txt")
+    # Bind the exact Content-Length and Content-Type the client must send (S3
+    # only); the store rejects uploads that don't match.
     upload_url = await client.get_pre_signed_url(
-        "s3://my-bucket/upload.bin", method="PUT", expires_in_secs=900
+        "s3://my-bucket/upload.bin",
+        method="PUT",
+        expires_in_secs=900,
+        content_length=1_048_576,
+        content_type="application/octet-stream",
     )
     print(f"Download: {download_url}\nUpload: {upload_url}")
 

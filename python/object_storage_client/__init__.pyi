@@ -18,5 +18,18 @@ class ObjectStorageClient:
     async def copy_object(self, from_url: str, to_url: str) -> None: ...
     async def move_object(self, from_url: str, to_url: str) -> None: ...
     async def get_pre_signed_url(
-        self, url: str, method: str = "GET", expires_in_secs: int = 3600
+        self,
+        url: str,
+        method: str = "GET",
+        expires_in_secs: int = 3600,
+        content_length: int | None = None,
+        content_type: str | None = None,
     ) -> str: ...
+    async def get_pre_signed_urls(
+        self,
+        urls: list[str],
+        method: str = "GET",
+        expires_in_secs: int = 3600,
+        content_length: int | None = None,
+        content_type: str | None = None,
+    ) -> list[str]: ...

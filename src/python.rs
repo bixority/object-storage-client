@@ -1,5 +1,5 @@
 use crate::client::ObjectStorageClient as InternalClient;
-use crate::client::SignMethod;
+use crate::sign::{SignMethod, SignOptions};
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::Error as ObjectStoreError;
@@ -229,22 +229,68 @@ impl ObjectStorageClient {
     /// ``"HEAD"`` (case-insensitive). ``expires_in_secs`` is how long the URL
     /// remains valid, in seconds (default one hour).
     ///
-    /// Supported for ``s3://``, ``gs://``/``gcs://`` and Azure schemes.
-    #[pyo3(signature = (url, method="GET", expires_in_secs=3600))]
+    /// ``content_length`` and ``content_type`` bind a required ``Content-Length``
+    /// and ``Content-Type`` into the signature (S3 only): a client using the URL
+    /// MUST send exactly those header values or the request is rejected with a
+    /// 403 signature mismatch. Leave them as ``None`` for plain signing.
+    ///
+    /// Supported for ``s3://``, ``gs://``/``gcs://`` and Azure schemes; binding
+    /// content headers is only supported for ``s3://``.
+    #[pyo3(signature = (url, method="GET", expires_in_secs=3600, content_length=None, content_type=None))]
     fn get_pre_signed_url<'py>(
         &self,
         py: Python<'py>,
         url: String,
         method: &str,
         expires_in_secs: u64,
+        content_length: Option<u64>,
+        content_type: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         let method: SignMethod = method.parse().map_err(client_to_py_err)?;
         let expires_in = Duration::from_secs(expires_in_secs);
+        let options = SignOptions {
+            content_length,
+            content_type,
+        };
 
         future_into_py(py, async move {
             let signed = inner
-                .get_pre_signed_url(&url, method, expires_in)
+                .get_pre_signed_url(&url, method, expires_in, &options)
+                .await
+                .map_err(client_to_py_err)?;
+            Ok(signed)
+        })
+    }
+
+    /// Generate pre-signed URLs for multiple objects sharing the same backend.
+    ///
+    /// All ``urls`` must resolve to the same backend (scheme and host). See
+    /// :py:meth:`get_pre_signed_url` for the meaning of ``method``,
+    /// ``expires_in_secs``, ``content_length`` and ``content_type``; the same
+    /// options are applied to every URL.
+    #[pyo3(signature = (urls, method="GET", expires_in_secs=3600, content_length=None, content_type=None))]
+    fn get_pre_signed_urls<'py>(
+        &self,
+        py: Python<'py>,
+        urls: Vec<String>,
+        method: &str,
+        expires_in_secs: u64,
+        content_length: Option<u64>,
+        content_type: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let method: SignMethod = method.parse().map_err(client_to_py_err)?;
+        let expires_in = Duration::from_secs(expires_in_secs);
+        let options = SignOptions {
+            content_length,
+            content_type,
+        };
+
+        future_into_py(py, async move {
+            let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+            let signed = inner
+                .get_pre_signed_urls(&refs, method, expires_in, &options)
                 .await
                 .map_err(client_to_py_err)?;
             Ok(signed)

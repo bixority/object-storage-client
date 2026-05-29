@@ -1,4 +1,4 @@
-use object_storage_client::{ObjectStorageClient, SignMethod};
+use object_storage_client::{ObjectStorageClient, SignMethod, SignOptions};
 use std::time::Duration;
 
 /// This test is ignored by default because it requires S3 credentials and a bucket.
@@ -85,7 +85,12 @@ async fn test_s3_presigned_url_roundtrip() -> anyhow::Result<()> {
     client.put(&file_url, &content[..]).await?;
 
     let signed = client
-        .get_pre_signed_url(&file_url, SignMethod::Get, Duration::from_mins(5))
+        .get_pre_signed_url(
+            &file_url,
+            SignMethod::Get,
+            Duration::from_mins(5),
+            &SignOptions::default(),
+        )
         .await?;
 
     assert!(
@@ -95,6 +100,68 @@ async fn test_s3_presigned_url_roundtrip() -> anyhow::Result<()> {
 
     // The signed URL should be usable by any plain HTTP client without creds.
     let body = reqwest::get(&signed).await?.bytes().await?;
+    assert_eq!(body.as_ref(), content);
+
+    client.delete(&file_url).await?;
+
+    Ok(())
+}
+
+/// Verifies that a pre-signed PUT URL with a bound `Content-Length` and
+/// `Content-Type` can be used to upload directly, and that the object store
+/// enforces those header values (rejecting a mismatched upload).
+///
+/// Requires the same environment variables as `test_s3_object_lifecycle`.
+/// Run with: `cargo test --test s3_storage_ops -- --ignored`
+#[tokio::test]
+#[ignore = "functional"]
+async fn test_s3_presigned_put_with_bound_headers() -> anyhow::Result<()> {
+    let bucket = std::env::var("S3_BUCKET")
+        .expect("S3_BUCKET environment variable must be set to run this test");
+    let bucket = bucket.trim_end_matches('/');
+
+    let client = ObjectStorageClient::new();
+    let file_url = format!("s3://{bucket}/presign_put_test.bin");
+    let content = b"exact-size-and-type payload";
+    let content_type = "application/octet-stream";
+
+    let options = SignOptions {
+        content_length: Some(content.len() as u64),
+        content_type: Some(content_type.to_string()),
+    };
+
+    let signed = client
+        .get_pre_signed_url(&file_url, SignMethod::Put, Duration::from_mins(5), &options)
+        .await?;
+
+    assert!(signed.contains("X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost"));
+
+    let http = reqwest::Client::new();
+
+    // Upload matching the bound headers must succeed.
+    let ok = http
+        .put(&signed)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .body(content.to_vec())
+        .send()
+        .await?;
+    assert!(ok.status().is_success(), "matching upload should succeed");
+
+    // A mismatched Content-Type must be rejected by the store.
+    let rejected = http
+        .put(&signed)
+        .header(reqwest::header::CONTENT_TYPE, "text/plain")
+        .body(content.to_vec())
+        .send()
+        .await?;
+    assert!(
+        rejected.status().is_client_error(),
+        "mismatched content type must be rejected, got: {}",
+        rejected.status()
+    );
+
+    // The matching upload should be retrievable.
+    let body = client.get(&file_url).await?;
     assert_eq!(body.as_ref(), content);
 
     client.delete(&file_url).await?;

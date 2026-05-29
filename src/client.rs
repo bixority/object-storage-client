@@ -1,8 +1,9 @@
+use crate::sign::{SignMethod, SignOptions};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use http::Method;
+use object_store::aws::AmazonS3;
 use object_store::signer::Signer;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use std::sync::Arc;
@@ -30,52 +31,6 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// HTTP method a pre-signed URL authorizes.
-///
-/// This is a backend-agnostic abstraction over the HTTP verb so that callers
-/// (including the Python and CLI front-ends) do not need to depend on the
-/// `http`/`reqwest` crates directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SignMethod {
-    /// Download an object.
-    Get,
-    /// Upload (overwrite) an object.
-    Put,
-    /// Upload via an HTTP POST (e.g. browser form uploads).
-    Post,
-    /// Delete an object.
-    Delete,
-    /// Fetch object metadata only.
-    Head,
-}
-
-impl SignMethod {
-    fn into_http(self) -> Method {
-        match self {
-            Self::Get => Method::GET,
-            Self::Put => Method::PUT,
-            Self::Post => Method::POST,
-            Self::Delete => Method::DELETE,
-            Self::Head => Method::HEAD,
-        }
-    }
-}
-
-impl std::str::FromStr for SignMethod {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_uppercase().as_str() {
-            "GET" => Ok(Self::Get),
-            "PUT" => Ok(Self::Put),
-            "POST" => Ok(Self::Post),
-            "DELETE" => Ok(Self::Delete),
-            "HEAD" => Ok(Self::Head),
-            other => Err(Error::Generic(format!("Invalid HTTP method: {other}"))),
-        }
-    }
-}
-
 /// Metadata for an object in storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
@@ -99,11 +54,16 @@ impl From<ObjectMeta> for Metadata {
 }
 
 /// A resolved storage backend: the object store plus, when the backend supports
-/// it, a [`Signer`] for generating pre-signed URLs.
+/// it, a [`Signer`] for generating pre-signed URLs. For S3 the concrete store
+/// is retained as well, so header-bound signing can read its credentials.
+///
+/// Visible to the [`crate::sign`] module, which performs the actual pre-signed
+/// URL generation against a resolved backend.
 #[derive(Clone)]
-struct Backend {
+pub(crate) struct Backend {
     store: Arc<dyn ObjectStore>,
-    signer: Option<Arc<dyn Signer>>,
+    pub(crate) signer: Option<Arc<dyn Signer>>,
+    pub(crate) s3: Option<Arc<AmazonS3>>,
 }
 
 /// A unified object storage client that handles multiple backends based on URL schemes.
@@ -174,7 +134,8 @@ impl ObjectStorageClient {
                 let store = Arc::new(builder.build()?);
                 Backend {
                     signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
-                    store,
+                    store: Arc::clone(&store) as Arc<dyn ObjectStore>,
+                    s3: Some(store),
                 }
             }
             "gs" | "gcs" => {
@@ -187,6 +148,7 @@ impl ObjectStorageClient {
                 Backend {
                     signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
                     store,
+                    s3: None,
                 }
             }
             "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
@@ -199,6 +161,7 @@ impl ObjectStorageClient {
                 Backend {
                     signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
                     store,
+                    s3: None,
                 }
             }
             "http" | "https" => {
@@ -206,11 +169,13 @@ impl ObjectStorageClient {
                 Backend {
                     store: Arc::new(builder.build()?),
                     signer: None,
+                    s3: None,
                 }
             }
             "file" => Backend {
                 store: Arc::new(object_store::local::LocalFileSystem::new()),
                 signer: None,
+                s3: None,
             },
             _ => return Err(Error::UnsupportedScheme(scheme.to_string())),
         };
@@ -445,6 +410,10 @@ impl ObjectStorageClient {
     /// be handed to a client that has no access to the storage credentials
     /// (e.g. a browser performing a direct upload or download).
     ///
+    /// `options` may bind a required `Content-Length` and/or `Content-Type`
+    /// into the signature (S3 only); the client must then send exactly those
+    /// header values. Pass [`SignOptions::default`] for plain signing.
+    ///
     /// Supported for S3 (`s3://`), Google Cloud Storage (`gs://`/`gcs://`) and
     /// Azure Blob Storage (`az://`, `wasb(s)://`, `abfs(s)://`). Local and
     /// plain HTTP backends do not support signing.
@@ -454,22 +423,26 @@ impl ObjectStorageClient {
     /// Returns an error if:
     /// - The URL is invalid.
     /// - The scheme is unsupported, or does not support pre-signed URLs.
+    /// - `options` binds extra headers on a non-S3 backend.
     /// - The backend fails to sign the request.
     pub async fn get_pre_signed_url(
         &self,
         url: &str,
         method: SignMethod,
         expires_in: Duration,
+        options: &SignOptions,
     ) -> Result<String> {
         let parsed_url = Url::parse(url)?;
         let (backend, path) = self.get_backend(&parsed_url)?;
-        let signer = backend
-            .signer
-            .ok_or_else(|| Error::SigningUnsupported(parsed_url.scheme().to_string()))?;
-        let pre_signed_url = signer
-            .signed_url(method.into_http(), &path, expires_in)
-            .await?;
-        Ok(pre_signed_url.into())
+        crate::sign::pre_signed_url(
+            &backend,
+            parsed_url.scheme(),
+            &path,
+            method,
+            expires_in,
+            options,
+        )
+        .await
     }
 
     /// Generates pre-signed URLs for multiple objects sharing the same backend
@@ -479,18 +452,23 @@ impl ObjectStorageClient {
     /// returned. This is more efficient than calling [`Self::get_pre_signed_url`]
     /// in a loop when signing many objects in the same bucket/container.
     ///
+    /// `options` applies the same `Content-Length` / `Content-Type` binding to
+    /// every URL (S3 only); see [`Self::get_pre_signed_url`].
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - `urls` is empty, or any URL is invalid.
     /// - The URLs resolve to different backends.
     /// - The scheme is unsupported, or does not support pre-signed URLs.
+    /// - `options` binds extra headers on a non-S3 backend.
     /// - The backend fails to sign the requests.
     pub async fn get_pre_signed_urls(
         &self,
         urls: &[&str],
         method: SignMethod,
         expires_in: Duration,
+        options: &SignOptions,
     ) -> Result<Vec<String>> {
         let Some((first, rest)) = urls.split_first() else {
             return Err(Error::Generic("No URLs provided for signing".into()));
@@ -498,9 +476,6 @@ impl ObjectStorageClient {
 
         let first_url = Url::parse(first)?;
         let (backend, first_path) = self.get_backend(&first_url)?;
-        let signer = backend
-            .signer
-            .ok_or_else(|| Error::SigningUnsupported(first_url.scheme().to_string()))?;
 
         let mut paths = Vec::with_capacity(urls.len());
         paths.push(first_path);
@@ -516,10 +491,15 @@ impl ObjectStorageClient {
             paths.push(path);
         }
 
-        let pre_signed_url = signer
-            .signed_urls(method.into_http(), &paths, expires_in)
-            .await?;
-        Ok(pre_signed_url.into_iter().map(Into::into).collect())
+        crate::sign::pre_signed_urls(
+            &backend,
+            first_url.scheme(),
+            &paths,
+            method,
+            expires_in,
+            options,
+        )
+        .await
     }
 }
 
@@ -613,19 +593,12 @@ mod tests {
                 "file:///tmp/foo.txt",
                 SignMethod::Get,
                 Duration::from_mins(1),
+                &SignOptions::default(),
             )
             .await
             .expect_err("local filesystem must not support signing");
 
         assert!(matches!(err, Error::SigningUnsupported(scheme) if scheme == "file"));
-    }
-
-    #[tokio::test]
-    async fn test_sign_method_from_str() {
-        assert_eq!("get".parse::<SignMethod>().unwrap(), SignMethod::Get);
-        assert_eq!("PUT".parse::<SignMethod>().unwrap(), SignMethod::Put);
-        assert_eq!("Delete".parse::<SignMethod>().unwrap(), SignMethod::Delete);
-        assert!("PATCH".parse::<SignMethod>().is_err());
     }
 
     #[tokio::test]
@@ -636,12 +609,14 @@ mod tests {
                 &["file:///tmp/a.txt", "s3://bucket/b.txt"],
                 SignMethod::Get,
                 Duration::from_mins(1),
+                &SignOptions::default(),
             )
             .await
             .expect_err("mixed backends must be rejected");
 
-        // The first URL (file) is resolved first and is itself unsupported.
-        assert!(matches!(err, Error::SigningUnsupported(_)));
+        // The URLs resolve to different backends (file vs s3), which is
+        // detected before any signing is attempted.
+        assert!(matches!(err, Error::Generic(msg) if msg.contains("same backend")));
     }
 
     #[tokio::test]

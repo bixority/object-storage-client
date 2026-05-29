@@ -6,6 +6,8 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
+- **Existence checks**: Test whether an object exists without raising on a miss.
+- **Bucket creation**: Create buckets on S3 (or directories for local paths).
 - **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
 - **Multi-Language**: Native Rust library with Python 3.13+ bindings.
 - **Streaming**: Async streaming support for both Rust and Python.
@@ -78,6 +80,16 @@ cargo install --path .
   osc rm s3://my-bucket/temp_file.tmp
   ```
 
+- **Check whether an object exists** (prints `true`/`false`):
+  ```bash
+  osc exists s3://my-bucket/report.pdf
+  ```
+
+- **Create a bucket** (S3, or a directory for local paths):
+  ```bash
+  osc mb s3://my-new-bucket
+  ```
+
 - **Stream an object**:
   ```bash
   osc get-stream gs://my-bucket/large_file.bin
@@ -143,6 +155,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let retrieved = client.get("s3://my-bucket/hello.txt").await?;
     println!("Retrieved: {:?}", String::from_utf8(retrieved.to_vec())?);
 
+    // Create a bucket (S3, or a directory for file:// URLs); idempotent
+    client.create_bucket("s3://my-bucket").await?;
+
+    // Check whether an object exists (missing -> Ok(false), never an error)
+    if client.exists("s3://my-bucket/hello.txt").await? {
+        println!("hello.txt is present");
+    }
+
     // Cross-provider copy (S3 to Local)
     client.copy("s3://my-bucket/hello.txt", "file:///tmp/hello_local.txt").await?;
 
@@ -207,8 +227,21 @@ from object_storage_client import ObjectStorageClient
 async def main():
     client = ObjectStorageClient()
 
+    # Create a bucket (S3, or a directory for file:// URLs); idempotent
+    await client.create_bucket("s3://my-bucket")
+
     # Upload data
     await client.put_object("s3://my-bucket/python_test.txt", b"Hello from Python!")
+
+    # Check whether an object exists (returns a bool; never raises for a miss).
+    # If you prefer the missing case to raise FileNotFoundError, use
+    # get_object_metadata() or get_object() instead.
+    if await client.object_exists("s3://my-bucket/python_test.txt"):
+        print("python_test.txt is present")
+
+    # Fetch full metadata (raises FileNotFoundError if the object is missing)
+    meta = await client.get_object_metadata("s3://my-bucket/python_test.txt")
+    print(f"Size: {meta['size_bytes']}, type: {meta['content_type']}")
 
     # Download data
     data = await client.get_object("s3://my-bucket/python_test.txt")

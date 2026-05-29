@@ -44,6 +44,14 @@ enum Commands {
     Rm {
         url: String,
     },
+    /// Check whether an object exists, printing `true` or `false`.
+    Exists {
+        url: String,
+    },
+    /// Create a bucket / container (or, for local paths, a directory).
+    Mb {
+        url: String,
+    },
     /// Generate a pre-signed URL (S3, GCS and Azure only).
     Sign {
         url: String,
@@ -215,6 +223,20 @@ async fn main() -> Result<()> {
 
             println!("Delete {target}");
             client.delete(&target).await?;
+        }
+
+        Commands::Exists { url } => {
+            let target = to_url(&url);
+
+            let exists = client.exists(&target).await?;
+            println!("{exists}");
+        }
+
+        Commands::Mb { url } => {
+            let target = to_url(&url);
+
+            println!("Create bucket {target}");
+            client.create_bucket(&target).await?;
         }
 
         Commands::Sign {

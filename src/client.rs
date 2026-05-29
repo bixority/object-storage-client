@@ -1,13 +1,11 @@
 use crate::sign::{SignMethod, SignOptions};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::StreamExt;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use object_store::aws::AmazonS3;
 use object_store::signer::Signer;
-use object_store::{
-    Attribute, GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt, path::Path as ObjectPath,
-};
+use object_store::{path::Path as ObjectPath, Attribute, GetOptions, ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -27,46 +25,36 @@ pub enum Error {
     #[error("Pre-signed URLs are not supported for scheme: {0}")]
     SigningUnsupported(String),
 
+    #[error("Bucket creation is not supported for scheme: {0}")]
+    BucketCreationUnsupported(String),
+
     #[error("Generic error: {0}")]
     Generic(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Metadata for an object in storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Metadata {
-    pub location: String,
-    pub last_modified: chrono::DateTime<chrono::Utc>,
-    pub size: u64,
-    pub e_tag: Option<String>,
-    pub version: Option<String>,
-}
-
-impl From<ObjectMeta> for Metadata {
-    fn from(meta: ObjectMeta) -> Self {
-        Self {
-            location: meta.location.to_string(),
-            last_modified: meta.last_modified,
-            size: meta.size,
-            e_tag: meta.e_tag,
-            version: meta.version,
-        }
-    }
-}
-
-/// The size and content type of a stored object, as reported by a HEAD request.
+/// Metadata for an object in storage, as reported by a HEAD request.
 ///
-/// Returned by [`ObjectStorageClient::get_object_metadata`]. Unlike [`Metadata`], this
-/// carries the `Content-Type` (read from the object's attributes), which the
-/// plain `head` operation does not expose — useful for verifying that a
-/// completed upload wrote the bytes and content type a presigned URL was
-/// issued for.
+/// Returned by [`ObjectStorageClient::get_object_metadata`]. Alongside the
+/// fields carried by `object_store`'s `ObjectMeta` (location, last modified
+/// time, size, e-tag and version) this also exposes the stored `Content-Type`,
+/// read from the object's attributes — useful for verifying that a completed
+/// upload wrote the bytes and content type a presigned URL was issued for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectMetadata {
+    /// The object's path within the store.
+    pub location: String,
+    /// The last modification time reported by the store.
+    pub last_modified: chrono::DateTime<chrono::Utc>,
+    /// The object size in bytes.
     pub size_bytes: u64,
     /// The stored `Content-Type`, or `None` if the backend reported none.
     pub content_type: Option<String>,
+    /// The object's e-tag, if the backend reports one.
+    pub e_tag: Option<String>,
+    /// The object's version, if the backend reports one.
+    pub version: Option<String>,
 }
 
 /// A resolved storage backend: the object store plus, when the backend supports
@@ -321,36 +309,24 @@ impl ObjectStorageClient {
         Ok(results)
     }
 
-    /// Retrieves metadata for an object at the given URL.
+    /// Retrieves metadata for the object at the given URL.
+    ///
+    /// Issues a single HEAD request via [`GetOptions::head`], returning the
+    /// location, last modified time, size, e-tag and version from the object
+    /// metadata together with the `Content-Type` read from the object
+    /// attributes. A missing object is reported as an error
+    /// ([`object_store::Error::NotFound`], surfaced as `FileNotFoundError` from
+    /// the Python bindings); use [`Self::exists`] for a non-erroring presence
+    /// check.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The URL is invalid.
     /// - The scheme is unsupported.
+    /// - The object does not exist.
     /// - There is an error retrieving metadata from the store.
-    pub async fn head(&self, url: &str) -> Result<Metadata> {
-        let parsed_url = Url::parse(url)?;
-        let (store, path) = self.get_store(&parsed_url)?;
-        let meta = store.head(&path).await?;
-        Ok(meta.into())
-    }
-
-    /// Returns the object's size and content type, or `None` if it does not
-    /// exist.
-    ///
-    /// Unlike [`Self::head`], this also reports the stored `Content-Type` and
-    /// treats a missing object as `None` rather than an error. It issues a
-    /// single HEAD request via [`GetOptions::head`], reading the size from the
-    /// object metadata and the content type from the object attributes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The URL is invalid.
-    /// - The scheme is unsupported.
-    /// - The store fails for a reason other than the object not existing.
-    pub async fn get_object_metadata(&self, url: &str) -> Result<Option<ObjectMetadata>> {
+    pub async fn get_object_metadata(&self, url: &str) -> Result<ObjectMetadata> {
         let parsed_url = Url::parse(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         let options = GetOptions {
@@ -358,19 +334,86 @@ impl ObjectStorageClient {
             ..Default::default()
         };
 
-        match store.get_opts(&path, options).await {
-            Ok(result) => {
-                let content_type = result
-                    .attributes
-                    .get(&Attribute::ContentType)
-                    .map(|value| value.as_ref().to_string());
-                Ok(Some(ObjectMetadata {
-                    size_bytes: result.meta.size,
-                    content_type,
-                }))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
+        let result = store.get_opts(&path, options).await?;
+        let content_type = result
+            .attributes
+            .get(&Attribute::ContentType)
+            .map(|value| value.as_ref().to_string());
+        let meta = result.meta;
+
+        Ok(ObjectMetadata {
+            location: meta.location.to_string(),
+            last_modified: meta.last_modified,
+            size_bytes: meta.size,
+            content_type,
+            e_tag: meta.e_tag,
+            version: meta.version,
+        })
+    }
+
+    /// Returns whether an object exists at the given URL.
+    ///
+    /// Issues a single HEAD request through the backend. A missing object
+    /// yields `Ok(false)` rather than an error; any other failure (invalid
+    /// URL, unsupported scheme, network/permission error) is propagated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme is unsupported.
+    /// - The store fails for a reason other than the object not existing.
+    pub async fn exists(&self, url: &str) -> Result<bool> {
+        let parsed_url = Url::parse(url)?;
+        let (store, path) = self.get_store(&parsed_url)?;
+
+        match store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Creates the bucket / container identified by `url`.
+    ///
+    /// The bucket is identified by the URL's scheme and host; any path
+    /// component is ignored, except for `file://` URLs where the path is the
+    /// directory to create. `object_store` exposes no bucket-management API, so
+    /// this is implemented per backend:
+    ///
+    /// - `file://` — creates the directory (and any missing parents).
+    /// - `s3://` — issues a pre-signed `PUT` to the bucket root, compatible
+    ///   with AWS S3, MinIO and `SeaweedFS`.
+    ///
+    /// Other schemes are not supported. Creating a bucket that already exists
+    /// is treated as success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme does not support bucket creation.
+    /// - The backend rejects the request.
+    pub async fn create_bucket(&self, url: &str) -> Result<()> {
+        let parsed_url = Url::parse(url)?;
+        let scheme = parsed_url.scheme();
+
+        match scheme {
+            "file" => {
+                let path = parsed_url.path();
+                tokio::fs::create_dir_all(path).await.map_err(|e| {
+                    Error::Generic(format!("Failed to create directory {path}: {e}"))
+                })?;
+                Ok(())
+            }
+            "s3" => {
+                let (backend, _) = self.get_backend(&parsed_url)?;
+                let signed =
+                    crate::sign::pre_signed_create_bucket(&backend, scheme, Duration::from_mins(5))
+                        .await?;
+                put_bucket(&signed).await
+            }
+            other => Err(Error::BucketCreationUnsupported(other.to_string())),
         }
     }
 
@@ -557,6 +600,28 @@ impl ObjectStorageClient {
     }
 }
 
+/// Executes a pre-signed `PUT` request against a bucket root to create it.
+///
+/// Treats a `409 Conflict` (bucket already exists / already owned) as success
+/// so that [`ObjectStorageClient::create_bucket`] is idempotent.
+async fn put_bucket(signed_url: &str) -> Result<()> {
+    let response = reqwest::Client::new()
+        .put(signed_url)
+        .send()
+        .await
+        .map_err(|e| Error::Generic(format!("Bucket creation request failed: {e}")))?;
+
+    let status = response.status();
+    if status.is_success() || status.as_u16() == 409 {
+        Ok(())
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        Err(Error::Generic(format!(
+            "Bucket creation failed with HTTP {status}: {body}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,34 +644,86 @@ mod tests {
         let retrieved = client.get(&url).await?;
         assert_eq!(retrieved.as_ref(), data);
 
-        // Head
-        let meta = client.head(&url).await?;
-        assert_eq!(meta.size, data.len() as u64);
-
         // List (using directory URL)
         let dir_url = format!("file://{}", dir.path().to_str().unwrap());
         let list = client.list(&dir_url).await?;
         assert!(list.iter().any(|p| p.ends_with("test.txt")));
 
-        // Head object (size + content type, present)
+        // Object metadata (size, location, content type) for an existing object.
         let stored = client.get_object_metadata(&url).await?;
-        assert_eq!(
-            stored,
-            Some(ObjectMetadata {
-                size_bytes: data.len() as u64,
-                // LocalFileSystem reports no content type.
-                content_type: None,
-            })
-        );
+        assert_eq!(stored.size_bytes, data.len() as u64);
+        assert!(stored.location.ends_with("test.txt"));
+        // LocalFileSystem reports no content type.
+        assert_eq!(stored.content_type, None);
 
         // Delete
         client.delete(&url).await?;
         assert!(fs::metadata(&file_path).is_err());
 
-        // Head object on a missing object yields None rather than an error.
-        assert_eq!(client.get_object_metadata(&url).await?, None);
+        // Metadata for a missing object errors with NotFound.
+        let err = client
+            .get_object_metadata(&url)
+            .await
+            .expect_err("metadata for a missing object must error");
+        assert!(matches!(
+            err,
+            Error::ObjectStore(object_store::Error::NotFound { .. })
+        ));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exists() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("exists.txt");
+        let url = format!("file://{}", file_path.to_str().unwrap());
+
+        let client = ObjectStorageClient::new();
+
+        // Missing object reports false rather than erroring.
+        assert!(!client.exists(&url).await?);
+
+        client.put(&url, &b"data"[..]).await?;
+        assert!(client.exists(&url).await?);
+
+        client.delete(&url).await?;
+        assert!(!client.exists(&url).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_bucket_local() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let bucket_path = dir.path().join("new-bucket");
+        let url = format!("file://{}", bucket_path.to_str().unwrap());
+
+        let client = ObjectStorageClient::new();
+
+        client.create_bucket(&url).await?;
+        assert!(bucket_path.is_dir());
+
+        // Idempotent: creating an existing bucket succeeds.
+        client.create_bucket(&url).await?;
+
+        // Objects can be written into the freshly-created bucket.
+        let obj_url = format!("file://{}", bucket_path.join("o.txt").to_str().unwrap());
+        client.put(&obj_url, &b"hi"[..]).await?;
+        assert!(client.exists(&obj_url).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_bucket_unsupported_scheme() {
+        let client = ObjectStorageClient::new();
+        let err = client
+            .create_bucket("https://example.com/foo")
+            .await
+            .expect_err("https must not support bucket creation");
+
+        assert!(matches!(err, Error::BucketCreationUnsupported(scheme) if scheme == "https"));
     }
 
     #[tokio::test]

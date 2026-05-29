@@ -66,6 +66,47 @@ async fn test_s3_object_lifecycle() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Verifies bucket creation and object existence checks against a live S3
+/// backend.
+///
+/// Set `S3_BUCKET` to a bucket name that does NOT yet exist; the test creates
+/// it and writes/checks an object inside it. Requires the same credentials as
+/// `test_s3_object_lifecycle`.
+/// Run with: `cargo test --test s3_storage_ops -- --ignored`
+#[tokio::test]
+#[ignore = "functional"]
+async fn test_s3_create_bucket_and_exists() -> anyhow::Result<()> {
+    let bucket = std::env::var("S3_BUCKET")
+        .expect("S3_BUCKET environment variable must be set to run this test");
+    let bucket = bucket.trim_end_matches('/');
+    let bucket_url = format!("s3://{bucket}/");
+
+    let client = ObjectStorageClient::new();
+
+    // Creating the bucket should succeed, and be idempotent.
+    client.create_bucket(&bucket_url).await?;
+    client.create_bucket(&bucket_url).await?;
+
+    let file_url = format!("{bucket_url}exists_probe.txt");
+
+    // A not-yet-written object does not exist.
+    assert!(
+        !client.exists(&file_url).await?,
+        "object should not exist yet"
+    );
+
+    client.put(&file_url, &b"present"[..]).await?;
+    assert!(client.exists(&file_url).await?, "object should exist now");
+
+    client.delete(&file_url).await?;
+    assert!(
+        !client.exists(&file_url).await?,
+        "object should not exist after delete"
+    );
+
+    Ok(())
+}
+
 /// Verifies that a pre-signed GET URL can be generated for S3 and used to
 /// retrieve an object without supplying credentials directly.
 ///

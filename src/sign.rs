@@ -188,6 +188,55 @@ pub(crate) async fn pre_signed_urls(
     Ok(pre_signed_urls)
 }
 
+/// Generate a pre-signed `PUT` URL targeting the bucket root, suitable for
+/// creating the bucket (S3 `CreateBucket`). Only S3 backends are supported.
+///
+/// The bucket endpoint and its host/path style (virtual-hosted vs path-style)
+/// are discovered from `object_store`'s own signer by signing the empty object
+/// path; the resulting URL's trailing slash is then dropped so the request
+/// targets `PUT /` (virtual-hosted) or `PUT /{bucket}` (path-style) rather than
+/// an empty object key, before re-signing with host-only `SigV4`.
+///
+/// # Errors
+///
+/// Returns an error if the backend is not an S3 backend, or signing fails.
+pub(crate) async fn pre_signed_create_bucket(
+    backend: &Backend,
+    scheme: &str,
+    expires_in: Duration,
+) -> Result<String> {
+    let signer = backend
+        .signer
+        .as_ref()
+        .ok_or_else(|| Error::BucketCreationUnsupported(scheme.to_string()))?;
+    let s3 = backend
+        .s3
+        .as_ref()
+        .ok_or_else(|| Error::BucketCreationUnsupported(scheme.to_string()))?;
+
+    // Ask the signer to sign the bucket root so we inherit the correctly-styled
+    // endpoint URL, then strip the trailing slash and the host-only query.
+    let mut base = signer
+        .signed_url(Method::PUT, &ObjectPath::from(""), expires_in)
+        .await?;
+    base.set_query(None);
+    let trimmed = base.as_str().trim_end_matches('/');
+    let base = Url::parse(trimmed)?;
+
+    let credential = s3.credentials().get_credential().await?;
+    let region = s3_region();
+
+    let signed = presign_s3(
+        &base,
+        &Method::PUT,
+        expires_in,
+        &credential,
+        &region,
+        BoundHeaders::default(),
+    );
+    Ok(signed.into())
+}
+
 /// Re-sign `base` (an `object_store`-produced signed URL) binding the headers
 /// in `options` into the signature. Only S3 backends carry the credentials
 /// needed for this; other backends yield an error.

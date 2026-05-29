@@ -26,6 +26,7 @@ futures-util = "0.3"
 http = "1"
 object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
 percent-encoding = "2.3"
+reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 ring = "0.17"
 pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"], optional = true }
@@ -41,7 +42,6 @@ name = "osc"
 path = "src/main.rs"
 
 [dev-dependencies]
-reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 tempfile = "3.27"
 tokio = { version = "1.52", features = ["full", "test-util"] }
 

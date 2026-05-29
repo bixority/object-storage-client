@@ -163,39 +163,13 @@ impl ObjectStorageClient {
         })
     }
 
-    fn head<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
-        let inner = Arc::clone(&self.inner);
-
-        future_into_py(py, async move {
-            let meta = inner.head(&url).await.map_err(client_to_py_err)?;
-
-            pyo3::Python::attach(|py| {
-                let dict = PyDict::new(py);
-
-                dict.set_item("location", &meta.location)?;
-                dict.set_item("last_modified", meta.last_modified.to_rfc3339())?;
-                dict.set_item("size", meta.size)?;
-
-                if let Some(e_tag) = meta.e_tag {
-                    dict.set_item("e_tag", e_tag)?;
-                }
-
-                if let Some(version) = meta.version {
-                    dict.set_item("version", version)?;
-                }
-
-                Ok(dict.into_any().unbind())
-            })
-        })
-    }
-
-    /// Return the object's size and content type, or ``None`` if it does not
-    /// exist.
+    /// Return metadata for the object at ``url``.
     ///
-    /// On success returns a dict ``{"size_bytes": int, "content_type": str}``;
-    /// ``content_type`` is the empty string when the backend reports none.
-    /// Unlike :py:meth:`head`, a missing object yields ``None`` rather than
-    /// raising ``FileNotFoundError``.
+    /// On success returns a dict with the keys ``location`` (str),
+    /// ``last_modified`` (RFC 3339 str), ``size_bytes`` (int), ``content_type``
+    /// (str or ``None``), ``e_tag`` (str or ``None``) and ``version`` (str or
+    /// ``None``). A missing object raises ``FileNotFoundError``; use
+    /// :py:meth:`object_exists` for a non-raising presence check.
     fn get_object_metadata<'py>(
         &self,
         py: Python<'py>,
@@ -209,15 +183,45 @@ impl ObjectStorageClient {
                 .await
                 .map_err(client_to_py_err)?;
 
-            pyo3::Python::attach(|py| match stored {
-                Some(stored) => {
-                    let dict = PyDict::new(py);
-                    dict.set_item("size_bytes", stored.size_bytes)?;
-                    dict.set_item("content_type", stored.content_type.unwrap_or_default())?;
-                    Ok(dict.into_any().unbind())
-                }
-                None => Ok(py.None()),
+            pyo3::Python::attach(|py| {
+                let dict = PyDict::new(py);
+                dict.set_item("location", stored.location)?;
+                dict.set_item("last_modified", stored.last_modified.to_rfc3339())?;
+                dict.set_item("size_bytes", stored.size_bytes)?;
+                dict.set_item("content_type", stored.content_type)?;
+                dict.set_item("e_tag", stored.e_tag)?;
+                dict.set_item("version", stored.version)?;
+                Ok(dict.into_any().unbind())
             })
+        })
+    }
+
+    /// Return ``True`` if an object exists at ``url``, otherwise ``False``.
+    ///
+    /// A missing object yields ``False`` rather than raising. Use
+    /// :py:meth:`get_object_metadata` or :py:meth:`get_object` if you prefer
+    /// the missing case to raise ``FileNotFoundError``.
+    fn object_exists<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let exists = inner.exists(&url).await.map_err(client_to_py_err)?;
+            Ok(exists)
+        })
+    }
+
+    /// Create the bucket / container identified by ``url``.
+    ///
+    /// The bucket is identified by the URL's scheme and host; for ``file://``
+    /// URLs the path is the directory to create. Supported for ``file://`` and
+    /// ``s3://`` (AWS S3, MinIO and SeaweedFS). Creating a bucket that already
+    /// exists is treated as success.
+    fn create_bucket<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            inner.create_bucket(&url).await.map_err(client_to_py_err)?;
+            Ok(())
         })
     }
 

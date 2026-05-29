@@ -612,7 +612,7 @@ mod tests {
             .get_pre_signed_url(
                 "file:///tmp/foo.txt",
                 SignMethod::Get,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .await
             .expect_err("local filesystem must not support signing");
@@ -635,7 +635,7 @@ mod tests {
             .get_pre_signed_urls(
                 &["file:///tmp/a.txt", "s3://bucket/b.txt"],
                 SignMethod::Get,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
             )
             .await
             .expect_err("mixed backends must be rejected");

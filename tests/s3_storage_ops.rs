@@ -85,7 +85,7 @@ async fn test_s3_presigned_url_roundtrip() -> anyhow::Result<()> {
     client.put(&file_url, &content[..]).await?;
 
     let signed = client
-        .get_pre_signed_url(&file_url, SignMethod::Get, Duration::from_secs(300))
+        .get_pre_signed_url(&file_url, SignMethod::Get, Duration::from_mins(5))
         .await?;
 
     assert!(

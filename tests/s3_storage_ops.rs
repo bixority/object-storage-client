@@ -87,6 +87,18 @@ async fn test_s3_create_bucket_and_exists() -> anyhow::Result<()> {
     client.create_bucket(&bucket_url).await?;
     client.create_bucket(&bucket_url).await?;
 
+    // The freshly-created bucket should report as existing, while a clearly
+    // bogus bucket name should not.
+    assert!(
+        client.bucket_exists(&bucket_url).await?,
+        "created bucket should exist"
+    );
+    let missing_bucket_url = format!("s3://{bucket}-does-not-exist/");
+    assert!(
+        !client.bucket_exists(&missing_bucket_url).await?,
+        "nonexistent bucket should not exist"
+    );
+
     let file_url = format!("{bucket_url}exists_probe.txt");
 
     // A not-yet-written object does not exist.

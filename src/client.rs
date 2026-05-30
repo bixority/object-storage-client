@@ -1,11 +1,11 @@
 use crate::sign::{SignMethod, SignOptions};
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::aws::AmazonS3;
 use object_store::signer::Signer;
-use object_store::{path::Path as ObjectPath, Attribute, GetOptions, ObjectStore, ObjectStoreExt};
+use object_store::{Attribute, GetOptions, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("Bucket creation is not supported for scheme: {0}")]
     BucketCreationUnsupported(String),
+
+    #[error("Bucket existence checks are not supported for scheme: {0}")]
+    BucketExistenceUnsupported(String),
 
     #[error("Generic error: {0}")]
     Generic(String),
@@ -383,7 +386,7 @@ impl ObjectStorageClient {
     ///
     /// - `file://` — creates the directory (and any missing parents).
     /// - `s3://` — issues a pre-signed `PUT` to the bucket root, compatible
-    ///   with AWS S3, MinIO and `SeaweedFS`.
+    ///   with AWS S3, `MinIO` and `SeaweedFS`.
     ///
     /// Other schemes are not supported. Creating a bucket that already exists
     /// is treated as success.
@@ -414,6 +417,53 @@ impl ObjectStorageClient {
                 put_bucket(&signed).await
             }
             other => Err(Error::BucketCreationUnsupported(other.to_string())),
+        }
+    }
+
+    /// Returns whether the bucket / container identified by `url` exists.
+    ///
+    /// As with [`Self::create_bucket`], the bucket is identified by the URL's
+    /// scheme and host; any path component is ignored, except for `file://`
+    /// URLs where the path is the directory to probe. `object_store` exposes no
+    /// bucket-management API, so this is implemented per backend:
+    ///
+    /// - `file://` — checks that the path exists and is a directory.
+    /// - `s3://` — issues a pre-signed `HEAD` to the bucket root (S3
+    ///   `HeadBucket`), compatible with AWS S3, `MinIO` and `SeaweedFS`. A
+    ///   `403 Forbidden` is treated as existence: the bucket is present but the
+    ///   caller may not list it.
+    ///
+    /// Other schemes are not supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme does not support bucket existence checks.
+    /// - The backend fails for a reason other than the bucket not existing.
+    pub async fn bucket_exists(&self, url: &str) -> Result<bool> {
+        let parsed_url = Url::parse(url)?;
+        let scheme = parsed_url.scheme();
+
+        match scheme {
+            "file" => {
+                let path = parsed_url.path();
+                match tokio::fs::metadata(path).await {
+                    Ok(meta) => Ok(meta.is_dir()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(Error::Generic(format!(
+                        "Failed to stat directory {path}: {e}"
+                    ))),
+                }
+            }
+            "s3" => {
+                let (backend, _) = self.get_backend(&parsed_url)?;
+                let signed =
+                    crate::sign::pre_signed_head_bucket(&backend, scheme, Duration::from_mins(5))
+                        .await?;
+                head_bucket(&signed).await
+            }
+            other => Err(Error::BucketExistenceUnsupported(other.to_string())),
         }
     }
 
@@ -622,6 +672,33 @@ async fn put_bucket(signed_url: &str) -> Result<()> {
     }
 }
 
+/// Executes a pre-signed `HEAD` request against a bucket root to determine
+/// whether it exists (S3 `HeadBucket`).
+///
+/// A `2xx` response means the bucket exists; `404 Not Found` means it does not.
+/// A `403 Forbidden` is treated as existence (the bucket is present but the
+/// caller lacks permission to probe it), mirroring the conventional
+/// `HeadBucket` interpretation. Any other status is surfaced as an error.
+async fn head_bucket(signed_url: &str) -> Result<bool> {
+    let response = reqwest::Client::new()
+        .head(signed_url)
+        .send()
+        .await
+        .map_err(|e| Error::Generic(format!("Bucket existence request failed: {e}")))?;
+
+    let status = response.status();
+    if status.is_success() || status.as_u16() == 403 {
+        Ok(true)
+    } else if status.as_u16() == 404 {
+        Ok(false)
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        Err(Error::Generic(format!(
+            "Bucket existence check failed with HTTP {status}: {body}"
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +801,40 @@ mod tests {
             .expect_err("https must not support bucket creation");
 
         assert!(matches!(err, Error::BucketCreationUnsupported(scheme) if scheme == "https"));
+    }
+
+    #[tokio::test]
+    async fn test_bucket_exists_local() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let bucket_path = dir.path().join("probe-bucket");
+        let url = format!("file://{}", bucket_path.to_str().unwrap());
+
+        let client = ObjectStorageClient::new();
+
+        // Missing bucket reports false rather than erroring.
+        assert!(!client.bucket_exists(&url).await?);
+
+        client.create_bucket(&url).await?;
+        assert!(client.bucket_exists(&url).await?);
+
+        // A plain file at the path is not a bucket.
+        let file_path = dir.path().join("plain.txt");
+        let file_url = format!("file://{}", file_path.to_str().unwrap());
+        client.put(&file_url, &b"hi"[..]).await?;
+        assert!(!client.bucket_exists(&file_url).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bucket_exists_unsupported_scheme() {
+        let client = ObjectStorageClient::new();
+        let err = client
+            .bucket_exists("https://example.com/foo")
+            .await
+            .expect_err("https must not support bucket existence checks");
+
+        assert!(matches!(err, Error::BucketExistenceUnsupported(scheme) if scheme == "https"));
     }
 
     #[tokio::test]

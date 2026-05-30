@@ -214,7 +214,7 @@ impl ObjectStorageClient {
     ///
     /// The bucket is identified by the URL's scheme and host; for ``file://``
     /// URLs the path is the directory to create. Supported for ``file://`` and
-    /// ``s3://`` (AWS S3, MinIO and SeaweedFS). Creating a bucket that already
+    /// ``s3://`` (AWS S3, `MinIO` and `SeaweedFS`). Creating a bucket that already
     /// exists is treated as success.
     fn create_bucket<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
@@ -222,6 +222,22 @@ impl ObjectStorageClient {
         future_into_py(py, async move {
             inner.create_bucket(&url).await.map_err(client_to_py_err)?;
             Ok(())
+        })
+    }
+
+    /// Return ``True`` if the bucket / container identified by ``url`` exists,
+    /// otherwise ``False``.
+    ///
+    /// The bucket is identified by the URL's scheme and host; for ``file://``
+    /// URLs the path is the directory to probe. Supported for ``file://`` and
+    /// ``s3://`` (AWS S3, `MinIO` and `SeaweedFS`). A missing bucket yields
+    /// ``False`` rather than raising.
+    fn bucket_exists<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            let exists = inner.bucket_exists(&url).await.map_err(client_to_py_err)?;
+            Ok(exists)
         })
     }
 

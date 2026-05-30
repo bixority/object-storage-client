@@ -188,14 +188,50 @@ pub(crate) async fn pre_signed_urls(
     Ok(pre_signed_urls)
 }
 
-/// Generate a pre-signed `PUT` URL targeting the bucket root, suitable for
-/// creating the bucket (S3 `CreateBucket`). Only S3 backends are supported.
+/// Generate a pre-signed URL for `method` targeting the bucket root, for the
+/// bucket-level operations `object_store` does not expose (S3 `CreateBucket`
+/// via `PUT`, `HeadBucket` via `HEAD`). Only S3 backends are supported;
+/// `unsupported` builds the error returned for any other backend.
 ///
 /// The bucket endpoint and its host/path style (virtual-hosted vs path-style)
 /// are discovered from `object_store`'s own signer by signing the empty object
 /// path; the resulting URL's trailing slash is then dropped so the request
-/// targets `PUT /` (virtual-hosted) or `PUT /{bucket}` (path-style) rather than
-/// an empty object key, before re-signing with host-only `SigV4`.
+/// targets `/` (virtual-hosted) or `/{bucket}` (path-style) rather than an
+/// empty object key, before re-signing with host-only `SigV4`.
+async fn pre_signed_bucket_request(
+    backend: &Backend,
+    method: &Method,
+    expires_in: Duration,
+    unsupported: impl Fn() -> Error,
+) -> Result<String> {
+    let signer = backend.signer.as_ref().ok_or_else(&unsupported)?;
+    let s3 = backend.s3.as_ref().ok_or_else(&unsupported)?;
+
+    // Ask the signer to sign the bucket root so we inherit the correctly-styled
+    // endpoint URL, then strip the trailing slash and the host-only query.
+    let mut base = signer
+        .signed_url(method.clone(), &ObjectPath::from(""), expires_in)
+        .await?;
+    base.set_query(None);
+    let trimmed = base.as_str().trim_end_matches('/');
+    let base = Url::parse(trimmed)?;
+
+    let credential = s3.credentials().get_credential().await?;
+    let region = s3_region();
+
+    let presigned = presign_s3(
+        &base,
+        method,
+        expires_in,
+        &credential,
+        &region,
+        BoundHeaders::default(),
+    );
+    Ok(presigned.into())
+}
+
+/// Generate a pre-signed `PUT` URL targeting the bucket root, suitable for
+/// creating the bucket (S3 `CreateBucket`). Only S3 backends are supported.
 ///
 /// # Errors
 ///
@@ -205,36 +241,28 @@ pub(crate) async fn pre_signed_create_bucket(
     scheme: &str,
     expires_in: Duration,
 ) -> Result<String> {
-    let signer = backend
-        .signer
-        .as_ref()
-        .ok_or_else(|| Error::BucketCreationUnsupported(scheme.to_string()))?;
-    let s3 = backend
-        .s3
-        .as_ref()
-        .ok_or_else(|| Error::BucketCreationUnsupported(scheme.to_string()))?;
+    pre_signed_bucket_request(backend, &Method::PUT, expires_in, || {
+        Error::BucketCreationUnsupported(scheme.to_string())
+    })
+    .await
+}
 
-    // Ask the signer to sign the bucket root so we inherit the correctly-styled
-    // endpoint URL, then strip the trailing slash and the host-only query.
-    let mut base = signer
-        .signed_url(Method::PUT, &ObjectPath::from(""), expires_in)
-        .await?;
-    base.set_query(None);
-    let trimmed = base.as_str().trim_end_matches('/');
-    let base = Url::parse(trimmed)?;
-
-    let credential = s3.credentials().get_credential().await?;
-    let region = s3_region();
-
-    let signed = presign_s3(
-        &base,
-        &Method::PUT,
-        expires_in,
-        &credential,
-        &region,
-        BoundHeaders::default(),
-    );
-    Ok(signed.into())
+/// Generate a pre-signed `HEAD` URL targeting the bucket root, suitable for
+/// probing the bucket's existence (S3 `HeadBucket`). Only S3 backends are
+/// supported.
+///
+/// # Errors
+///
+/// Returns an error if the backend is not an S3 backend, or signing fails.
+pub(crate) async fn pre_signed_head_bucket(
+    backend: &Backend,
+    scheme: &str,
+    expires_in: Duration,
+) -> Result<String> {
+    pre_signed_bucket_request(backend, &Method::HEAD, expires_in, || {
+        Error::BucketExistenceUnsupported(scheme.to_string())
+    })
+    .await
 }
 
 /// Re-sign `base` (an `object_store`-produced signed URL) binding the headers

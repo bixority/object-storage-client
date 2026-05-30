@@ -6,7 +6,7 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
-- **Existence checks**: Test whether an object exists without raising on a miss.
+- **Existence checks**: Test whether an object or bucket exists without raising on a miss.
 - **Bucket creation**: Create buckets on S3 (or directories for local paths).
 - **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
 - **Multi-Language**: Native Rust library with Python 3.13+ bindings.
@@ -20,6 +20,239 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 - `az://`, `wasb://`, `wasbs://`, `abfs://`, or `abfss://` (Azure Blob Storage)
 - `http://host/path` or `https://host/path` (HTTP/HTTPS)
 - `file:///absolute/path` or `local_path` (Local Filesystem)
+
+---
+
+## Provider Configuration & Examples
+
+Credentials are read from the environment when a backend is first used — the
+client never takes them as constructor arguments. The bucket / container is
+always taken from the URL host, so the same process can talk to several buckets
+across several providers at once. Set the variables below before constructing
+`ObjectStorageClient` (e.g. export them in your shell, a `.env` file, or your
+container/runtime configuration).
+
+The examples reuse the same operation (`put` then `get`); see the
+[Rust](#rust-usage), [Python](#python-313-usage) and [CLI](#cli-usage-osc)
+sections for the full API.
+
+### AWS S3
+
+**Provider:** Amazon S3 (and S3-compatible stores such as MinIO or SeaweedFS).
+
+**Env variables:**
+
+```bash
+# Standard AWS variables (read via AmazonS3Builder::from_env())
+export AWS_ACCESS_KEY_ID="AKIA..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_REGION="us-east-1"
+# Optional: session token for temporary credentials
+export AWS_SESSION_TOKEN="..."
+# Optional: custom endpoint for S3-compatible stores (e.g. MinIO)
+export AWS_ENDPOINT="https://s3.us-east-1.amazonaws.com"
+
+# Convenience overrides honoured by this client (take precedence when set):
+#   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
+# Set S3_SECURE=false to allow plain HTTP (e.g. a local MinIO over http://):
+#   export S3_SECURE=false
+```
+
+**Rust example:**
+
+```rust
+use object_storage_client::ObjectStorageClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ObjectStorageClient::new();
+    client.put("s3://my-bucket/hello.txt", &b"Hello from Rust!"[..]).await?;
+    let data = client.get("s3://my-bucket/hello.txt").await?;
+    println!("{}", String::from_utf8_lossy(&data));
+    Ok(())
+}
+```
+
+**Python example:**
+
+```python
+import asyncio
+from object_storage_client import ObjectStorageClient
+
+async def main():
+    client = ObjectStorageClient()
+    await client.put_object("s3://my-bucket/hello.txt", b"Hello from Python!")
+    data = await client.get_object("s3://my-bucket/hello.txt")
+    print(data.decode())
+
+asyncio.run(main())
+```
+
+**CLI example:**
+
+```bash
+osc put hello.txt s3://my-bucket/hello.txt
+osc get s3://my-bucket/hello.txt ./hello.txt
+```
+
+### Azure Blob Storage
+
+**Provider:** Azure Blob Storage. Use the `az://` scheme (the host is the
+container); `wasb(s)://` and `abfs(s)://` are also accepted.
+
+**Env variables:**
+
+```bash
+export AZURE_STORAGE_ACCOUNT_NAME="mystorageaccount"
+
+# Pick ONE authentication method:
+
+# 1. Shared account key
+export AZURE_STORAGE_ACCOUNT_KEY="..."
+
+# 2. Shared Access Signature (SAS) token
+#   export AZURE_STORAGE_SAS_KEY="?sv=..."
+
+# 3. Service principal (Azure AD)
+#   export AZURE_STORAGE_CLIENT_ID="..."
+#   export AZURE_STORAGE_CLIENT_SECRET="..."
+#   export AZURE_STORAGE_TENANT_ID="..."
+```
+
+**Rust example:**
+
+```rust
+use object_storage_client::ObjectStorageClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ObjectStorageClient::new();
+    client.put("az://my-container/hello.txt", &b"Hello from Rust!"[..]).await?;
+    let data = client.get("az://my-container/hello.txt").await?;
+    println!("{}", String::from_utf8_lossy(&data));
+    Ok(())
+}
+```
+
+**Python example:**
+
+```python
+import asyncio
+from object_storage_client import ObjectStorageClient
+
+async def main():
+    client = ObjectStorageClient()
+    await client.put_object("az://my-container/hello.txt", b"Hello from Python!")
+    data = await client.get_object("az://my-container/hello.txt")
+    print(data.decode())
+
+asyncio.run(main())
+```
+
+**CLI example:**
+
+```bash
+osc put hello.txt az://my-container/hello.txt
+osc get az://my-container/hello.txt ./hello.txt
+```
+
+### Google Cloud Storage
+
+**Provider:** Google Cloud Storage. Use the `gs://` (or `gcs://`) scheme; the
+host is the bucket.
+
+**Env variables:**
+
+```bash
+# Path to a service-account JSON key file...
+export GOOGLE_SERVICE_ACCOUNT="/path/to/service-account.json"
+# (GOOGLE_SERVICE_ACCOUNT_PATH and the standard
+#  GOOGLE_APPLICATION_CREDENTIALS are also recognised.)
+
+# ...or the service-account JSON supplied inline instead of a path:
+#   export GOOGLE_SERVICE_ACCOUNT_KEY='{"type":"service_account", ...}'
+```
+
+**Rust example:**
+
+```rust
+use object_storage_client::ObjectStorageClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ObjectStorageClient::new();
+    client.put("gs://my-bucket/hello.txt", &b"Hello from Rust!"[..]).await?;
+    let data = client.get("gs://my-bucket/hello.txt").await?;
+    println!("{}", String::from_utf8_lossy(&data));
+    Ok(())
+}
+```
+
+**Python example:**
+
+```python
+import asyncio
+from object_storage_client import ObjectStorageClient
+
+async def main():
+    client = ObjectStorageClient()
+    await client.put_object("gs://my-bucket/hello.txt", b"Hello from Python!")
+    data = await client.get_object("gs://my-bucket/hello.txt")
+    print(data.decode())
+
+asyncio.run(main())
+```
+
+**CLI example:**
+
+```bash
+osc put hello.txt gs://my-bucket/hello.txt
+osc get gs://my-bucket/hello.txt ./hello.txt
+```
+
+### Local Filesystem
+
+**Provider:** the local filesystem. Use absolute `file://` URLs, or a bare path
+on the CLI (it is canonicalised to a `file://` URL automatically).
+
+**Env variables:** none — no credentials are required.
+
+**Rust example:**
+
+```rust
+use object_storage_client::ObjectStorageClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ObjectStorageClient::new();
+    client.put("file:///tmp/hello.txt", &b"Hello from Rust!"[..]).await?;
+    let data = client.get("file:///tmp/hello.txt").await?;
+    println!("{}", String::from_utf8_lossy(&data));
+    Ok(())
+}
+```
+
+**Python example:**
+
+```python
+import asyncio
+from object_storage_client import ObjectStorageClient
+
+async def main():
+    client = ObjectStorageClient()
+    await client.put_object("file:///tmp/hello.txt", b"Hello from Python!")
+    data = await client.get_object("file:///tmp/hello.txt")
+    print(data.decode())
+
+asyncio.run(main())
+```
+
+**CLI example:**
+
+```bash
+osc put hello.txt /tmp/hello.txt
+osc get /tmp/hello.txt ./hello_copy.txt
+```
 
 ---
 
@@ -90,6 +323,11 @@ cargo install --path .
   osc mb s3://my-new-bucket
   ```
 
+- **Check whether a bucket exists** (prints `true`/`false`):
+  ```bash
+  osc bucket-exists s3://my-bucket
+  ```
+
 - **Stream an object**:
   ```bash
   osc get-stream gs://my-bucket/large_file.bin
@@ -157,6 +395,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a bucket (S3, or a directory for file:// URLs); idempotent
     client.create_bucket("s3://my-bucket").await?;
+
+    // Check whether a bucket exists (missing -> Ok(false), never an error)
+    if client.bucket_exists("s3://my-bucket").await? {
+        println!("my-bucket is present");
+    }
 
     // Check whether an object exists (missing -> Ok(false), never an error)
     if client.exists("s3://my-bucket/hello.txt").await? {
@@ -229,6 +472,10 @@ async def main():
 
     # Create a bucket (S3, or a directory for file:// URLs); idempotent
     await client.create_bucket("s3://my-bucket")
+
+    # Check whether a bucket exists (returns a bool; never raises for a miss).
+    if await client.bucket_exists("s3://my-bucket"):
+        print("my-bucket is present")
 
     # Upload data
     await client.put_object("s3://my-bucket/python_test.txt", b"Hello from Python!")

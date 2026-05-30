@@ -10,11 +10,10 @@
 //! with a 403 signature mismatch — pushing size/type enforcement down to the
 //! object store.
 
-use crate::client::{Backend, Error, Result};
+use crate::client::{Error, Result};
 use chrono::{DateTime, Utc};
 use http::Method;
 use object_store::aws::AwsCredential;
-use object_store::path::Path as ObjectPath;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use ring::{digest, hmac};
 use std::time::Duration;
@@ -40,7 +39,7 @@ pub enum SignMethod {
 }
 
 impl SignMethod {
-    fn into_http(self) -> Method {
+    pub(crate) fn into_http(self) -> Method {
         match self {
             Self::Get => Method::GET,
             Self::Put => Method::PUT,
@@ -84,12 +83,12 @@ pub struct SignOptions {
 impl SignOptions {
     /// `true` when no extra headers are requested, so plain host-only signing
     /// via the object store's own signer suffices.
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.content_length.is_none() && self.content_type.is_none()
     }
 
     /// Borrow these options as the lower-level [`BoundHeaders`].
-    fn bound_headers(&self) -> BoundHeaders<'_> {
+    pub(crate) fn bound_headers(&self) -> BoundHeaders<'_> {
         BoundHeaders {
             content_length: self.content_length,
             content_type: self.content_type.as_deref(),
@@ -97,209 +96,10 @@ impl SignOptions {
     }
 }
 
-/// Generate a pre-signed URL for a single object on an already-resolved
-/// `backend` (whose `scheme` and object `path` have been determined by the
-/// caller).
-///
-/// When `options` is empty this is the object store's own host-only signing;
-/// otherwise the host-only URL is re-signed binding the requested headers,
-/// which is only possible for S3 backends.
-///
-/// # Errors
-///
-/// Returns an error if the backend does not support signing, `options` binds
-/// extra headers on a non-S3 backend, or the backend fails to sign.
-pub(crate) async fn pre_signed_url(
-    backend: &Backend,
-    scheme: &str,
-    path: &ObjectPath,
-    method: SignMethod,
-    expires_in: Duration,
-    options: &SignOptions,
-) -> Result<String> {
-    let signer = backend
-        .signer
-        .as_ref()
-        .ok_or_else(|| Error::SigningUnsupported(scheme.to_string()))?;
-    let base = signer
-        .signed_url(method.into_http(), path, expires_in)
-        .await?;
-
-    if options.is_empty() {
-        return Ok(base.into());
-    }
-
-    let pre_signed_url = sign_with_headers(backend, base, method, expires_in, options).await?;
-    Ok(pre_signed_url.into())
-}
-
-/// Generate pre-signed URLs for multiple objects that share `backend` (and
-/// therefore one signer / set of credentials). `paths` are the object paths
-/// already resolved by the caller, all belonging to the same `scheme`.
-///
-/// # Errors
-///
-/// Returns an error if the backend does not support signing, `options` binds
-/// extra headers on a non-S3 backend, or the backend fails to sign.
-pub(crate) async fn pre_signed_urls(
-    backend: &Backend,
-    scheme: &str,
-    paths: &[ObjectPath],
-    method: SignMethod,
-    expires_in: Duration,
-    options: &SignOptions,
-) -> Result<Vec<String>> {
-    let signer = backend
-        .signer
-        .as_ref()
-        .ok_or_else(|| Error::SigningUnsupported(scheme.to_string()))?;
-    let bases = signer
-        .signed_urls(method.into_http(), paths, expires_in)
-        .await?;
-
-    if options.is_empty() {
-        return Ok(bases.into_iter().map(Into::into).collect());
-    }
-
-    // Resolve credentials once, then re-sign each URL with the bound headers.
-    let s3 = backend
-        .s3
-        .as_ref()
-        .ok_or_else(content_binding_unsupported)?;
-    let credential = s3.credentials().get_credential().await?;
-    let region = s3_region();
-    let http_method = method.into_http();
-
-    let mut pre_signed_urls = Vec::with_capacity(bases.len());
-    for mut base in bases {
-        base.set_query(None);
-        pre_signed_urls.push(
-            presign_s3(
-                &base,
-                &http_method,
-                expires_in,
-                &credential,
-                &region,
-                options.bound_headers(),
-            )
-            .into(),
-        );
-    }
-    Ok(pre_signed_urls)
-}
-
-/// Generate a pre-signed URL for `method` targeting the bucket root, for the
-/// bucket-level operations `object_store` does not expose (S3 `CreateBucket`
-/// via `PUT`, `HeadBucket` via `HEAD`). Only S3 backends are supported;
-/// `unsupported` builds the error returned for any other backend.
-///
-/// The bucket endpoint and its host/path style (virtual-hosted vs path-style)
-/// are discovered from `object_store`'s own signer by signing the empty object
-/// path; the resulting URL's trailing slash is then dropped so the request
-/// targets `/` (virtual-hosted) or `/{bucket}` (path-style) rather than an
-/// empty object key, before re-signing with host-only `SigV4`.
-async fn pre_signed_bucket_request(
-    backend: &Backend,
-    method: &Method,
-    expires_in: Duration,
-    unsupported: impl Fn() -> Error,
-) -> Result<String> {
-    let signer = backend.signer.as_ref().ok_or_else(&unsupported)?;
-    let s3 = backend.s3.as_ref().ok_or_else(&unsupported)?;
-
-    // Ask the signer to sign the bucket root so we inherit the correctly-styled
-    // endpoint URL, then strip the trailing slash and the host-only query.
-    let mut base = signer
-        .signed_url(method.clone(), &ObjectPath::from(""), expires_in)
-        .await?;
-    base.set_query(None);
-    let trimmed = base.as_str().trim_end_matches('/');
-    let base = Url::parse(trimmed)?;
-
-    let credential = s3.credentials().get_credential().await?;
-    let region = s3_region();
-
-    let presigned = presign_s3(
-        &base,
-        method,
-        expires_in,
-        &credential,
-        &region,
-        BoundHeaders::default(),
-    );
-    Ok(presigned.into())
-}
-
-/// Generate a pre-signed `PUT` URL targeting the bucket root, suitable for
-/// creating the bucket (S3 `CreateBucket`). Only S3 backends are supported.
-///
-/// # Errors
-///
-/// Returns an error if the backend is not an S3 backend, or signing fails.
-pub(crate) async fn pre_signed_create_bucket(
-    backend: &Backend,
-    scheme: &str,
-    expires_in: Duration,
-) -> Result<String> {
-    pre_signed_bucket_request(backend, &Method::PUT, expires_in, || {
-        Error::BucketCreationUnsupported(scheme.to_string())
-    })
-    .await
-}
-
-/// Generate a pre-signed `HEAD` URL targeting the bucket root, suitable for
-/// probing the bucket's existence (S3 `HeadBucket`). Only S3 backends are
-/// supported.
-///
-/// # Errors
-///
-/// Returns an error if the backend is not an S3 backend, or signing fails.
-pub(crate) async fn pre_signed_head_bucket(
-    backend: &Backend,
-    scheme: &str,
-    expires_in: Duration,
-) -> Result<String> {
-    pre_signed_bucket_request(backend, &Method::HEAD, expires_in, || {
-        Error::BucketExistenceUnsupported(scheme.to_string())
-    })
-    .await
-}
-
-/// Re-sign `base` (an `object_store`-produced signed URL) binding the headers
-/// in `options` into the signature. Only S3 backends carry the credentials
-/// needed for this; other backends yield an error.
-async fn sign_with_headers(
-    backend: &Backend,
-    mut base: Url,
-    method: SignMethod,
-    expires_in: Duration,
-    options: &SignOptions,
-) -> Result<Url> {
-    let s3 = backend
-        .s3
-        .as_ref()
-        .ok_or_else(content_binding_unsupported)?;
-    let credential = s3.credentials().get_credential().await?;
-    let region = s3_region();
-
-    // Drop the host-only query produced by the object store's signer; we
-    // generate our own SigV4 query over the bound headers.
-    base.set_query(None);
-
-    Ok(presign_s3(
-        &base,
-        &method.into_http(),
-        expires_in,
-        &credential,
-        &region,
-        options.bound_headers(),
-    ))
-}
-
 /// Error returned when `Content-Length`/`Content-Type` binding is requested for
 /// a backend other than S3, which is the only one this client can re-sign with
 /// extra headers.
-fn content_binding_unsupported() -> Error {
+pub(crate) fn content_binding_unsupported() -> Error {
     Error::Generic(
         "binding Content-Length/Content-Type into a pre-signed URL is only supported for S3 \
          (s3://) backends"
@@ -310,7 +110,7 @@ fn content_binding_unsupported() -> Error {
 /// Resolve the AWS region used for `SigV4` signing, mirroring how the S3 backend
 /// is configured: explicit `S3_REGION`, then the standard AWS environment
 /// variables, falling back to `us-east-1`.
-fn s3_region() -> String {
+pub(crate) fn s3_region() -> String {
     std::env::var("S3_REGION")
         .or_else(|_| std::env::var("AWS_REGION"))
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -511,11 +311,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sign_method_from_str() {
-        assert_eq!("get".parse::<SignMethod>().unwrap(), SignMethod::Get);
-        assert_eq!("PUT".parse::<SignMethod>().unwrap(), SignMethod::Put);
-        assert_eq!("Delete".parse::<SignMethod>().unwrap(), SignMethod::Delete);
+    fn sign_method_from_str() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        assert_eq!("get".parse::<SignMethod>()?, SignMethod::Get);
+        assert_eq!("PUT".parse::<SignMethod>()?, SignMethod::Put);
+        assert_eq!("Delete".parse::<SignMethod>()?, SignMethod::Delete);
         assert!("PATCH".parse::<SignMethod>().is_err());
+        Ok(())
     }
 
     /// Reproduces the canonical AWS `SigV4` "Example: GET Object" pre-signed URL
@@ -523,7 +324,7 @@ mod tests {
     /// resulting signature can be compared against the published value. This
     /// guards the whole canonical-request / string-to-sign / signing pipeline.
     #[test]
-    fn matches_aws_documented_vector() {
+    fn matches_aws_documented_vector() -> std::result::Result<(), Box<dyn std::error::Error>> {
         use chrono::TimeZone;
 
         let cred = AwsCredential {
@@ -532,8 +333,11 @@ mod tests {
             token: None,
         };
         // Virtual-hosted style base URL, as in the AWS example.
-        let base = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
-        let date = Utc.with_ymd_and_hms(2013, 5, 24, 0, 0, 0).unwrap();
+        let base = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt")?;
+        let date = Utc
+            .with_ymd_and_hms(2013, 5, 24, 0, 0, 0)
+            .single()
+            .ok_or("invalid test timestamp")?;
 
         let signed = presign_s3_at(
             &base,
@@ -549,12 +353,13 @@ mod tests {
             .query_pairs()
             .find(|(k, _)| k == "X-Amz-Signature")
             .map(|(_, v)| v.into_owned())
-            .unwrap();
+            .ok_or("missing X-Amz-Signature in signed URL")?;
 
         assert_eq!(
             signature,
             "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
         );
+        Ok(())
     }
 
     fn test_credential() -> AwsCredential {
@@ -566,8 +371,8 @@ mod tests {
     }
 
     #[test]
-    fn presign_binds_content_headers() {
-        let base = Url::parse("https://s3.amazonaws.com/my-bucket/some/key.bin").unwrap();
+    fn presign_binds_content_headers() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let base = Url::parse("https://s3.amazonaws.com/my-bucket/some/key.bin")?;
         let signed = presign_s3(
             &base,
             &Method::PUT,
@@ -580,16 +385,17 @@ mod tests {
             },
         );
 
-        let query = signed.query().unwrap();
+        let query = signed.query().ok_or("signed URL has no query string")?;
         assert!(signed.as_str().contains("X-Amz-Signature="));
         // Signed headers are sorted and include the bound content headers.
         assert!(query.contains("X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost"));
         assert!(query.contains("X-Amz-Expires=900"));
+        Ok(())
     }
 
     #[test]
-    fn presign_host_only_when_no_headers() {
-        let base = Url::parse("https://s3.amazonaws.com/my-bucket/key").unwrap();
+    fn presign_host_only_when_no_headers() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let base = Url::parse("https://s3.amazonaws.com/my-bucket/key")?;
         let signed = presign_s3(
             &base,
             &Method::GET,
@@ -599,14 +405,17 @@ mod tests {
             BoundHeaders::default(),
         );
 
-        assert!(signed.query().unwrap().contains("X-Amz-SignedHeaders=host"));
+        let query = signed.query().ok_or("signed URL has no query string")?;
+        assert!(query.contains("X-Amz-SignedHeaders=host"));
+        Ok(())
     }
 
     #[test]
-    fn security_token_is_included_when_present() {
+    fn security_token_is_included_when_present()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mut cred = test_credential();
         cred.token = Some("session-token-value".to_string());
-        let base = Url::parse("https://s3.amazonaws.com/bucket/key").unwrap();
+        let base = Url::parse("https://s3.amazonaws.com/bucket/key")?;
         let signed = presign_s3(
             &base,
             &Method::PUT,
@@ -624,5 +433,6 @@ mod tests {
                 .as_str()
                 .contains("X-Amz-Security-Token=session-token-value")
         );
+        Ok(())
     }
 }

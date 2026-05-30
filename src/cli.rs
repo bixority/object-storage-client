@@ -4,14 +4,55 @@
 //! [`ObjectStorageClient`]. The longer subcommands (`get-stream`, `sign`) are
 //! delegated to helpers so the dispatch stays small and readable.
 
-use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use object_storage_client::client::Error as StorageError;
 use object_storage_client::{ObjectStorageClient, SignMethod, SignOptions};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::io::{self, AsyncWrite, AsyncWriteExt, BufWriter};
+
+/// Errors surfaced by the `osc` command-line interface.
+///
+/// Storage failures are delegated to the library's [`StorageError`]; the
+/// remaining variants attach the offending local path to an I/O failure so the
+/// user can see which file could not be read, written or created.
+#[derive(Debug, Error)]
+pub enum CliError {
+    /// A failure from the underlying storage operation.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+
+    /// The local source file for an upload could not be read.
+    #[error("failed to read {path}")]
+    ReadFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A downloaded object could not be written to its local destination.
+    #[error("failed to write {path}")]
+    WriteFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The local destination file for a stream could not be created.
+    #[error("failed to create {path}")]
+    CreateFile {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Writing streamed bytes to the output sink failed.
+    #[error("failed to write output")]
+    Output(#[source] std::io::Error),
+}
 
 #[derive(Parser)]
 #[command(name = "osc")]
@@ -148,7 +189,7 @@ impl Cli {
     /// # Errors
     ///
     /// Propagates any error returned by the underlying storage operation.
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<(), CliError> {
         let client = ObjectStorageClient::new();
 
         match self.command {
@@ -169,8 +210,10 @@ impl Cli {
             }
 
             Commands::Put { src, dst } => {
-                let data =
-                    fs::read(&src).with_context(|| format!("failed to read {}", src.display()))?;
+                let data = fs::read(&src).map_err(|source| CliError::ReadFile {
+                    path: src.display().to_string(),
+                    source,
+                })?;
 
                 let dst_url = to_url(&dst);
 
@@ -185,8 +228,10 @@ impl Cli {
 
                 let data = client.get(&src_url).await?;
 
-                fs::write(&dst, data)
-                    .with_context(|| format!("failed to write {}", dst.display()))?;
+                fs::write(&dst, data).map_err(|source| CliError::WriteFile {
+                    path: dst.display().to_string(),
+                    source,
+                })?;
             }
 
             Commands::GetStream { src, dst } => get_stream(&client, &src, dst.as_deref()).await?,
@@ -253,23 +298,28 @@ impl Cli {
 }
 
 /// Stream an object to a file (when `dst` is given) or to standard output.
-async fn get_stream(client: &ObjectStorageClient, src: &str, dst: Option<&Path>) -> Result<()> {
+async fn get_stream(
+    client: &ObjectStorageClient,
+    src: &str,
+    dst: Option<&Path>,
+) -> Result<(), CliError> {
     let src_url = to_url(src);
 
     println!("Streaming {src_url}");
 
-    let mut stream = client
-        .get_stream(&src_url)
-        .await
-        .context("failed to start stream")?;
+    let mut stream = client.get_stream(&src_url).await?;
 
     let mut output: Output = match dst {
         Some(path) => {
             println!("Writing to file {}", path.display());
 
-            let file = tokio::fs::File::create(path)
-                .await
-                .with_context(|| format!("failed to create {}", path.display()))?;
+            let file =
+                tokio::fs::File::create(path)
+                    .await
+                    .map_err(|source| CliError::CreateFile {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
 
             Output::new_file(file)
         }
@@ -278,12 +328,12 @@ async fn get_stream(client: &ObjectStorageClient, src: &str, dst: Option<&Path>)
 
     // streaming loop (zero-copy from Bytes -> &[u8])
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk.context("stream error")?;
+        let bytes = chunk.map_err(StorageError::from)?;
 
-        output.write_all(&bytes).await?;
+        output.write_all(&bytes).await.map_err(CliError::Output)?;
     }
 
-    output.flush().await?;
+    output.flush().await.map_err(CliError::Output)?;
     Ok(())
 }
 
@@ -295,11 +345,9 @@ async fn sign(
     expires_in: u64,
     content_length: Option<u64>,
     content_type: Option<String>,
-) -> Result<()> {
+) -> Result<(), CliError> {
     let target = to_url(url);
-    let signed_method: SignMethod = method
-        .parse()
-        .with_context(|| format!("invalid HTTP method: {method}"))?;
+    let signed_method: SignMethod = method.parse()?;
     let options = SignOptions {
         content_length,
         content_type,
@@ -312,8 +360,7 @@ async fn sign(
             Duration::from_secs(expires_in),
             &options,
         )
-        .await
-        .context("failed to generate pre-signed URL")?;
+        .await?;
 
     println!("{signed}");
     Ok(())

@@ -7,7 +7,7 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
 - **Existence checks**: Test whether an object or bucket exists without raising on a miss.
-- **Bucket creation**: Create buckets on S3 (or directories for local paths).
+- **Bucket creation**: Create buckets/containers on S3, GCS and Azure (or directories for local paths).
 - **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
 - **Multi-Language**: Native Rust library with Python 3.13+ bindings.
 - **Streaming**: Async streaming support for both Rust and Python.
@@ -148,7 +148,7 @@ cargo install --path .
   osc exists s3://my-bucket/report.pdf
   ```
 
-- **Create a bucket** (S3, or a directory for local paths):
+- **Create a bucket** (S3, GCS, Azure, or a directory for local paths):
   ```bash
   osc mb s3://my-new-bucket
   ```
@@ -194,7 +194,7 @@ Then add `object-storage-client` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-object-storage-client = { version = "0.0.31", registry = "bixority" }
+object-storage-client = { version = "0.0.33", registry = "bixority" }
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -220,7 +220,7 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ObjectStorageClient::new();
 
-    // Create a bucket (S3, or a directory for file:// URLs); idempotent
+    // Create a bucket (S3/GCS/Azure, or a directory for file:// URLs); idempotent
     client.create_bucket("s3://my-bucket").await?;
 
     // Upload data to S3
@@ -318,7 +318,7 @@ from object_storage_client import ObjectStorageClient
 async def main():
     client = ObjectStorageClient()
 
-    # Create a bucket (S3, or a directory for file:// URLs); idempotent
+    # Create a bucket (S3/GCS/Azure, or a directory for file:// URLs); idempotent
     await client.create_bucket("s3://my-bucket")
 
     # Check whether a bucket exists (returns a bool; never raises for a miss).

@@ -3,7 +3,7 @@ use tempfile::tempdir;
 
 #[tokio::test]
 #[ignore = "functional"]
-async fn test_object_lifecycle() -> anyhow::Result<()> {
+async fn test_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     // Setup a temporary directory to act as our local storage "bucket"
     let tmp_dir = tempdir()?;
     let bucket_path = tmp_dir.path().to_string_lossy();

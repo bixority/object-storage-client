@@ -23,145 +23,36 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 
 ---
 
-## Provider Configuration & Examples
+## Environment Variables
 
-Credentials are read from the environment when a backend is first used — the
-client never takes them as constructor arguments. The bucket / container is
-always taken from the URL host, so the same process can talk to several buckets
-across several providers at once. Set the variables below before constructing
-`ObjectStorageClient` (e.g. export them in your shell, a `.env` file, or your
-container/runtime configuration).
+Credentials are read from the environment the first time a backend is used — the
+client never takes them as constructor arguments. The bucket / container always
+comes from the URL host, so a single process can talk to several buckets across
+several providers at once. That is exactly what makes the cross-provider copy
+and move shown in the walk-throughs below work: export the variables for every
+provider you touch, and a single `ObjectStorageClient` can shuttle objects
+between them. The local filesystem needs no variables.
 
-The examples reuse the same operation (`put` then `get`); see the
-[Rust](#rust-usage), [Python](#python-313-usage) and [CLI](#cli-usage-osc)
-sections for the full API.
+### AWS S3 (`s3://`)
 
-### AWS S3
-
-**Provider:** Amazon S3 (and S3-compatible stores such as MinIO or SeaweedFS).
-
-**Env variables:**
+Also covers S3-compatible stores such as MinIO and SeaweedFS.
 
 ```bash
-# Standard AWS variables (read via AmazonS3Builder::from_env())
 export AWS_ACCESS_KEY_ID="AKIA..."
 export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="us-east-1"
-# Optional: session token for temporary credentials
+# Optional: temporary credentials
 export AWS_SESSION_TOKEN="..."
 # Optional: custom endpoint for S3-compatible stores (e.g. MinIO)
-export AWS_ENDPOINT="https://s3.us-east-1.amazonaws.com"
+export AWS_ENDPOINT="http://localhost:9000"
 
 # Convenience overrides honoured by this client (take precedence when set):
 #   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
-# Set S3_SECURE=false to allow plain HTTP (e.g. a local MinIO over http://):
+# Allow plain HTTP (e.g. a local MinIO):
 #   export S3_SECURE=false
 ```
 
-**Rust example:**
-
-```rust
-use object_storage_client::ObjectStorageClient;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ObjectStorageClient::new();
-    client.put("s3://my-bucket/hello.txt", &b"Hello from Rust!"[..]).await?;
-    let data = client.get("s3://my-bucket/hello.txt").await?;
-    println!("{}", String::from_utf8_lossy(&data));
-    Ok(())
-}
-```
-
-**Python example:**
-
-```python
-import asyncio
-from object_storage_client import ObjectStorageClient
-
-async def main():
-    client = ObjectStorageClient()
-    await client.put_object("s3://my-bucket/hello.txt", b"Hello from Python!")
-    data = await client.get_object("s3://my-bucket/hello.txt")
-    print(data.decode())
-
-asyncio.run(main())
-```
-
-**CLI example:**
-
-```bash
-osc put hello.txt s3://my-bucket/hello.txt
-osc get s3://my-bucket/hello.txt ./hello.txt
-```
-
-### Azure Blob Storage
-
-**Provider:** Azure Blob Storage. Use the `az://` scheme (the host is the
-container); `wasb(s)://` and `abfs(s)://` are also accepted.
-
-**Env variables:**
-
-```bash
-export AZURE_STORAGE_ACCOUNT_NAME="mystorageaccount"
-
-# Pick ONE authentication method:
-
-# 1. Shared account key
-export AZURE_STORAGE_ACCOUNT_KEY="..."
-
-# 2. Shared Access Signature (SAS) token
-#   export AZURE_STORAGE_SAS_KEY="?sv=..."
-
-# 3. Service principal (Azure AD)
-#   export AZURE_STORAGE_CLIENT_ID="..."
-#   export AZURE_STORAGE_CLIENT_SECRET="..."
-#   export AZURE_STORAGE_TENANT_ID="..."
-```
-
-**Rust example:**
-
-```rust
-use object_storage_client::ObjectStorageClient;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ObjectStorageClient::new();
-    client.put("az://my-container/hello.txt", &b"Hello from Rust!"[..]).await?;
-    let data = client.get("az://my-container/hello.txt").await?;
-    println!("{}", String::from_utf8_lossy(&data));
-    Ok(())
-}
-```
-
-**Python example:**
-
-```python
-import asyncio
-from object_storage_client import ObjectStorageClient
-
-async def main():
-    client = ObjectStorageClient()
-    await client.put_object("az://my-container/hello.txt", b"Hello from Python!")
-    data = await client.get_object("az://my-container/hello.txt")
-    print(data.decode())
-
-asyncio.run(main())
-```
-
-**CLI example:**
-
-```bash
-osc put hello.txt az://my-container/hello.txt
-osc get az://my-container/hello.txt ./hello.txt
-```
-
-### Google Cloud Storage
-
-**Provider:** Google Cloud Storage. Use the `gs://` (or `gcs://`) scheme; the
-host is the bucket.
-
-**Env variables:**
+### Google Cloud Storage (`gs://` / `gcs://`)
 
 ```bash
 # Path to a service-account JSON key file...
@@ -173,86 +64,25 @@ export GOOGLE_SERVICE_ACCOUNT="/path/to/service-account.json"
 #   export GOOGLE_SERVICE_ACCOUNT_KEY='{"type":"service_account", ...}'
 ```
 
-**Rust example:**
-
-```rust
-use object_storage_client::ObjectStorageClient;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ObjectStorageClient::new();
-    client.put("gs://my-bucket/hello.txt", &b"Hello from Rust!"[..]).await?;
-    let data = client.get("gs://my-bucket/hello.txt").await?;
-    println!("{}", String::from_utf8_lossy(&data));
-    Ok(())
-}
-```
-
-**Python example:**
-
-```python
-import asyncio
-from object_storage_client import ObjectStorageClient
-
-async def main():
-    client = ObjectStorageClient()
-    await client.put_object("gs://my-bucket/hello.txt", b"Hello from Python!")
-    data = await client.get_object("gs://my-bucket/hello.txt")
-    print(data.decode())
-
-asyncio.run(main())
-```
-
-**CLI example:**
+### Azure Blob Storage (`az://`, `wasb(s)://`, `abfs(s)://`)
 
 ```bash
-osc put hello.txt gs://my-bucket/hello.txt
-osc get gs://my-bucket/hello.txt ./hello.txt
+export AZURE_STORAGE_ACCOUNT_NAME="mystorageaccount"
+
+# Pick ONE authentication method:
+# 1. Shared account key
+export AZURE_STORAGE_ACCOUNT_KEY="..."
+# 2. Shared Access Signature (SAS) token
+#   export AZURE_STORAGE_SAS_KEY="?sv=..."
+# 3. Service principal (Azure AD)
+#   export AZURE_STORAGE_CLIENT_ID="..."
+#   export AZURE_STORAGE_CLIENT_SECRET="..."
+#   export AZURE_STORAGE_TENANT_ID="..."
 ```
 
-### Local Filesystem
+### Local Filesystem (`file://`)
 
-**Provider:** the local filesystem. Use absolute `file://` URLs, or a bare path
-on the CLI (it is canonicalised to a `file://` URL automatically).
-
-**Env variables:** none — no credentials are required.
-
-**Rust example:**
-
-```rust
-use object_storage_client::ObjectStorageClient;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ObjectStorageClient::new();
-    client.put("file:///tmp/hello.txt", &b"Hello from Rust!"[..]).await?;
-    let data = client.get("file:///tmp/hello.txt").await?;
-    println!("{}", String::from_utf8_lossy(&data));
-    Ok(())
-}
-```
-
-**Python example:**
-
-```python
-import asyncio
-from object_storage_client import ObjectStorageClient
-
-async def main():
-    client = ObjectStorageClient()
-    await client.put_object("file:///tmp/hello.txt", b"Hello from Python!")
-    data = await client.get_object("file:///tmp/hello.txt")
-    print(data.decode())
-
-asyncio.run(main())
-```
-
-**CLI example:**
-
-```bash
-osc put hello.txt /tmp/hello.txt
-osc get /tmp/hello.txt ./hello_copy.txt
-```
+No environment variables — no credentials are required.
 
 ---
 
@@ -376,42 +206,56 @@ object-storage-client = { git = "https://codeberg.org/bixority/object-storage-cl
 tokio = { version = "1.0", features = ["full"] }
 ```
 
-### Example
+### Walk-through
+
+A single client works across every provider — the scheme in each URL selects the
+backend, so you can upload to S3, then copy or move the object straight to GCS,
+Azure or the local disk with no intermediate download on your side.
 
 ```rust
-use object_storage_client::ObjectStorageClient;
+use object_storage_client::{ObjectStorageClient, SignMethod, SignOptions};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ObjectStorageClient::new();
 
-    // Upload data
-    let data = b"Hello from Rust!";
-    client.put("s3://my-bucket/hello.txt", &data).await?;
-
-    // Download data
-    let retrieved = client.get("s3://my-bucket/hello.txt").await?;
-    println!("Retrieved: {:?}", String::from_utf8(retrieved.to_vec())?);
-
     // Create a bucket (S3, or a directory for file:// URLs); idempotent
     client.create_bucket("s3://my-bucket").await?;
 
-    // Check whether a bucket exists (missing -> Ok(false), never an error)
+    // Upload data to S3
+    client.put("s3://my-bucket/hello.txt", &b"Hello from Rust!"[..]).await?;
+
+    // Download it back
+    let retrieved = client.get("s3://my-bucket/hello.txt").await?;
+    println!("Retrieved: {}", String::from_utf8_lossy(&retrieved));
+
+    // Existence checks (missing -> Ok(false), never an error)
     if client.bucket_exists("s3://my-bucket").await? {
         println!("my-bucket is present");
     }
-
-    // Check whether an object exists (missing -> Ok(false), never an error)
     if client.exists("s3://my-bucket/hello.txt").await? {
         println!("hello.txt is present");
     }
 
-    // Cross-provider copy (S3 to Local)
-    client.copy("s3://my-bucket/hello.txt", "file:///tmp/hello_local.txt").await?;
+    // --- Move data across providers with one client ---
 
-    // Pre-signed URL: time-limited, credential-free access (S3/GCS/Azure)
-    use object_storage_client::{SignMethod, SignOptions};
-    use std::time::Duration;
+    // Copy S3 -> Google Cloud Storage (source is left in place)
+    client
+        .copy("s3://my-bucket/hello.txt", "gs://my-gcs-bucket/hello.txt")
+        .await?;
+
+    // Move GCS -> Azure Blob Storage (source is deleted afterwards)
+    client
+        .move_object("gs://my-gcs-bucket/hello.txt", "az://my-container/hello.txt")
+        .await?;
+
+    // Copy Azure -> local disk for a working copy
+    client
+        .copy("az://my-container/hello.txt", "file:///tmp/hello_local.txt")
+        .await?;
+
+    // --- Pre-signed URLs: time-limited, credential-free access (S3/GCS/Azure) ---
 
     // Pre-signed download (GET) link, valid for one hour
     let download_url = client
@@ -461,7 +305,11 @@ Or if you are developing locally, you can use `maturin`:
 maturin develop
 ```
 
-### Example
+### Walk-through
+
+The same client handles every provider; the scheme in each URL picks the
+backend, so copying or moving an object between S3, GCS, Azure and local disk is
+a single call.
 
 ```python
 import asyncio
@@ -477,21 +325,21 @@ async def main():
     if await client.bucket_exists("s3://my-bucket"):
         print("my-bucket is present")
 
-    # Upload data
-    await client.put_object("s3://my-bucket/python_test.txt", b"Hello from Python!")
+    # Upload data to S3
+    await client.put_object("s3://my-bucket/hello.txt", b"Hello from Python!")
 
     # Check whether an object exists (returns a bool; never raises for a miss).
     # If you prefer the missing case to raise FileNotFoundError, use
     # get_object_metadata() or get_object() instead.
-    if await client.object_exists("s3://my-bucket/python_test.txt"):
-        print("python_test.txt is present")
+    if await client.object_exists("s3://my-bucket/hello.txt"):
+        print("hello.txt is present")
 
     # Fetch full metadata (raises FileNotFoundError if the object is missing)
-    meta = await client.get_object_metadata("s3://my-bucket/python_test.txt")
+    meta = await client.get_object_metadata("s3://my-bucket/hello.txt")
     print(f"Size: {meta['size_bytes']}, type: {meta['content_type']}")
 
     # Download data
-    data = await client.get_object("s3://my-bucket/python_test.txt")
+    data = await client.get_object("s3://my-bucket/hello.txt")
     print(f"Retrieved: {data.decode()}")
 
     # List objects
@@ -499,15 +347,24 @@ async def main():
     print(f"Bucket items: {items}")
 
     # Stream data
-    stream = await client.get_object_stream("s3://my-bucket/python_test.txt")
+    stream = await client.get_object_stream("s3://my-bucket/hello.txt")
     async for chunk in stream:
         print(f"Chunk size: {len(chunk)}")
 
-    # Cross-provider move (GCS to S3)
-    await client.move_object("gs://my-gcs-bucket/data.csv", "s3://my-s3-bucket/data.csv")
+    # --- Move data across providers with one client ---
 
-    # Pre-signed URL (S3/GCS/Azure): hand out credential-free, time-limited access
-    download_url = await client.get_pre_signed_url("s3://my-bucket/python_test.txt")
+    # Copy S3 -> Google Cloud Storage (source is left in place)
+    await client.copy_object("s3://my-bucket/hello.txt", "gs://my-gcs-bucket/hello.txt")
+
+    # Move GCS -> Azure Blob Storage (source is deleted afterwards)
+    await client.move_object("gs://my-gcs-bucket/hello.txt", "az://my-container/hello.txt")
+
+    # Copy Azure -> local disk for a working copy
+    await client.copy_object("az://my-container/hello.txt", "file:///tmp/hello_local.txt")
+
+    # --- Pre-signed URLs (S3/GCS/Azure): credential-free, time-limited access ---
+
+    download_url = await client.get_pre_signed_url("s3://my-bucket/hello.txt")
     # Bind the exact Content-Length and Content-Type the client must send (S3
     # only); the store rejects uploads that don't match.
     upload_url = await client.get_pre_signed_url(

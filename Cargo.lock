@@ -1029,7 +1029,7 @@ dependencies = [
 name = "object-storage-client"
 version = "0.0.33"
 dependencies = [
- "anyhow",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",

@@ -16,7 +16,7 @@ name = "object_storage_client"
 
 
 [dependencies]
-anyhow = "1.0"
+async-trait = "0.1"
 bytes = "1.11"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }

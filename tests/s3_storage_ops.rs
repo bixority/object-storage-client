@@ -1,6 +1,15 @@
 use object_storage_client::{ObjectStorageClient, SignMethod, SignOptions};
 use std::time::Duration;
 
+/// Reads the `S3_BUCKET` environment variable required by the functional tests,
+/// returning a descriptive error (rather than panicking) when it is unset, and
+/// trimming any trailing slash for consistent URL joining.
+fn s3_bucket() -> Result<String, Box<dyn std::error::Error>> {
+    let bucket = std::env::var("S3_BUCKET")
+        .map_err(|_| "S3_BUCKET environment variable must be set to run this test")?;
+    Ok(bucket.trim_end_matches('/').to_string())
+}
+
 /// This test is ignored by default because it requires S3 credentials and a bucket.
 /// To run it, set the following environment variables:
 /// S3_BUCKETL=your-bucket-name
@@ -10,12 +19,8 @@ use std::time::Duration;
 /// Then run with: cargo test --test `s3_storage_ops` -- --ignored
 #[tokio::test]
 #[ignore = "functional"]
-async fn test_s3_object_lifecycle() -> anyhow::Result<()> {
-    let bucket = std::env::var("S3_BUCKET")
-        .expect("S3_BUCKET environment variable must be set to run this test");
-
-    // Ensure bucket doesn't end with a slash for consistent joining
-    let bucket = bucket.trim_end_matches('/');
+async fn test_s3_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = s3_bucket()?;
     let bucket_url = format!("s3://{bucket}/");
 
     let client = ObjectStorageClient::new();
@@ -75,10 +80,8 @@ async fn test_s3_object_lifecycle() -> anyhow::Result<()> {
 /// Run with: `cargo test --test s3_storage_ops -- --ignored`
 #[tokio::test]
 #[ignore = "functional"]
-async fn test_s3_create_bucket_and_exists() -> anyhow::Result<()> {
-    let bucket = std::env::var("S3_BUCKET")
-        .expect("S3_BUCKET environment variable must be set to run this test");
-    let bucket = bucket.trim_end_matches('/');
+async fn test_s3_create_bucket_and_exists() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = s3_bucket()?;
     let bucket_url = format!("s3://{bucket}/");
 
     let client = ObjectStorageClient::new();
@@ -126,10 +129,8 @@ async fn test_s3_create_bucket_and_exists() -> anyhow::Result<()> {
 /// Run with: `cargo test --test s3_storage_ops -- --ignored`
 #[tokio::test]
 #[ignore = "functional"]
-async fn test_s3_presigned_url_roundtrip() -> anyhow::Result<()> {
-    let bucket = std::env::var("S3_BUCKET")
-        .expect("S3_BUCKET environment variable must be set to run this test");
-    let bucket = bucket.trim_end_matches('/');
+async fn test_s3_presigned_url_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = s3_bucket()?;
 
     let client = ObjectStorageClient::new();
     let file_url = format!("s3://{bucket}/presign_test.txt");
@@ -168,10 +169,8 @@ async fn test_s3_presigned_url_roundtrip() -> anyhow::Result<()> {
 /// Run with: `cargo test --test s3_storage_ops -- --ignored`
 #[tokio::test]
 #[ignore = "functional"]
-async fn test_s3_presigned_put_with_bound_headers() -> anyhow::Result<()> {
-    let bucket = std::env::var("S3_BUCKET")
-        .expect("S3_BUCKET environment variable must be set to run this test");
-    let bucket = bucket.trim_end_matches('/');
+async fn test_s3_presigned_put_with_bound_headers() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = s3_bucket()?;
 
     let client = ObjectStorageClient::new();
     let file_url = format!("s3://{bucket}/presign_put_test.bin");

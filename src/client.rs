@@ -1,10 +1,9 @@
+use crate::backend::{self, Backend};
 use crate::sign::{SignMethod, SignOptions};
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use object_store::aws::AmazonS3;
-use object_store::signer::Signer;
 use object_store::{Attribute, GetOptions, ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,24 +59,14 @@ pub struct ObjectMetadata {
     pub version: Option<String>,
 }
 
-/// A resolved storage backend: the object store plus, when the backend supports
-/// it, a [`Signer`] for generating pre-signed URLs. For S3 the concrete store
-/// is retained as well, so header-bound signing can read its credentials.
-///
-/// Visible to the [`crate::sign`] module, which performs the actual pre-signed
-/// URL generation against a resolved backend.
-#[derive(Clone)]
-pub(crate) struct Backend {
-    store: Arc<dyn ObjectStore>,
-    pub(crate) signer: Option<Arc<dyn Signer>>,
-    pub(crate) s3: Option<Arc<AmazonS3>>,
-}
-
 /// A unified object storage client that handles multiple backends based on URL schemes.
 #[derive(Clone, Default)]
 pub struct ObjectStorageClient {
-    /// Cache for resolved backends based on (scheme, host).
-    stores: Arc<DashMap<StoreKey, Backend>>,
+    /// Cache of resolved backends keyed on (scheme, host), so each provider's
+    /// `object_store` is built once and reused across calls.
+    stores: Arc<DashMap<StoreKey, Arc<dyn Backend>>>,
+    /// Shared HTTP client for bucket operations and other direct requests.
+    client: reqwest::Client,
 }
 
 type StoreKey = (String, Option<String>);
@@ -87,10 +76,13 @@ impl ObjectStorageClient {
     pub fn new() -> Self {
         Self {
             stores: Arc::new(DashMap::new()),
+            client: reqwest::Client::new(),
         }
     }
 
-    /// Resolves the correct backend (store + optional signer) for a given URL.
+    /// Resolves the provider-specific [`Backend`] for a given URL, building it
+    /// on first use and caching it by (scheme, host) so subsequent calls reuse
+    /// the same store and credentials.
     ///
     /// # Errors
     ///
@@ -98,7 +90,7 @@ impl ObjectStorageClient {
     /// - The URL scheme is unsupported.
     /// - The URL is missing required components (e.g., bucket name for S3/GCS).
     /// - There is an error building the underlying `ObjectStore`.
-    fn get_backend(&self, url: &Url) -> Result<(Backend, ObjectPath)> {
+    fn get_backend(&self, url: &Url) -> Result<(Arc<dyn Backend>, ObjectPath)> {
         let scheme = url.scheme();
         let host = url.host_str();
         let path = if scheme == "file" {
@@ -110,84 +102,11 @@ impl ObjectStorageClient {
 
         let key = (scheme.to_string(), host.map(ToString::to_string));
         if let Some(backend) = self.stores.get(&key) {
-            return Ok((backend.value().clone(), object_path));
+            return Ok((Arc::clone(backend.value()), object_path));
         }
 
-        let backend = match scheme {
-            "s3" => {
-                let s3_secure = std::env::var("S3_SECURE").unwrap_or_else(|_| "true".into());
-
-                let bucket =
-                    host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
-                let mut builder =
-                    object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
-
-                if let Ok(region) = std::env::var("S3_REGION") {
-                    builder = builder.with_region(region);
-                }
-
-                if let Ok(access_key_id) = std::env::var("S3_ACCESS_KEY_ID") {
-                    builder = builder.with_token("").with_access_key_id(access_key_id);
-                }
-
-                if let Ok(secret_access_key) = std::env::var("S3_SECRET_ACCESS_KEY") {
-                    builder = builder.with_secret_access_key(secret_access_key);
-                }
-
-                if s3_secure == "false" {
-                    builder = builder.with_allow_http(true);
-                }
-
-                let store = Arc::new(builder.build()?);
-                Backend {
-                    signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
-                    store: Arc::clone(&store) as Arc<dyn ObjectStore>,
-                    s3: Some(store),
-                }
-            }
-            "gs" | "gcs" => {
-                let bucket =
-                    host.ok_or_else(|| Error::Generic("Missing bucket in GCS URL".into()))?;
-                let builder = object_store::gcp::GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(bucket);
-
-                let store = Arc::new(builder.build()?);
-                Backend {
-                    signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
-                    store,
-                    s3: None,
-                }
-            }
-            "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
-                let container =
-                    host.ok_or_else(|| Error::Generic("Missing container in Azure URL".into()))?;
-                let builder = object_store::azure::MicrosoftAzureBuilder::from_env()
-                    .with_container_name(container);
-
-                let store = Arc::new(builder.build()?);
-                Backend {
-                    signer: Some(Arc::clone(&store) as Arc<dyn Signer>),
-                    store,
-                    s3: None,
-                }
-            }
-            "http" | "https" => {
-                let builder = object_store::http::HttpBuilder::new().with_url(url.as_str());
-                Backend {
-                    store: Arc::new(builder.build()?),
-                    signer: None,
-                    s3: None,
-                }
-            }
-            "file" => Backend {
-                store: Arc::new(object_store::local::LocalFileSystem::new()),
-                signer: None,
-                s3: None,
-            },
-            _ => return Err(Error::UnsupportedScheme(scheme.to_string())),
-        };
-
-        self.stores.insert(key, backend.clone());
+        let backend = backend::build(url)?;
+        self.stores.insert(key, Arc::clone(&backend));
         Ok((backend, object_path))
     }
 
@@ -201,7 +120,7 @@ impl ObjectStorageClient {
     /// - There is an error building the underlying `ObjectStore`.
     fn get_store(&self, url: &Url) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
         let (backend, path) = self.get_backend(url)?;
-        Ok((backend.store, path))
+        Ok((Arc::clone(backend.store()), path))
     }
 
     /// Stream object's data from the given URL.
@@ -381,43 +300,42 @@ impl ObjectStorageClient {
     ///
     /// The bucket is identified by the URL's scheme and host; any path
     /// component is ignored, except for `file://` URLs where the path is the
-    /// directory to create. `object_store` exposes no bucket-management API, so
-    /// this is implemented per backend:
+    /// directory to create. `object_store` exposes no bucket-management API
+    /// (and bundles no provider SDK), so this is implemented per backend by
+    /// issuing each provider's native bucket-creation request, **signed with
+    /// `object_store`'s own public authorizers** so no signing logic is
+    /// reimplemented and no new dependency is introduced. The per-provider
+    /// implementations live in the `crate::backend` modules:
     ///
     /// - `file://` — creates the directory (and any missing parents).
-    /// - `s3://` — issues a pre-signed `PUT` to the bucket root, compatible
-    ///   with AWS S3, `MinIO` and `SeaweedFS`.
+    /// - `s3://` — S3 `CreateBucket` (`PUT /<bucket>`), signed with
+    ///   `AwsAuthorizer`. Idempotent against `BucketAlreadyOwnedByYou` /
+    ///   `BucketAlreadyExists`.
+    /// - `gs://`, `gcs://` — GCS JSON API `buckets.insert`, authenticated with
+    ///   the backend's `OAuth2` bearer credential. Idempotent against HTTP 409.
+    /// - `az://`, `wasb(s)://`, `abfs(s)://` — Azure `Create Container`
+    ///   (`PUT /<container>?restype=container`), signed with `AzureAuthorizer`.
+    ///   Idempotent against `ContainerAlreadyExists` / HTTP 409.
     ///
-    /// Other schemes are not supported. Creating a bucket that already exists
-    /// is treated as success.
+    /// Because `object_store` does not expose a built store's resolved
+    /// endpoint, region, account or project, those are read from configuration
+    /// (the same environment the backend was built from):
+    /// `S3_REGION` / `AWS_ENDPOINT`(`S3_ENDPOINT`) / `S3_SECURE` for S3,
+    /// `GOOGLE_CLOUD_PROJECT` (`GCS_PROJECT_ID`) for GCS, and
+    /// `AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ENDPOINT` for Azure.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The URL is invalid.
     /// - The scheme does not support bucket creation.
-    /// - The backend rejects the request.
+    /// - Required configuration (GCS project, Azure account) is missing.
+    /// - The backend rejects the request for a reason other than the bucket
+    ///   already existing.
     pub async fn create_bucket(&self, url: &str) -> Result<()> {
         let parsed_url = Url::parse(url)?;
-        let scheme = parsed_url.scheme();
-
-        match scheme {
-            "file" => {
-                let path = parsed_url.path();
-                tokio::fs::create_dir_all(path).await.map_err(|e| {
-                    Error::Generic(format!("Failed to create directory {path}: {e}"))
-                })?;
-                Ok(())
-            }
-            "s3" => {
-                let (backend, _) = self.get_backend(&parsed_url)?;
-                let signed =
-                    crate::sign::pre_signed_create_bucket(&backend, scheme, Duration::from_mins(5))
-                        .await?;
-                put_bucket(&signed).await
-            }
-            other => Err(Error::BucketCreationUnsupported(other.to_string())),
-        }
+        let (backend, _) = self.get_backend(&parsed_url)?;
+        backend.create_bucket(&self.client, &parsed_url).await
     }
 
     /// Returns whether the bucket / container identified by `url` exists.
@@ -428,12 +346,11 @@ impl ObjectStorageClient {
     /// bucket-management API, so this is implemented per backend:
     ///
     /// - `file://` — checks that the path exists and is a directory.
-    /// - `s3://` — issues a pre-signed `HEAD` to the bucket root (S3
-    ///   `HeadBucket`), compatible with AWS S3, `MinIO` and `SeaweedFS`. A
-    ///   `403 Forbidden` is treated as existence: the bucket is present but the
-    ///   caller may not list it.
-    ///
-    /// Other schemes are not supported.
+    /// - `s3://`, `gs://`, `az://` (and variants) — issues the provider's
+    ///   dedicated metadata probe (S3 `HeadBucket`, Azure `Get Container
+    ///   Properties`, GCS `buckets.get`) rather than listing objects. A `404
+    ///   Not Found` means the bucket is missing; success or `403 Forbidden`
+    ///   means it exists.
     ///
     /// # Errors
     ///
@@ -443,28 +360,8 @@ impl ObjectStorageClient {
     /// - The backend fails for a reason other than the bucket not existing.
     pub async fn bucket_exists(&self, url: &str) -> Result<bool> {
         let parsed_url = Url::parse(url)?;
-        let scheme = parsed_url.scheme();
-
-        match scheme {
-            "file" => {
-                let path = parsed_url.path();
-                match tokio::fs::metadata(path).await {
-                    Ok(meta) => Ok(meta.is_dir()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(e) => Err(Error::Generic(format!(
-                        "Failed to stat directory {path}: {e}"
-                    ))),
-                }
-            }
-            "s3" => {
-                let (backend, _) = self.get_backend(&parsed_url)?;
-                let signed =
-                    crate::sign::pre_signed_head_bucket(&backend, scheme, Duration::from_mins(5))
-                        .await?;
-                head_bucket(&signed).await
-            }
-            other => Err(Error::BucketExistenceUnsupported(other.to_string())),
-        }
+        let (backend, _) = self.get_backend(&parsed_url)?;
+        backend.bucket_exists(&self.client, &parsed_url).await
     }
 
     /// Copies an object from one URL to another.
@@ -581,15 +478,9 @@ impl ObjectStorageClient {
     ) -> Result<String> {
         let parsed_url = Url::parse(url)?;
         let (backend, path) = self.get_backend(&parsed_url)?;
-        crate::sign::pre_signed_url(
-            &backend,
-            parsed_url.scheme(),
-            &path,
-            method,
-            expires_in,
-            options,
-        )
-        .await
+        backend
+            .pre_signed_url(&path, method, expires_in, options)
+            .await
     }
 
     /// Generates pre-signed URLs for multiple objects sharing the same backend
@@ -638,64 +529,9 @@ impl ObjectStorageClient {
             paths.push(path);
         }
 
-        crate::sign::pre_signed_urls(
-            &backend,
-            first_url.scheme(),
-            &paths,
-            method,
-            expires_in,
-            options,
-        )
-        .await
-    }
-}
-
-/// Executes a pre-signed `PUT` request against a bucket root to create it.
-///
-/// Treats a `409 Conflict` (bucket already exists / already owned) as success
-/// so that [`ObjectStorageClient::create_bucket`] is idempotent.
-async fn put_bucket(signed_url: &str) -> Result<()> {
-    let response = reqwest::Client::new()
-        .put(signed_url)
-        .send()
-        .await
-        .map_err(|e| Error::Generic(format!("Bucket creation request failed: {e}")))?;
-
-    let status = response.status();
-    if status.is_success() || status.as_u16() == 409 {
-        Ok(())
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        Err(Error::Generic(format!(
-            "Bucket creation failed with HTTP {status}: {body}"
-        )))
-    }
-}
-
-/// Executes a pre-signed `HEAD` request against a bucket root to determine
-/// whether it exists (S3 `HeadBucket`).
-///
-/// A `2xx` response means the bucket exists; `404 Not Found` means it does not.
-/// A `403 Forbidden` is treated as existence (the bucket is present but the
-/// caller lacks permission to probe it), mirroring the conventional
-/// `HeadBucket` interpretation. Any other status is surfaced as an error.
-async fn head_bucket(signed_url: &str) -> Result<bool> {
-    let response = reqwest::Client::new()
-        .head(signed_url)
-        .send()
-        .await
-        .map_err(|e| Error::Generic(format!("Bucket existence request failed: {e}")))?;
-
-    let status = response.status();
-    if status.is_success() || status.as_u16() == 403 {
-        Ok(true)
-    } else if status.as_u16() == 404 {
-        Ok(false)
-    } else {
-        let body = response.text().await.unwrap_or_default();
-        Err(Error::Generic(format!(
-            "Bucket existence check failed with HTTP {status}: {body}"
-        )))
+        backend
+            .pre_signed_urls(&paths, method, expires_in, options)
+            .await
     }
 }
 
@@ -706,10 +542,10 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_local_file_ops() -> Result<()> {
-        let dir = tempdir().unwrap();
+    async fn test_local_file_ops() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
         let file_path = dir.path().join("test.txt");
-        let url = format!("file://{}", file_path.to_str().unwrap());
+        let url = format!("file://{}", file_path.display());
 
         let client = ObjectStorageClient::new();
 
@@ -722,7 +558,7 @@ mod tests {
         assert_eq!(retrieved.as_ref(), data);
 
         // List (using directory URL)
-        let dir_url = format!("file://{}", dir.path().to_str().unwrap());
+        let dir_url = format!("file://{}", dir.path().display());
         let list = client.list(&dir_url).await?;
         assert!(list.iter().any(|p| p.ends_with("test.txt")));
 
@@ -751,10 +587,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_exists() -> Result<()> {
-        let dir = tempdir().unwrap();
+    async fn test_exists() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
         let file_path = dir.path().join("exists.txt");
-        let url = format!("file://{}", file_path.to_str().unwrap());
+        let url = format!("file://{}", file_path.display());
 
         let client = ObjectStorageClient::new();
 
@@ -771,10 +607,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_bucket_local() -> Result<()> {
-        let dir = tempdir().unwrap();
+    async fn test_create_bucket_local() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
         let bucket_path = dir.path().join("new-bucket");
-        let url = format!("file://{}", bucket_path.to_str().unwrap());
+        let url = format!("file://{}", bucket_path.display());
 
         let client = ObjectStorageClient::new();
 
@@ -785,7 +621,7 @@ mod tests {
         client.create_bucket(&url).await?;
 
         // Objects can be written into the freshly-created bucket.
-        let obj_url = format!("file://{}", bucket_path.join("o.txt").to_str().unwrap());
+        let obj_url = format!("file://{}", bucket_path.join("o.txt").display());
         client.put(&obj_url, &b"hi"[..]).await?;
         assert!(client.exists(&obj_url).await?);
 
@@ -804,10 +640,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bucket_exists_local() -> Result<()> {
-        let dir = tempdir().unwrap();
+    async fn test_bucket_exists_local() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
         let bucket_path = dir.path().join("probe-bucket");
-        let url = format!("file://{}", bucket_path.to_str().unwrap());
+        let url = format!("file://{}", bucket_path.display());
 
         let client = ObjectStorageClient::new();
 
@@ -819,7 +655,7 @@ mod tests {
 
         // A plain file at the path is not a bucket.
         let file_path = dir.path().join("plain.txt");
-        let file_url = format!("file://{}", file_path.to_str().unwrap());
+        let file_url = format!("file://{}", file_path.display());
         client.put(&file_url, &b"hi"[..]).await?;
         assert!(!client.bucket_exists(&file_url).await?);
 
@@ -838,12 +674,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_move() -> Result<()> {
-        let dir = tempdir().unwrap();
+    async fn test_copy_move() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
         let src_path = dir.path().join("src.txt");
         let dst_path = dir.path().join("dst.txt");
-        let src_url = format!("file://{}", src_path.to_str().unwrap());
-        let dst_url = format!("file://{}", dst_path.to_str().unwrap());
+        let src_url = format!("file://{}", src_path.display());
+        let dst_url = format!("file://{}", dst_path.display());
 
         let client = ObjectStorageClient::new();
         let data = b"copy move test";
@@ -855,7 +691,7 @@ mod tests {
         assert_eq!(client.get(&src_url).await?.as_ref(), data);
 
         // Test Move
-        let dst_url2 = format!("file://{}.2", dst_path.to_str().unwrap());
+        let dst_url2 = format!("file://{}.2", dst_path.display());
         client.move_object(&dst_url, &dst_url2).await?;
         assert_eq!(client.get(&dst_url2).await?.as_ref(), data);
         Ok(())

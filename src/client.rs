@@ -96,7 +96,11 @@ impl ObjectStorageClient {
         let path = if scheme == "file" {
             url.path()
         } else {
-            &url.path()[1..]
+            // For non-`file` schemes the host is the bucket/container and the
+            // object key is the path with its leading `/` removed. A bucket-only
+            // URL (e.g. `s3://bucket`) has an empty path, so strip the slash
+            // rather than slicing `[1..]`, which would panic on `""`.
+            url.path().strip_prefix('/').unwrap_or("")
         };
         let object_path = ObjectPath::from(path);
 
@@ -749,6 +753,62 @@ mod tests {
         // The URLs resolve to different backends (file vs s3), which is
         // detected before any signing is attempted.
         assert!(matches!(err, Error::Generic(msg) if msg.contains("same backend")));
+    }
+
+    #[tokio::test]
+    async fn test_get_backend_s3_bucket_only() -> Result<()> {
+        // A bucket-only S3 URL has an empty path; this used to panic on
+        // `&url.path()[1..]`. It must resolve to the s3 backend with an empty
+        // object key.
+        let client = ObjectStorageClient::new();
+        let url = Url::parse("s3://bucket")?;
+
+        let (backend, path) = client.get_backend(&url)?;
+        assert_eq!(backend.scheme(), "s3");
+        assert_eq!(path.to_string(), "");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_backend_s3_bucket_and_path() -> Result<()> {
+        // The host is the bucket and the leading `/` is stripped from the key.
+        let client = ObjectStorageClient::new();
+        let url = Url::parse("s3://bucket/path")?;
+
+        let (backend, path) = client.get_backend(&url)?;
+        assert_eq!(backend.scheme(), "s3");
+        assert_eq!(path.to_string(), "path");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_backend_file_with_host_and_path() -> Result<()> {
+        // For `file://tmp/path` the URL authority ("tmp") is parsed as the host
+        // and "/path" as the path. The file backend keeps `url.path()` verbatim,
+        // and `ObjectPath` normalises away the leading slash.
+        let client = ObjectStorageClient::new();
+        let url = Url::parse("file://tmp/path")?;
+
+        let (backend, path) = client.get_backend(&url)?;
+        assert_eq!(backend.scheme(), "file");
+        assert_eq!(path.to_string(), "path");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_backend_s3_caches_by_bucket_host() -> Result<()> {
+        // Bucket-only and keyed URLs share the (scheme, host) cache entry, so
+        // the same backend instance is reused.
+        let client = ObjectStorageClient::new();
+
+        let (b1, _) = client.get_backend(&Url::parse("s3://bucket")?)?;
+        let (b2, _) = client.get_backend(&Url::parse("s3://bucket/path")?)?;
+        assert!(Arc::ptr_eq(&b1, &b2));
+
+        Ok(())
     }
 
     #[tokio::test]

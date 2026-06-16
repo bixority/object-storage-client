@@ -6,6 +6,7 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
+- **Listing**: List a prefix, or the whole bucket from a bucket-root URL (e.g. `s3://bucket`). Listing is flat and recursive — every key under the prefix is returned, not just the immediate level.
 - **Existence checks**: Test whether an object or bucket exists without raising on a miss.
 - **Bucket creation**: Create buckets/containers on S3, GCS and Azure (or directories for local paths).
 - **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
@@ -20,6 +21,11 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 - `az://`, `wasb://`, `wasbs://`, `abfs://`, or `abfss://` (Azure Blob Storage)
 - `http://host/path` or `https://host/path` (HTTP/HTTPS)
 - `file:///absolute/path` or `local_path` (Local Filesystem)
+
+For the cloud schemes the host is the bucket / container and the path is the
+object key. The path is optional: a bucket-root URL such as `s3://bucket` (or
+`s3://bucket/`) is valid and addresses the bucket itself — use it to list the
+whole bucket, create it, or check that it exists.
 
 ---
 
@@ -194,7 +200,7 @@ Then add `object-storage-client` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-object-storage-client = { version = "0.0.33", registry = "bixority" }
+object-storage-client = { version = "0.0.36", registry = "bixority" }
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -229,6 +235,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Download it back
     let retrieved = client.get("s3://my-bucket/hello.txt").await?;
     println!("Retrieved: {}", String::from_utf8_lossy(&retrieved));
+
+    // List the whole bucket from a bucket-root URL (flat, recursive: every key
+    // is returned). Pass a prefix such as "s3://my-bucket/logs/" to narrow it.
+    let keys = client.list("s3://my-bucket").await?;
+    println!("Bucket keys: {keys:?}");
 
     // Existence checks (missing -> Ok(false), never an error)
     if client.bucket_exists("s3://my-bucket").await? {

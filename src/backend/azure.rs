@@ -98,7 +98,9 @@ impl Backend for AzureBackend {
             .map_err(|e| Error::Generic(format!("Failed to build Azure request: {e}")))?;
 
         // Reuse object_store's SharedKey / SAS / Bearer authorization.
-        AzureAuthorizer::new(credential.as_ref(), &account).authorize(&mut request);
+        AzureAuthorizer::new(credential.as_ref(), &account)
+            .try_authorize(&mut request)
+            .map_err(|e| Error::Generic(format!("Failed to sign Azure request: {e}")))?;
 
         let response = send_signed(client, request, Bytes::new()).await?;
         let status = response.status();
@@ -137,7 +139,9 @@ impl Backend for AzureBackend {
             .body(HttpRequestBody::empty())
             .map_err(|e| Error::Generic(format!("Failed to build Azure request: {e}")))?;
 
-        AzureAuthorizer::new(credential.as_ref(), &account).authorize(&mut request);
+        AzureAuthorizer::new(credential.as_ref(), &account)
+            .try_authorize(&mut request)
+            .map_err(|e| Error::Generic(format!("Failed to sign Azure request: {e}")))?;
 
         let response = send_signed(client, request, Bytes::new()).await?;
         bucket_exists_from_response(response, "Azure").await

@@ -221,7 +221,9 @@ impl Backend for S3Backend {
         // When signing is skipped (anonymous store) the request is sent as-is,
         // which also avoids touching the IMDS credential provider.
         if let Some(credential) = self.credential().await? {
-            AwsAuthorizer::new(credential.as_ref(), "s3", &region).authorize(&mut request, None);
+            AwsAuthorizer::new(credential.as_ref(), "s3", &region)
+                .try_authorize(&mut request, None)
+                .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
         }
 
         let response = send_signed(client, request, body).await?;
@@ -261,7 +263,9 @@ impl Backend for S3Backend {
             .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
 
         if let Some(credential) = self.credential().await? {
-            AwsAuthorizer::new(credential.as_ref(), "s3", &region).authorize(&mut request, None);
+            AwsAuthorizer::new(credential.as_ref(), "s3", &region)
+                .try_authorize(&mut request, None)
+                .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
         }
 
         let response = send_signed(client, request, Bytes::new()).await?;

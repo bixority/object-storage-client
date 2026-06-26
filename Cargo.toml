@@ -1,5 +1,5 @@
 [package]
-authors = ["Olegs Korsaks <bixority@proton.me>"]
+authors = ["Olegs Korsaks <olegs.korsaks@bixority.com>"]
 categories = ["api-bindings", "filesystem"]
 description = "Unified object storage client API"
 edition = "2024"

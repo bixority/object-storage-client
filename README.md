@@ -44,13 +44,13 @@ between them. The local filesystem needs no variables.
 Also covers S3-compatible stores such as MinIO and SeaweedFS.
 
 ```bash
-export AWS_ACCESS_KEY_ID="AKIA..."
-export AWS_SECRET_ACCESS_KEY="..."
+export S3_ACCESS_KEY_ID="AKIA..."
+export S3_SECRET_ACCESS_KEY="..."
 export AWS_REGION="us-east-1"
 # Optional: temporary credentials
 export AWS_SESSION_TOKEN="..."
 # Optional: custom endpoint for S3-compatible stores (e.g. MinIO)
-export AWS_ENDPOINT="http://localhost:9000"
+export AWS_ENDPOINT_URL_S3="http://localhost:9000"
 
 # Convenience overrides honoured by this client (take precedence when set):
 #   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY

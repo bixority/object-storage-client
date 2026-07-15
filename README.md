@@ -124,6 +124,11 @@ cargo install --path .
   osc put my_file.txt s3://my-bucket/remote_file.txt
   ```
 
+- **Upload a directory recursively**:
+  ```bash
+  osc put --recursive my_dir s3://my-bucket/remote_dir/
+  ```
+
 - **Download an object**:
   ```bash
   osc get gs://my-bucket/data.json ./local_data.json

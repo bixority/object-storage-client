@@ -41,6 +41,10 @@ pub enum CliError {
         source: std::io::Error,
     },
 
+    /// A directory was provided for upload without the recursive flag.
+    #[error("directory {path} requires --recursive to upload")]
+    DirectoryRecursiveRequired { path: String },
+
     /// The local destination file for a stream could not be created.
     #[error("failed to create {path}")]
     CreateFile {
@@ -75,6 +79,9 @@ enum Commands {
     Put {
         src: PathBuf,
         dst: String,
+        /// Recursively upload a directory.
+        #[arg(short, long)]
+        recursive: bool,
     },
     Get {
         src: String,
@@ -193,86 +200,29 @@ impl Cli {
         let client = ObjectStorageClient::new();
 
         match self.command {
-            Commands::Cp { src, dst } => {
-                let src_url = to_url(&src);
-                let dst_url = to_url(&dst);
+            Commands::Cp { src, dst } => cp(&client, &src, &dst).await?,
 
-                println!("Copy {src_url} -> {dst_url}");
-                client.copy(&src_url, &dst_url).await?;
-            }
+            Commands::Mv { src, dst } => mv(&client, &src, &dst).await?,
 
-            Commands::Mv { src, dst } => {
-                let src_url = to_url(&src);
-                let dst_url = to_url(&dst);
+            Commands::Put {
+                src,
+                dst,
+                recursive,
+            } => put(&client, src, dst, recursive).await?,
 
-                println!("Move {src_url} -> {dst_url}");
-                client.move_object(&src_url, &dst_url).await?;
-            }
-
-            Commands::Put { src, dst } => {
-                let data = fs::read(&src).map_err(|source| CliError::ReadFile {
-                    path: src.display().to_string(),
-                    source,
-                })?;
-
-                let dst_url = to_url(&dst);
-
-                println!("Upload {} -> {dst_url}", src.display());
-                client.put(&dst_url, data).await?;
-            }
-
-            Commands::Get { src, dst } => {
-                let src_url = to_url(&src);
-
-                println!("Download {src_url} -> {}", dst.display());
-
-                let data = client.get(&src_url).await?;
-
-                fs::write(&dst, data).map_err(|source| CliError::WriteFile {
-                    path: dst.display().to_string(),
-                    source,
-                })?;
-            }
+            Commands::Get { src, dst } => get(&client, &src, &dst).await?,
 
             Commands::GetStream { src, dst } => get_stream(&client, &src, dst.as_deref()).await?,
 
-            Commands::Ls { url } => {
-                let target = to_url(&url);
+            Commands::Ls { url } => ls(&client, &url).await?,
 
-                let list = client.list(&target).await?;
+            Commands::Rm { url } => rm(&client, &url).await?,
 
-                for item in list {
-                    println!("{item}");
-                }
-            }
+            Commands::Exists { url } => exists(&client, &url).await?,
 
-            Commands::Rm { url } => {
-                let target = to_url(&url);
+            Commands::Mb { url } => mb(&client, &url).await?,
 
-                println!("Delete {target}");
-                client.delete(&target).await?;
-            }
-
-            Commands::Exists { url } => {
-                let target = to_url(&url);
-
-                let exists = client.exists(&target).await?;
-                println!("{exists}");
-            }
-
-            Commands::Mb { url } => {
-                let target = to_url(&url);
-
-                println!("Create bucket {target}");
-                client.create_bucket(&target).await?;
-            }
-
-            Commands::BucketExists { url } => {
-                let target = to_url(&url);
-
-                let exists = client.bucket_exists(&target).await?;
-                println!("{exists}");
-            }
+            Commands::BucketExists { url } => bucket_exists(&client, &url).await?,
 
             Commands::Sign {
                 url,
@@ -295,6 +245,121 @@ impl Cli {
 
         Ok(())
     }
+}
+
+async fn cp(client: &ObjectStorageClient, src: &str, dst: &str) -> Result<(), CliError> {
+    let src_url = to_url(src);
+    let dst_url = to_url(dst);
+
+    println!("Copy {src_url} -> {dst_url}");
+    client.copy(&src_url, &dst_url).await?;
+    Ok(())
+}
+
+async fn mv(client: &ObjectStorageClient, src: &str, dst: &str) -> Result<(), CliError> {
+    let src_url = to_url(src);
+    let dst_url = to_url(dst);
+
+    println!("Move {src_url} -> {dst_url}");
+    client.move_object(&src_url, &dst_url).await?;
+    Ok(())
+}
+
+async fn put(
+    client: &ObjectStorageClient,
+    src: PathBuf,
+    dst: String,
+    recursive: bool,
+) -> Result<(), CliError> {
+    let src_metadata = fs::metadata(&src).map_err(|source| CliError::ReadFile {
+        path: src.display().to_string(),
+        source,
+    })?;
+
+    if src_metadata.is_dir() {
+        if !recursive {
+            return Err(CliError::DirectoryRecursiveRequired {
+                path: src.display().to_string(),
+            });
+        }
+
+        let mut dst_root = to_url(&dst);
+        if !dst_root.ends_with('/') {
+            dst_root.push('/');
+        }
+
+        println!("Recursive upload {} -> {dst_root}", src.display());
+        upload_dir_recursive(client, &src, &dst_root).await?;
+    } else {
+        let data = fs::read(&src).map_err(|source| CliError::ReadFile {
+            path: src.display().to_string(),
+            source,
+        })?;
+
+        let dst_url = to_url(&dst);
+
+        println!("Upload {} -> {dst_url}", src.display());
+        client.put(&dst_url, data).await?;
+    }
+
+    Ok(())
+}
+
+async fn get(client: &ObjectStorageClient, src: &str, dst: &Path) -> Result<(), CliError> {
+    let src_url = to_url(src);
+
+    println!("Download {src_url} -> {}", dst.display());
+
+    let data = client.get(&src_url).await?;
+
+    fs::write(dst, data).map_err(|source| CliError::WriteFile {
+        path: dst.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+async fn ls(client: &ObjectStorageClient, url: &str) -> Result<(), CliError> {
+    let target = to_url(url);
+
+    let list = client.list(&target).await?;
+
+    for item in list {
+        println!("{item}");
+    }
+    Ok(())
+}
+
+async fn rm(client: &ObjectStorageClient, url: &str) -> Result<(), CliError> {
+    let target = to_url(url);
+
+    println!("Delete {target}");
+    client.delete(&target).await?;
+    Ok(())
+}
+
+async fn exists(client: &ObjectStorageClient, url: &str) -> Result<(), CliError> {
+    let target = to_url(url);
+
+    let exists = client.exists(&target).await?;
+    println!("{exists}");
+    Ok(())
+}
+
+async fn mb(client: &ObjectStorageClient, url: &str) -> Result<(), CliError> {
+    let target = to_url(url);
+
+    println!("Create bucket {target}");
+    client.create_bucket(&target).await?;
+    Ok(())
+}
+
+async fn bucket_exists(client: &ObjectStorageClient, url: &str) -> Result<(), CliError> {
+    let target = to_url(url);
+
+    let exists = client.bucket_exists(&target).await?;
+    println!("{exists}");
+    Ok(())
 }
 
 /// Stream an object to a file (when `dst` is given) or to standard output.
@@ -363,5 +428,79 @@ async fn sign(
         .await?;
 
     println!("{signed}");
+    Ok(())
+}
+
+/// Recursively upload the contents of `src_dir` to the destination prefix.
+async fn upload_dir_recursive(
+    client: &ObjectStorageClient,
+    src_dir: &Path,
+    dst_root_url: &str,
+) -> Result<(), CliError> {
+    let mut files = Vec::new();
+    let mut dir_stack = vec![src_dir.to_path_buf()];
+
+    while let Some(current_dir) = dir_stack.pop() {
+        let mut entries =
+            tokio::fs::read_dir(&current_dir)
+                .await
+                .map_err(|source| CliError::ReadFile {
+                    path: current_dir.display().to_string(),
+                    source,
+                })?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| CliError::ReadFile {
+                path: current_dir.display().to_string(),
+                source,
+            })?
+        {
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|source| CliError::ReadFile {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+
+            if metadata.is_dir() {
+                dir_stack.push(path);
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
+    }
+
+    futures_util::stream::iter(files)
+        .map(|path| {
+            let client = client.clone();
+            let src_dir = src_dir.to_path_buf();
+            let dst_root_url = dst_root_url.to_string();
+            async move {
+                let rel_path = path.strip_prefix(&src_dir).unwrap();
+                let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+                let dst_url = format!("{dst_root_url}{rel_path_str}");
+
+                let data = tokio::fs::read(&path)
+                    .await
+                    .map_err(|source| CliError::ReadFile {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
+
+                println!("Upload {} -> {dst_url}", path.display());
+                client.put(&dst_url, data).await?;
+                Ok::<(), CliError>(())
+            }
+        })
+        .buffer_unordered(8)
+        .collect::<Vec<Result<(), CliError>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<()>, CliError>>()?;
+
     Ok(())
 }

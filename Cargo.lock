@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage-client"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "async-trait",
  "bytes",

@@ -164,8 +164,8 @@ impl AsyncWrite for Output {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         match &mut *self {
-            Output::Stdout(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            Output::BufferedFile(f) => std::pin::Pin::new(f).poll_write(cx, buf),
+            Self::Stdout(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::BufferedFile(f) => std::pin::Pin::new(f).poll_write(cx, buf),
         }
     }
 
@@ -174,8 +174,8 @@ impl AsyncWrite for Output {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
-            Output::Stdout(s) => std::pin::Pin::new(s).poll_flush(cx),
-            Output::BufferedFile(f) => std::pin::Pin::new(f).poll_flush(cx),
+            Self::Stdout(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::BufferedFile(f) => std::pin::Pin::new(f).poll_flush(cx),
         }
     }
 
@@ -184,8 +184,8 @@ impl AsyncWrite for Output {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         match &mut *self {
-            Output::Stdout(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            Output::BufferedFile(f) => std::pin::Pin::new(f).poll_shutdown(cx),
+            Self::Stdout(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::BufferedFile(f) => std::pin::Pin::new(f).poll_shutdown(cx),
         }
     }
 }
@@ -480,7 +480,9 @@ async fn upload_dir_recursive(
             let src_dir = src_dir.to_path_buf();
             let dst_root_url = dst_root_url.to_string();
             async move {
-                let rel_path = path.strip_prefix(&src_dir).unwrap();
+                let rel_path = path
+                    .strip_prefix(&src_dir)
+                    .expect("path discovered via src_dir must start with src_dir");
                 let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
                 let dst_url = format!("{dst_root_url}{rel_path_str}");
 

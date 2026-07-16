@@ -10,12 +10,12 @@ use object_store::local::LocalFileSystem;
 use std::sync::Arc;
 use url::Url;
 
-pub(crate) struct LocalBackend {
+pub struct LocalBackend {
     store: Arc<dyn ObjectStore>,
 }
 
 impl LocalBackend {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             store: Arc::new(LocalFileSystem::new()),
         }

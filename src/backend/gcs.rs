@@ -16,7 +16,7 @@ use url::Url;
 /// GCS backend. Retains the concrete [`GoogleCloudStorage`] store so its
 /// `OAuth2` bearer credential can be read for the `buckets.insert` call and for
 /// pre-signing.
-pub(crate) struct GcsBackend {
+pub struct GcsBackend {
     store: Arc<dyn ObjectStore>,
     inner: Arc<GoogleCloudStorage>,
     scheme: String,
@@ -30,7 +30,7 @@ impl GcsBackend {
     ///
     /// Returns an error if the bucket (URL host) is missing or the store fails
     /// to build.
-    pub(crate) fn from_env(scheme: &str, host: Option<&str>) -> Result<Self> {
+    pub fn from_env(scheme: &str, host: Option<&str>) -> Result<Self> {
         let bucket = host.ok_or_else(|| Error::Generic("Missing bucket in GCS URL".into()))?;
         let inner = Arc::new(
             GoogleCloudStorageBuilder::from_env()

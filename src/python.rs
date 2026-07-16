@@ -54,7 +54,7 @@ pub struct ByteStream {
 
 #[pymethods]
 impl ByteStream {
-    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+    const fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 

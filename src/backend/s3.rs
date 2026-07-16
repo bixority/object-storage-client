@@ -17,7 +17,7 @@ use url::Url;
 /// S3 backend. Retains the concrete [`AmazonS3`] store so credentials can be
 /// read for header-bound signing and `CreateBucket`, alongside the type-erased
 /// store used for generic object operations.
-pub(crate) struct S3Backend {
+pub struct S3Backend {
     store: Arc<dyn ObjectStore>,
     inner: Arc<AmazonS3>,
     /// When set, requests are sent unsigned (anonymous) and the credential
@@ -46,7 +46,7 @@ impl S3Backend {
     ///
     /// Returns an error if the bucket (URL host) is missing or the store fails
     /// to build.
-    pub(crate) fn from_env(host: Option<&str>) -> Result<Self> {
+    pub fn from_env(host: Option<&str>) -> Result<Self> {
         let s3_secure = std::env::var("S3_SECURE").unwrap_or_else(|_| "true".into());
         let bucket = host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);

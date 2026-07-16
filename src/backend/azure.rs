@@ -18,7 +18,7 @@ use url::Url;
 
 /// Azure backend. Retains the concrete [`MicrosoftAzure`] store so its storage
 /// credentials can be read for the `Create Container` call and for pre-signing.
-pub(crate) struct AzureBackend {
+pub struct AzureBackend {
     store: Arc<dyn ObjectStore>,
     inner: Arc<MicrosoftAzure>,
     scheme: String,
@@ -32,7 +32,7 @@ impl AzureBackend {
     ///
     /// Returns an error if the container (URL host) is missing or the store
     /// fails to build.
-    pub(crate) fn from_env(scheme: &str, host: Option<&str>) -> Result<Self> {
+    pub fn from_env(scheme: &str, host: Option<&str>) -> Result<Self> {
         let container =
             host.ok_or_else(|| Error::Generic("Missing container in Azure URL".into()))?;
         let inner = Arc::new(

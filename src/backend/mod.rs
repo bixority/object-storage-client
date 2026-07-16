@@ -36,7 +36,7 @@ use url::Url;
 /// `object_store` does not expose. They are constructed once per (scheme, host)
 /// and shared behind an `Arc`.
 #[async_trait::async_trait]
-pub(crate) trait Backend: Send + Sync {
+pub trait Backend: Send + Sync {
     /// The underlying object store used for generic read / write / list
     /// operations.
     fn store(&self) -> &Arc<dyn ObjectStore>;
@@ -97,7 +97,7 @@ pub(crate) trait Backend: Send + Sync {
 ///
 /// Returns an error if the scheme is unsupported, required URL components are
 /// missing, or the underlying `object_store` fails to build.
-pub(crate) fn build(url: &Url) -> Result<Arc<dyn Backend>> {
+pub fn build(url: &Url) -> Result<Arc<dyn Backend>> {
     let scheme = url.scheme();
     let host = url.host_str();
 
@@ -126,7 +126,7 @@ pub(crate) fn build(url: &Url) -> Result<Arc<dyn Backend>> {
 /// A `2xx` means the bucket exists. `404` means it does not. `401` / `403` mean
 /// the caller cannot see it but it does exist, which we report as present to
 /// match the list-based probe this replaced. Any other status is an error.
-pub(crate) async fn bucket_exists_from_response(
+pub async fn bucket_exists_from_response(
     response: reqwest::Response,
     scheme: &str,
 ) -> Result<bool> {
@@ -153,7 +153,7 @@ pub(crate) async fn bucket_exists_from_response(
 ///
 /// Returns an error if `options` requests header binding (unsupported off S3) or
 /// the signer fails.
-pub(crate) async fn generic_pre_signed_url(
+pub async fn generic_pre_signed_url(
     signer: &dyn Signer,
     path: &ObjectPath,
     method: SignMethod,
@@ -175,7 +175,7 @@ pub(crate) async fn generic_pre_signed_url(
 ///
 /// Returns an error if `options` requests header binding (unsupported off S3) or
 /// the signer fails.
-pub(crate) async fn generic_pre_signed_urls(
+pub async fn generic_pre_signed_urls(
     signer: &dyn Signer,
     paths: &[ObjectPath],
     method: SignMethod,
@@ -196,7 +196,7 @@ pub(crate) async fn generic_pre_signed_urls(
 /// The authorizer mutates an [`HttpRequest`] (method, URI and the signed
 /// headers); this transfers those onto the shared `reqwest` client and
 /// dispatches them, re-attaching the body the signature was computed over.
-pub(crate) async fn send_signed(
+pub async fn send_signed(
     client: &reqwest::Client,
     request: HttpRequest,
     body: Bytes,

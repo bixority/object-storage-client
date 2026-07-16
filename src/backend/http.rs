@@ -10,7 +10,7 @@ use object_store::http::HttpBuilder;
 use std::sync::Arc;
 use url::Url;
 
-pub(crate) struct HttpBackend {
+pub struct HttpBackend {
     store: Arc<dyn ObjectStore>,
     scheme: String,
 }
@@ -21,7 +21,7 @@ impl HttpBackend {
     /// # Errors
     ///
     /// Returns an error if the store fails to build.
-    pub(crate) fn new(scheme: &str, url: &Url) -> Result<Self> {
+    pub fn new(scheme: &str, url: &Url) -> Result<Self> {
         let store = HttpBuilder::new().with_url(url.as_str()).build()?;
         Ok(Self {
             store: Arc::new(store),

@@ -39,7 +39,7 @@ pub enum SignMethod {
 }
 
 impl SignMethod {
-    pub(crate) fn into_http(self) -> Method {
+    pub(crate) const fn into_http(self) -> Method {
         match self {
             Self::Get => Method::GET,
             Self::Put => Method::PUT,
@@ -83,7 +83,7 @@ pub struct SignOptions {
 impl SignOptions {
     /// `true` when no extra headers are requested, so plain host-only signing
     /// via the object store's own signer suffices.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.content_length.is_none() && self.content_type.is_none()
     }
 
@@ -99,7 +99,7 @@ impl SignOptions {
 /// Error returned when `Content-Length`/`Content-Type` binding is requested for
 /// a backend other than S3, which is the only one this client can re-sign with
 /// extra headers.
-pub(crate) fn content_binding_unsupported() -> Error {
+pub fn content_binding_unsupported() -> Error {
     Error::Generic(
         "binding Content-Length/Content-Type into a pre-signed URL is only supported for S3 \
          (s3://) backends"
@@ -110,7 +110,7 @@ pub(crate) fn content_binding_unsupported() -> Error {
 /// Resolve the AWS region used for `SigV4` signing, mirroring how the S3 backend
 /// is configured: explicit `S3_REGION`, then the standard AWS environment
 /// variables, falling back to `us-east-1`.
-pub(crate) fn s3_region() -> String {
+pub fn s3_region() -> String {
     std::env::var("S3_REGION")
         .or_else(|_| std::env::var("AWS_REGION"))
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
@@ -133,7 +133,7 @@ const STRICT_ENCODE_SET: AsciiSet = NON_ALPHANUMERIC
 /// Request headers to bind into the `SigV4` signature, forcing the client using
 /// the pre-signed URL to send exactly these values.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct BoundHeaders<'a> {
+pub struct BoundHeaders<'a> {
     pub content_length: Option<u64>,
     pub content_type: Option<&'a str>,
 }
@@ -212,7 +212,7 @@ fn canonicalize_query(url: &Url) -> String {
 /// (path-style vs virtual-hosted), which is why callers derive it from
 /// `object_store`'s own signer rather than reconstructing it here.
 #[must_use]
-pub(crate) fn presign_s3(
+pub fn presign_s3(
     base: &Url,
     method: &Method,
     expires_in: Duration,

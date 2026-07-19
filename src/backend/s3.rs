@@ -165,7 +165,7 @@ impl S3Backend {
             .or_else(|_| std::env::var("AWS_REGION"))
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".into());
-        let allow_http = std::env::var("S3_ALLOW_HTTP").map_or(false, |v| v == "true");
+        let allow_http = std::env::var("S3_ALLOW_HTTP").is_ok_and(|v| v == "true");
         let endpoint = Self::configured_endpoint().unwrap_or_else(|| {
             let scheme = if allow_http { "https" } else { "http" };
             format!("{scheme}://s3.{region}.amazonaws.com")

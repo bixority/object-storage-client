@@ -324,7 +324,7 @@ impl ObjectStorageClient {
     /// Because `object_store` does not expose a built store's resolved
     /// endpoint, region, account or project, those are read from configuration
     /// (the same environment the backend was built from):
-    /// `S3_REGION` / `AWS_ENDPOINT`(`S3_ENDPOINT`) / `S3_SECURE` for S3,
+    /// `S3_REGION` / `AWS_ENDPOINT`(`S3_ENDPOINT`) / `S3_ALLOW_HTTP` for S3,
     /// `GOOGLE_CLOUD_PROJECT` (`GCS_PROJECT_ID`) for GCS, and
     /// `AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ENDPOINT` for Azure.
     ///

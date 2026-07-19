@@ -29,7 +29,7 @@ pub struct S3Backend {
 impl S3Backend {
     /// Build the S3 store from the environment, mirroring the configuration the
     /// rest of the client reads (`S3_REGION`, `S3_ACCESS_KEY_ID`,
-    /// `S3_SECRET_ACCESS_KEY`, `S3_SECURE`) on top of
+    /// `S3_SECRET_ACCESS_KEY`, `S3_ALLOW_HTTP`) on top of
     /// [`AmazonS3Builder::from_env`].
     ///
     /// Most settings are left to `object_store`'s own env handling (region,
@@ -47,7 +47,7 @@ impl S3Backend {
     /// Returns an error if the bucket (URL host) is missing or the store fails
     /// to build.
     pub fn from_env(host: Option<&str>) -> Result<Self> {
-        let s3_secure = std::env::var("S3_SECURE").unwrap_or_else(|_| "true".into());
+        let s3_allow_http = std::env::var("S3_ALLOW_HTTP").unwrap_or_else(|_| "false".into());
         let bucket = host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
 
@@ -71,7 +71,7 @@ impl S3Backend {
             builder = builder.with_secret_access_key(secret_access_key);
         }
 
-        if s3_secure == "false" {
+        if s3_allow_http == "true" {
             builder = builder.with_allow_http(true);
         }
 
@@ -95,10 +95,10 @@ impl S3Backend {
     /// endpoint" — i.e. real AWS, where the IMDS credential fallback is valid.
     fn configured_endpoint() -> Option<String> {
         [
+            "S3_ENDPOINT",
             "AWS_ENDPOINT_URL_S3",
             "AWS_ENDPOINT",
             "AWS_ENDPOINT_URL",
-            "S3_ENDPOINT",
         ]
         .into_iter()
         .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
@@ -165,9 +165,9 @@ impl S3Backend {
             .or_else(|_| std::env::var("AWS_REGION"))
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".into());
-        let secure = std::env::var("S3_SECURE").map_or(true, |v| v != "false");
+        let allow_http = std::env::var("S3_ALLOW_HTTP").map_or(false, |v| v == "true");
         let endpoint = Self::configured_endpoint().unwrap_or_else(|| {
-            let scheme = if secure { "https" } else { "http" };
+            let scheme = if allow_http { "https" } else { "http" };
             format!("{scheme}://s3.{region}.amazonaws.com")
         });
         (endpoint, region)

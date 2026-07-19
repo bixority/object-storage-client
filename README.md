@@ -55,7 +55,7 @@ export AWS_ENDPOINT_URL_S3="http://localhost:9000"
 # Convenience overrides honoured by this client (take precedence when set):
 #   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 # Allow plain HTTP (e.g. a local MinIO):
-#   export S3_SECURE=false
+#   export S3_ALLOW_HTTP=true
 ```
 
 ### Google Cloud Storage (`gs://` / `gcs://`)

@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.1.0"
+version = "0.1.1"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -43,7 +43,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3.27"
-tokio = { version = "1.52", features = ["full", "test-util"] }
+tokio = { version = "1.53", features = ["full", "test-util"] }
 
 [lints.rust]
 linker_messages = "allow"

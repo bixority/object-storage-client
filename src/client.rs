@@ -18,6 +18,9 @@ pub enum Error {
     #[error("Invalid URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("Unsupported scheme: {0}")]
     UnsupportedScheme(String),
 
@@ -80,6 +83,54 @@ impl ObjectStorageClient {
         }
     }
 
+    /// Parses a URL string into a [`Url`], treating absolute or relative paths
+    /// without a scheme as `file://` URLs.
+    #[doc(hidden)]
+    pub fn parse_url(url: &str) -> Result<Url> {
+        match Url::parse(url) {
+            Ok(parsed) => {
+                // On Windows, an absolute path like `C:\path` might be parsed
+                // as having scheme `c`. If the scheme is a single character,
+                // we treat it as a local filesystem path instead.
+                if parsed.scheme().len() == 1 {
+                    Self::path_to_file_url(url)
+                } else {
+                    Ok(parsed)
+                }
+            }
+            Err(url::ParseError::RelativeUrlWithoutBase) => Self::path_to_file_url(url),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Converts a local filesystem path (absolute or relative) into a `file://`
+    /// [`Url`].
+    fn path_to_file_url(path_str: &str) -> Result<Url> {
+        let abs_path = if path_str.starts_with("~/") || path_str == "~" {
+            let home = homedir::my_home()
+                .map_err(|e| Error::Generic(format!("Failed to determine home directory: {e}")))?
+                .ok_or_else(|| Error::Generic("Failed to determine home directory".into()))?;
+            if path_str == "~" {
+                home
+            } else {
+                home.join(&path_str[2..])
+            }
+        } else {
+            let path = std::path::Path::new(path_str);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            }
+        };
+        Url::from_file_path(&abs_path).map_err(|()| {
+            Error::Generic(format!(
+                "Failed to convert path to URL: {}",
+                abs_path.display()
+            ))
+        })
+    }
+
     /// Resolves the provider-specific [`Backend`] for a given URL, building it
     /// on first use and caching it by (scheme, host) so subsequent calls reuse
     /// the same store and credentials.
@@ -90,7 +141,8 @@ impl ObjectStorageClient {
     /// - The URL scheme is unsupported.
     /// - The URL is missing required components (e.g., bucket name for S3/GCS).
     /// - There is an error building the underlying `ObjectStore`.
-    fn get_backend(&self, url: &Url) -> Result<(Arc<dyn Backend>, ObjectPath)> {
+    #[doc(hidden)]
+    pub fn get_backend(&self, url: &Url) -> Result<(Arc<dyn Backend>, ObjectPath)> {
         let scheme = url.scheme();
         let host = url.host_str();
         let path = if scheme == "file" {
@@ -122,7 +174,8 @@ impl ObjectStorageClient {
     /// - The URL scheme is unsupported.
     /// - The URL is missing required components (e.g., bucket name for S3/GCS).
     /// - There is an error building the underlying `ObjectStore`.
-    fn get_store(&self, url: &Url) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
+    #[doc(hidden)]
+    pub fn get_store(&self, url: &Url) -> Result<(Arc<dyn ObjectStore>, ObjectPath)> {
         let (backend, path) = self.get_backend(url)?;
         Ok((Arc::clone(backend.store()), path))
     }
@@ -139,7 +192,7 @@ impl ObjectStorageClient {
         &self,
         url: &str,
     ) -> Result<BoxStream<'static, object_store::Result<Bytes>>> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         let result = store.get(&path).await?;
         let stream = result.into_stream();
@@ -155,7 +208,7 @@ impl ObjectStorageClient {
     /// - The scheme is unsupported.
     /// - There is an error fetching the object from the store.
     pub async fn get(&self, url: &str) -> Result<Bytes> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         let result = store.get(&path).await?;
         let bytes = result.bytes().await?;
@@ -174,7 +227,7 @@ impl ObjectStorageClient {
     where
         D: Into<Bytes>,
     {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         store.put(&path, data.into().into()).await?;
         Ok(())
@@ -189,7 +242,7 @@ impl ObjectStorageClient {
     /// - The scheme is unsupported.
     /// - There is an error deleting the object from the store.
     pub async fn delete(&self, url: &str) -> Result<()> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         store.delete(&path).await?;
         Ok(())
@@ -204,7 +257,7 @@ impl ObjectStorageClient {
     /// - The scheme is unsupported.
     /// - There is an error listing objects from the store.
     pub async fn list(&self, url: &str) -> Result<Vec<String>> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         let prefix = path.to_string();
         let prefix_with_slash = if !prefix.is_empty() && !prefix.ends_with('/') {
@@ -253,7 +306,7 @@ impl ObjectStorageClient {
     /// - The object does not exist.
     /// - There is an error retrieving metadata from the store.
     pub async fn get_object_metadata(&self, url: &str) -> Result<ObjectMetadata> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
         let options = GetOptions {
             head: true,
@@ -290,7 +343,7 @@ impl ObjectStorageClient {
     /// - The scheme is unsupported.
     /// - The store fails for a reason other than the object not existing.
     pub async fn exists(&self, url: &str) -> Result<bool> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (store, path) = self.get_store(&parsed_url)?;
 
         match store.head(&path).await {
@@ -337,7 +390,7 @@ impl ObjectStorageClient {
     /// - The backend rejects the request for a reason other than the bucket
     ///   already existing.
     pub async fn create_bucket(&self, url: &str) -> Result<()> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (backend, _) = self.get_backend(&parsed_url)?;
         backend.create_bucket(&self.client, &parsed_url).await
     }
@@ -363,7 +416,7 @@ impl ObjectStorageClient {
     /// - The scheme does not support bucket existence checks.
     /// - The backend fails for a reason other than the bucket not existing.
     pub async fn bucket_exists(&self, url: &str) -> Result<bool> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (backend, _) = self.get_backend(&parsed_url)?;
         backend.bucket_exists(&self.client, &parsed_url).await
     }
@@ -378,8 +431,8 @@ impl ObjectStorageClient {
     /// - Schemes are unsupported.
     /// - There is an error copying between stores.
     pub async fn copy(&self, from_url: &str, to_url: &str) -> Result<()> {
-        let from_parsed_url = Url::parse(from_url)?;
-        let to_parsed_url = Url::parse(to_url)?;
+        let from_parsed_url = Self::parse_url(from_url)?;
+        let to_parsed_url = Self::parse_url(to_url)?;
 
         let (from_store, from_path) = self.get_store(&from_parsed_url)?;
         let (to_store, to_path) = self.get_store(&to_parsed_url)?;
@@ -420,8 +473,8 @@ impl ObjectStorageClient {
     /// - Schemes are unsupported.
     /// - There is an error moving between stores.
     pub async fn move_object(&self, from_url: &str, to_url: &str) -> Result<()> {
-        let from_parsed_url = Url::parse(from_url)?;
-        let to_parsed_url = Url::parse(to_url)?;
+        let from_parsed_url = Self::parse_url(from_url)?;
+        let to_parsed_url = Self::parse_url(to_url)?;
 
         let (from_store, from_path) = self.get_store(&from_parsed_url)?;
         let (to_store, to_path) = self.get_store(&to_parsed_url)?;
@@ -480,7 +533,7 @@ impl ObjectStorageClient {
         expires_in: Duration,
         options: &SignOptions,
     ) -> Result<String> {
-        let parsed_url = Url::parse(url)?;
+        let parsed_url = Self::parse_url(url)?;
         let (backend, path) = self.get_backend(&parsed_url)?;
         backend
             .pre_signed_url(&path, method, expires_in, options)
@@ -516,14 +569,14 @@ impl ObjectStorageClient {
             return Err(Error::Generic("No URLs provided for signing".into()));
         };
 
-        let first_url = Url::parse(first)?;
+        let first_url = Self::parse_url(first)?;
         let (backend, first_path) = self.get_backend(&first_url)?;
 
         let mut paths = Vec::with_capacity(urls.len());
         paths.push(first_path);
 
         for url in rest {
-            let parsed = Url::parse(url)?;
+            let parsed = Self::parse_url(url)?;
             if parsed.scheme() != first_url.scheme() || parsed.host_str() != first_url.host_str() {
                 return Err(Error::Generic(
                     "All URLs must belong to the same backend (scheme and host)".into(),
@@ -536,293 +589,5 @@ impl ObjectStorageClient {
         backend
             .pre_signed_urls(&paths, method, expires_in, options)
             .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn test_local_file_ops() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let file_path = dir.path().join("test.txt");
-        let url = format!("file://{}", file_path.display());
-
-        let client = ObjectStorageClient::new();
-
-        // Put
-        let data = b"hello world";
-        client.put(&url, &data[..]).await?;
-
-        // Get
-        let retrieved = client.get(&url).await?;
-        assert_eq!(retrieved.as_ref(), data);
-
-        // List (using directory URL)
-        let dir_url = format!("file://{}", dir.path().display());
-        let list = client.list(&dir_url).await?;
-        assert!(list.iter().any(|p| p.ends_with("test.txt")));
-
-        // Object metadata (size, location, content type) for an existing object.
-        let stored = client.get_object_metadata(&url).await?;
-        assert_eq!(stored.size_bytes, data.len() as u64);
-        assert!(stored.location.ends_with("test.txt"));
-        // LocalFileSystem reports no content type.
-        assert_eq!(stored.content_type, None);
-
-        // Delete
-        client.delete(&url).await?;
-        assert!(fs::metadata(&file_path).is_err());
-
-        // Metadata for a missing object errors with NotFound.
-        let err = client
-            .get_object_metadata(&url)
-            .await
-            .expect_err("metadata for a missing object must error");
-        assert!(matches!(
-            err,
-            Error::ObjectStore(object_store::Error::NotFound { .. })
-        ));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_exists() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let file_path = dir.path().join("exists.txt");
-        let url = format!("file://{}", file_path.display());
-
-        let client = ObjectStorageClient::new();
-
-        // Missing object reports false rather than erroring.
-        assert!(!client.exists(&url).await?);
-
-        client.put(&url, &b"data"[..]).await?;
-        assert!(client.exists(&url).await?);
-
-        client.delete(&url).await?;
-        assert!(!client.exists(&url).await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_bucket_local() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let bucket_path = dir.path().join("new-bucket");
-        let url = format!("file://{}", bucket_path.display());
-
-        let client = ObjectStorageClient::new();
-
-        client.create_bucket(&url).await?;
-        assert!(bucket_path.is_dir());
-
-        // Idempotent: creating an existing bucket succeeds.
-        client.create_bucket(&url).await?;
-
-        // Objects can be written into the freshly-created bucket.
-        let obj_url = format!("file://{}", bucket_path.join("o.txt").display());
-        client.put(&obj_url, &b"hi"[..]).await?;
-        assert!(client.exists(&obj_url).await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_create_bucket_unsupported_scheme() {
-        let client = ObjectStorageClient::new();
-        let err = client
-            .create_bucket("https://example.com/foo")
-            .await
-            .expect_err("https must not support bucket creation");
-
-        assert!(matches!(err, Error::BucketCreationUnsupported(scheme) if scheme == "https"));
-    }
-
-    #[tokio::test]
-    async fn test_bucket_exists_local() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let bucket_path = dir.path().join("probe-bucket");
-        let url = format!("file://{}", bucket_path.display());
-
-        let client = ObjectStorageClient::new();
-
-        // Missing bucket reports false rather than erroring.
-        assert!(!client.bucket_exists(&url).await?);
-
-        client.create_bucket(&url).await?;
-        assert!(client.bucket_exists(&url).await?);
-
-        // A plain file at the path is not a bucket.
-        let file_path = dir.path().join("plain.txt");
-        let file_url = format!("file://{}", file_path.display());
-        client.put(&file_url, &b"hi"[..]).await?;
-        assert!(!client.bucket_exists(&file_url).await?);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_bucket_exists_unsupported_scheme() {
-        let client = ObjectStorageClient::new();
-        let err = client
-            .bucket_exists("https://example.com/foo")
-            .await
-            .expect_err("https must not support bucket existence checks");
-
-        assert!(matches!(err, Error::BucketExistenceUnsupported(scheme) if scheme == "https"));
-    }
-
-    #[tokio::test]
-    async fn test_copy_move() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let src_path = dir.path().join("src.txt");
-        let dst_path = dir.path().join("dst.txt");
-        let src_url = format!("file://{}", src_path.display());
-        let dst_url = format!("file://{}", dst_path.display());
-
-        let client = ObjectStorageClient::new();
-        let data = b"copy move test";
-
-        // Test Copy
-        client.put(&src_url, &data[..]).await?;
-        client.copy(&src_url, &dst_url).await?;
-        assert_eq!(client.get(&dst_url).await?.as_ref(), data);
-        assert_eq!(client.get(&src_url).await?.as_ref(), data);
-
-        // Test Move
-        let dst_url2 = format!("file://{}.2", dst_path.display());
-        client.move_object(&dst_url, &dst_url2).await?;
-        assert_eq!(client.get(&dst_url2).await?.as_ref(), data);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_store_caching() -> Result<()> {
-        let client = ObjectStorageClient::new();
-        let url = Url::parse("file:///tmp")?;
-
-        let (store1, _) = client.get_store(&url)?;
-        let (store2, _) = client.get_store(&url)?;
-
-        // Check if both Arcs point to the same ObjectStore instance.
-        // We can compare the raw pointers of the trait objects.
-        assert!(Arc::ptr_eq(&store1, &store2));
-
-        // Different URL but same store (scheme + host)
-        let url3 = Url::parse("file:///other")?;
-        let (store3, _) = client.get_store(&url3)?;
-        assert!(Arc::ptr_eq(&store1, &store3));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_pre_signed_url_unsupported_for_local() {
-        let client = ObjectStorageClient::new();
-        let err = client
-            .get_pre_signed_url(
-                "file:///tmp/foo.txt",
-                SignMethod::Get,
-                Duration::from_mins(1),
-                &SignOptions::default(),
-            )
-            .await
-            .expect_err("local filesystem must not support signing");
-
-        assert!(matches!(err, Error::SigningUnsupported(scheme) if scheme == "file"));
-    }
-
-    #[tokio::test]
-    async fn test_get_pre_signed_urls_rejects_mixed_backends() {
-        let client = ObjectStorageClient::new();
-        let err = client
-            .get_pre_signed_urls(
-                &["file:///tmp/a.txt", "s3://bucket/b.txt"],
-                SignMethod::Get,
-                Duration::from_mins(1),
-                &SignOptions::default(),
-            )
-            .await
-            .expect_err("mixed backends must be rejected");
-
-        // The URLs resolve to different backends (file vs s3), which is
-        // detected before any signing is attempted.
-        assert!(matches!(err, Error::Generic(msg) if msg.contains("same backend")));
-    }
-
-    #[tokio::test]
-    async fn test_get_backend_s3_bucket_only() -> Result<()> {
-        // A bucket-only S3 URL has an empty path; this used to panic on
-        // `&url.path()[1..]`. It must resolve to the s3 backend with an empty
-        // object key.
-        let client = ObjectStorageClient::new();
-        let url = Url::parse("s3://bucket")?;
-
-        let (backend, path) = client.get_backend(&url)?;
-        assert_eq!(backend.scheme(), "s3");
-        assert_eq!(path.to_string(), "");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_backend_s3_bucket_and_path() -> Result<()> {
-        // The host is the bucket and the leading `/` is stripped from the key.
-        let client = ObjectStorageClient::new();
-        let url = Url::parse("s3://bucket/path")?;
-
-        let (backend, path) = client.get_backend(&url)?;
-        assert_eq!(backend.scheme(), "s3");
-        assert_eq!(path.to_string(), "path");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_backend_file_with_host_and_path() -> Result<()> {
-        // For `file://tmp/path` the URL authority ("tmp") is parsed as the host
-        // and "/path" as the path. The file backend keeps `url.path()` verbatim,
-        // and `ObjectPath` normalises away the leading slash.
-        let client = ObjectStorageClient::new();
-        let url = Url::parse("file://tmp/path")?;
-
-        let (backend, path) = client.get_backend(&url)?;
-        assert_eq!(backend.scheme(), "file");
-        assert_eq!(path.to_string(), "path");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_get_backend_s3_caches_by_bucket_host() -> Result<()> {
-        // Bucket-only and keyed URLs share the (scheme, host) cache entry, so
-        // the same backend instance is reused.
-        let client = ObjectStorageClient::new();
-
-        let (b1, _) = client.get_backend(&Url::parse("s3://bucket")?)?;
-        let (b2, _) = client.get_backend(&Url::parse("s3://bucket/path")?)?;
-        assert!(Arc::ptr_eq(&b1, &b2));
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_clone_client() -> Result<()> {
-        let client = ObjectStorageClient::new();
-        let client_clone = client.clone();
-        let url = Url::parse("file:///tmp")?;
-
-        let (store1, _) = client.get_store(&url)?;
-        let (store2, _) = client_clone.get_store(&url)?;
-
-        // Cloned client should share the same stores.
-        assert!(Arc::ptr_eq(&store1, &store2));
-
-        Ok(())
     }
 }

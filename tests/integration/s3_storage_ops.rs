@@ -18,7 +18,7 @@ fn s3_bucket() -> Result<String, Box<dyn std::error::Error>> {
 /// `AWS_REGION`=...
 /// Then run with: cargo test --test `s3_storage_ops` -- --ignored
 #[tokio::test]
-#[ignore = "functional"]
+#[ignore = "integration"]
 async fn test_s3_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = s3_bucket()?;
     let bucket_url = format!("s3://{bucket}/");
@@ -79,7 +79,7 @@ async fn test_s3_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 /// `test_s3_object_lifecycle`.
 /// Run with: `cargo test --test s3_storage_ops -- --ignored`
 #[tokio::test]
-#[ignore = "functional"]
+#[ignore = "integration"]
 async fn test_s3_create_bucket_and_exists() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = s3_bucket()?;
     let bucket_url = format!("s3://{bucket}/");
@@ -128,7 +128,7 @@ async fn test_s3_create_bucket_and_exists() -> Result<(), Box<dyn std::error::Er
 /// Requires the same environment variables as `test_s3_object_lifecycle`.
 /// Run with: `cargo test --test s3_storage_ops -- --ignored`
 #[tokio::test]
-#[ignore = "functional"]
+#[ignore = "integration"]
 async fn test_s3_presigned_url_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = s3_bucket()?;
 
@@ -168,7 +168,7 @@ async fn test_s3_presigned_url_roundtrip() -> Result<(), Box<dyn std::error::Err
 /// Requires the same environment variables as `test_s3_object_lifecycle`.
 /// Run with: `cargo test --test s3_storage_ops -- --ignored`
 #[tokio::test]
-#[ignore = "functional"]
+#[ignore = "integration"]
 async fn test_s3_presigned_put_with_bound_headers() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = s3_bucket()?;
 

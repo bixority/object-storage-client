@@ -20,7 +20,7 @@ A unified object storage client for Rust and Python, supporting S3, GCS, Azure B
 - `gs://bucket/path` or `gcs://bucket/path` (Google Cloud Storage)
 - `az://`, `wasb://`, `wasbs://`, `abfs://`, or `abfss://` (Azure Blob Storage)
 - `http://host/path` or `https://host/path` (HTTP/HTTPS)
-- `file:///absolute/path` or `local_path` (Local Filesystem)
+- `file:///absolute/path`, `/absolute/path`, `~/path.txt` or `local_path` (Local Filesystem)
 
 For the cloud schemes the host is the bucket / container and the path is the
 object key. The path is optional: a bucket-root URL such as `s3://bucket` (or

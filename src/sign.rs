@@ -99,6 +99,7 @@ impl SignOptions {
 /// Error returned when `Content-Length`/`Content-Type` binding is requested for
 /// a backend other than S3, which is the only one this client can re-sign with
 /// extra headers.
+#[must_use]
 pub fn content_binding_unsupported() -> Error {
     Error::Generic(
         "binding Content-Length/Content-Type into a pre-signed URL is only supported for S3 \
@@ -110,6 +111,7 @@ pub fn content_binding_unsupported() -> Error {
 /// Resolve the AWS region used for `SigV4` signing, mirroring how the S3 backend
 /// is configured: explicit `S3_REGION`, then the standard AWS environment
 /// variables, falling back to `us-east-1`.
+#[must_use]
 pub fn s3_region() -> String {
     std::env::var("S3_REGION")
         .or_else(|_| std::env::var("AWS_REGION"))
@@ -203,9 +205,10 @@ fn canonicalize_query(url: &Url) -> String {
     encoded
 }
 
-/// Generate a `SigV4` pre-signed URL for `base` (a clean resource URL, i.e.
-/// scheme, host and path with no query) authorizing `method` for `expires_in`,
-/// binding the supplied `content_length` and/or `content_type` into the
+/// Generate a `SigV4` pre-signed URL for `base`
+///
+/// (a clean resource URL, i.e. scheme, host and path with no query) authorizing `method` for
+/// `expires_in`, binding the supplied `content_length` and/or `content_type` into the
 /// signature so the client is forced to send those exact header values.
 ///
 /// `base` is expected to already encode the correct host and path style
@@ -225,8 +228,9 @@ pub fn presign_s3(
 
 /// As [`presign_s3`], but with an explicit signing timestamp (for testing
 /// against fixed `SigV4` vectors).
+#[doc(hidden)]
 #[must_use]
-fn presign_s3_at(
+pub fn presign_s3_at(
     base: &Url,
     method: &Method,
     expires_in: Duration,
@@ -304,135 +308,4 @@ fn presign_s3_at(
         .append_pair("X-Amz-Signature", &signature);
 
     url
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sign_method_from_str() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        assert_eq!("get".parse::<SignMethod>()?, SignMethod::Get);
-        assert_eq!("PUT".parse::<SignMethod>()?, SignMethod::Put);
-        assert_eq!("Delete".parse::<SignMethod>()?, SignMethod::Delete);
-        assert!("PATCH".parse::<SignMethod>().is_err());
-        Ok(())
-    }
-
-    /// Reproduces the canonical AWS `SigV4` "Example: GET Object" pre-signed URL
-    /// from the AWS documentation, pinning the signing timestamp so the
-    /// resulting signature can be compared against the published value. This
-    /// guards the whole canonical-request / string-to-sign / signing pipeline.
-    #[test]
-    fn matches_aws_documented_vector() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use chrono::TimeZone;
-
-        let cred = AwsCredential {
-            key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            token: None,
-        };
-        // Virtual-hosted style base URL, as in the AWS example.
-        let base = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt")?;
-        let date = Utc
-            .with_ymd_and_hms(2013, 5, 24, 0, 0, 0)
-            .single()
-            .ok_or("invalid test timestamp")?;
-
-        let signed = presign_s3_at(
-            &base,
-            &Method::GET,
-            Duration::from_hours(24),
-            &cred,
-            "us-east-1",
-            BoundHeaders::default(),
-            date,
-        );
-
-        let signature = signed
-            .query_pairs()
-            .find(|(k, _)| k == "X-Amz-Signature")
-            .map(|(_, v)| v.into_owned())
-            .ok_or("missing X-Amz-Signature in signed URL")?;
-
-        assert_eq!(
-            signature,
-            "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
-        );
-        Ok(())
-    }
-
-    fn test_credential() -> AwsCredential {
-        AwsCredential {
-            key_id: "AKIDEXAMPLE".to_string(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            token: None,
-        }
-    }
-
-    #[test]
-    fn presign_binds_content_headers() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let base = Url::parse("https://s3.amazonaws.com/my-bucket/some/key.bin")?;
-        let signed = presign_s3(
-            &base,
-            &Method::PUT,
-            Duration::from_mins(15),
-            &test_credential(),
-            "us-east-1",
-            BoundHeaders {
-                content_length: Some(1234),
-                content_type: Some("application/octet-stream"),
-            },
-        );
-
-        let query = signed.query().ok_or("signed URL has no query string")?;
-        assert!(signed.as_str().contains("X-Amz-Signature="));
-        // Signed headers are sorted and include the bound content headers.
-        assert!(query.contains("X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost"));
-        assert!(query.contains("X-Amz-Expires=900"));
-        Ok(())
-    }
-
-    #[test]
-    fn presign_host_only_when_no_headers() -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let base = Url::parse("https://s3.amazonaws.com/my-bucket/key")?;
-        let signed = presign_s3(
-            &base,
-            &Method::GET,
-            Duration::from_mins(1),
-            &test_credential(),
-            "eu-west-1",
-            BoundHeaders::default(),
-        );
-
-        let query = signed.query().ok_or("signed URL has no query string")?;
-        assert!(query.contains("X-Amz-SignedHeaders=host"));
-        Ok(())
-    }
-
-    #[test]
-    fn security_token_is_included_when_present()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let mut cred = test_credential();
-        cred.token = Some("session-token-value".to_string());
-        let base = Url::parse("https://s3.amazonaws.com/bucket/key")?;
-        let signed = presign_s3(
-            &base,
-            &Method::PUT,
-            Duration::from_mins(5),
-            &cred,
-            "us-east-1",
-            BoundHeaders {
-                content_length: Some(10),
-                content_type: None,
-            },
-        );
-
-        assert!(
-            signed
-                .as_str()
-                .contains("X-Amz-Security-Token=session-token-value")
-        );
-        Ok(())
-    }
 }

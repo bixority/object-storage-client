@@ -79,7 +79,7 @@ async fn test_mixed_local_paths() -> Result<(), Box<dyn std::error::Error>> {
     let file_url = if cfg!(windows) {
         format!("file:///{}", abs_path_str.replace('\\', "/"))
     } else {
-        format!("file://{}", abs_path_str)
+        format!("file://{abs_path_str}")
     };
     assert!(
         client.exists(&file_url).await?,
@@ -102,21 +102,16 @@ async fn test_single_letter_scheme_handling() -> Result<(), Box<dyn std::error::
     // but Url::parse might see "c" as a scheme.
     let result = client.exists("c:/non_existent_path_12345").await;
 
-    match result {
-        Ok(false) => {
-            // Correct: it was treated as a local path and not found.
-        }
-        Err(e) => {
-            let err_str = format!("{:?}", e);
-            assert!(
-                !err_str.contains("UnsupportedScheme(\"c\")"),
-                "Single-letter scheme should be treated as local path, not unsupported scheme: {}",
-                err_str
-            );
-        }
-        Ok(true) => {
-            // Unlikely but possible if such a file exists
-        }
+    if let Err(e) = result {
+        let err_str = format!("{e:?}");
+        assert!(
+            !err_str.contains("UnsupportedScheme(\"c\")"),
+            "Single-letter scheme should be treated as local path, \
+            not unsupported scheme: {err_str}"
+        );
+    } else {
+        // false: Correct: it was treated as a local path and not found.
+        // true: Unlikely but possible if such a file exists
     }
 
     Ok(())

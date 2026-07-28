@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use http::Method;
-use object_storage_client::sign::{presign_s3, presign_s3_at, BoundHeaders, SignMethod};
+use object_storage_client::sign::{BoundHeaders, SignMethod, presign_s3, presign_s3_at};
 use object_store::aws::AwsCredential;
 use std::time::Duration;
 use url::Url;
@@ -104,7 +104,8 @@ fn presign_host_only_when_no_headers() -> std::result::Result<(), Box<dyn std::e
 }
 
 #[test]
-fn security_token_is_included_when_present() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn security_token_is_included_when_present() -> std::result::Result<(), Box<dyn std::error::Error>>
+{
     let mut cred = test_credential();
     cred.token = Some("session-token-value".to_string());
     let base = Url::parse("https://s3.amazonaws.com/bucket/key")?;
@@ -120,8 +121,10 @@ fn security_token_is_included_when_present() -> std::result::Result<(), Box<dyn 
         },
     );
 
-    assert!(signed
-        .as_str()
-        .contains("X-Amz-Security-Token=session-token-value"));
+    assert!(
+        signed
+            .as_str()
+            .contains("X-Amz-Security-Token=session-token-value")
+    );
     Ok(())
 }

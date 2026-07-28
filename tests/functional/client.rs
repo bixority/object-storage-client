@@ -1,6 +1,4 @@
-use object_storage_client::{
-    Error, ObjectStorageClient, Result, SignMethod, SignOptions,
-};
+use object_storage_client::{Error, ObjectStorageClient, Result, SignMethod, SignOptions};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -324,12 +322,18 @@ async fn test_tilde_expansion() -> std::result::Result<(), Box<dyn std::error::E
     // Test ~
     let url = ObjectStorageClient::parse_url("~")?;
     assert_eq!(url.scheme(), "file");
-    assert_eq!(url, Url::from_file_path(&home).map_err(|()| "invalid home path")?);
+    assert_eq!(
+        url,
+        Url::from_file_path(&home).map_err(|()| "invalid home path")?
+    );
 
     // Test ~/path
     let url = ObjectStorageClient::parse_url("~/test.txt")?;
     assert_eq!(url.scheme(), "file");
-    assert_eq!(url, Url::from_file_path(home.join("test.txt")).map_err(|()| "invalid path")?);
+    assert_eq!(
+        url,
+        Url::from_file_path(home.join("test.txt")).map_err(|()| "invalid path")?
+    );
 
     Ok(())
 }

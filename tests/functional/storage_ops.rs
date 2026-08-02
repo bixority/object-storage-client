@@ -58,3 +58,50 @@ async fn test_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "functional"]
+async fn test_delete_by_prefix() -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = tempdir()?;
+    let bucket_path = tmp_dir.path().to_string_lossy();
+    let bucket_url = if cfg!(windows) {
+        format!("file:///{}", bucket_path.replace('\\', "/"))
+    } else {
+        format!("file://{bucket_path}")
+    };
+
+    let client = ObjectStorageClient::new();
+
+    // 1. Create a folder-like structure
+    client
+        .put(&format!("{bucket_url}/folder/file1.txt"), &b"content1"[..])
+        .await?;
+    client
+        .put(&format!("{bucket_url}/folder/file2.txt"), &b"content2"[..])
+        .await?;
+    client
+        .put(
+            &format!("{bucket_url}/folder/sub/file3.txt"),
+            &b"content3"[..],
+        )
+        .await?;
+    client
+        .put(&format!("{bucket_url}/other.txt"), &b"other"[..])
+        .await?;
+
+    // 2. Verify they exist
+    let list = client.list(&bucket_url).await?;
+    assert_eq!(list.len(), 4);
+
+    // 3. Delete by prefix
+    client
+        .delete_by_prefix(&format!("{bucket_url}/folder/"))
+        .await?;
+
+    // 4. Verify deletion
+    let list_after = client.list(&bucket_url).await?;
+    assert_eq!(list_after.len(), 1);
+    assert_eq!(list_after[0], "other.txt");
+
+    Ok(())
+}

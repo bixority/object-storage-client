@@ -154,6 +154,22 @@ impl ObjectStorageClient {
         })
     }
 
+    fn delete_objects_by_prefix<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+
+        future_into_py(py, async move {
+            inner
+                .delete_by_prefix(&url)
+                .await
+                .map_err(client_to_py_err)?;
+            Ok(())
+        })
+    }
+
     fn list_objects<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
 

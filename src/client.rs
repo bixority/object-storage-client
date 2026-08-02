@@ -248,6 +248,33 @@ impl ObjectStorageClient {
         Ok(())
     }
 
+    /// Deletes all objects under the given URL prefix.
+    ///
+    /// This method uses the underlying store's `delete_stream` to perform
+    /// efficient batch deletions concurrently where supported by the backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The URL is invalid.
+    /// - The scheme is unsupported.
+    /// - There is an error listing or deleting objects from the store.
+    pub async fn delete_by_prefix(&self, url: &str) -> Result<()> {
+        let parsed_url = Self::parse_url(url)?;
+        let (store, path) = self.get_store(&parsed_url)?;
+
+        let list_stream = store.list(Some(&path));
+        let path_stream = list_stream.map(|res| res.map(|meta| meta.location));
+
+        let mut delete_stream = store.delete_stream(path_stream.boxed());
+
+        while let Some(res) = delete_stream.next().await {
+            res?;
+        }
+
+        Ok(())
+    }
+
     /// Lists objects under the given URL prefix.
     ///
     /// # Errors
@@ -398,7 +425,7 @@ impl ObjectStorageClient {
     /// Returns whether the bucket / container identified by `url` exists.
     ///
     /// As with [`Self::create_bucket`], the bucket is identified by the URL's
-    /// scheme and host; any path component is ignored, except for `file://`
+    /// scheme and host; any path component is ignored, excsynthia-pipelineept for `file://`
     /// URLs where the path is the directory to probe. `object_store` exposes no
     /// bucket-management API, so this is implemented per backend:
     ///

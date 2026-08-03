@@ -47,36 +47,47 @@ impl S3Backend {
     /// Returns an error if the bucket (URL host) is missing or the store fails
     /// to build.
     pub fn from_env(host: Option<&str>) -> Result<Self> {
-        let s3_allow_http = std::env::var("S3_ALLOW_HTTP").unwrap_or_else(|_| "false".into());
+        Self::from_env_internal(host, |k| std::env::var(k).ok())
+    }
+
+    fn from_env_internal(
+        host: Option<&str>,
+        get_var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let s3_allow_http = get_var("S3_ALLOW_HTTP").unwrap_or_else(|| "false".into());
         let bucket = host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
 
-        if let Ok(region) = std::env::var("S3_REGION") {
+        if let Some(region) = get_var("S3_REGION") {
             builder = builder.with_region(region);
         }
 
         // Honour the crate's own `S3_ENDPOINT` alongside the `AWS_*` names
         // `from_env` already reads, so every endpoint name resolves the store to
         // the same place as `endpoint_and_region`.
-        let endpoint = Self::configured_endpoint();
+        let endpoint = Self::configured_endpoint(&get_var);
         if let Some(ep) = endpoint.as_deref() {
             builder = builder.with_endpoint(ep);
         }
 
-        if let Ok(access_key_id) = std::env::var("S3_ACCESS_KEY_ID") {
+        if let Some(access_key_id) = get_var("S3_ACCESS_KEY_ID") {
             builder = builder.with_token("").with_access_key_id(access_key_id);
         }
 
-        if let Ok(secret_access_key) = std::env::var("S3_SECRET_ACCESS_KEY") {
+        if let Some(secret_access_key) = get_var("S3_SECRET_ACCESS_KEY") {
             builder = builder.with_secret_access_key(secret_access_key);
         }
 
-        if s3_allow_http == "true" {
+        if s3_allow_http == "true"
+            || endpoint
+                .as_deref()
+                .is_some_and(|ep| ep.starts_with("http://"))
+        {
             builder = builder.with_allow_http(true);
         }
 
-        let skip_signature = Self::explicit_skip_signature()
-            .unwrap_or_else(|| endpoint.is_some() && !Self::has_credentials());
+        let skip_signature = Self::explicit_skip_signature(&get_var)
+            .unwrap_or_else(|| endpoint.is_some() && !Self::has_credentials(&get_var));
         if skip_signature {
             builder = builder.with_skip_signature(true);
         }
@@ -93,7 +104,7 @@ impl S3Backend {
     /// precedence `AmazonS3Builder::from_env` uses (`AWS_ENDPOINT_URL_S3` wins),
     /// extended with the crate's own `S3_ENDPOINT`. `None` means "no custom
     /// endpoint" — i.e. real AWS, where the IMDS credential fallback is valid.
-    fn configured_endpoint() -> Option<String> {
+    fn configured_endpoint(get_var: &impl Fn(&str) -> Option<String>) -> Option<String> {
         [
             "S3_ENDPOINT",
             "AWS_ENDPOINT_URL_S3",
@@ -101,16 +112,16 @@ impl S3Backend {
             "AWS_ENDPOINT_URL",
         ]
         .into_iter()
-        .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+        .find_map(|key| get_var(key).filter(|v| !v.is_empty()))
     }
 
     /// Whether the environment provides any credential source other than the
     /// instance-metadata (IMDS) fallback: static keys (either `S3_*` or `AWS_*`),
     /// web-identity (IRSA) or container credentials. When none of these is set
-    /// against a custom endpoint, IMDS is the only thing left for `object_store`
+    /// against a guest endpoint, IMDS is the only thing left for `object_store`
     /// to try — which is exactly what we want to avoid.
-    fn has_credentials() -> bool {
-        let set = |key: &str| std::env::var(key).is_ok_and(|v| !v.is_empty());
+    fn has_credentials(get_var: &impl Fn(&str) -> Option<String>) -> bool {
+        let set = |key: &str| get_var(key).is_some_and(|v| !v.is_empty());
         set("S3_ACCESS_KEY_ID")
             || set("AWS_ACCESS_KEY_ID")
             || set("AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -124,8 +135,8 @@ impl S3Backend {
     /// store. `None` means the variable is unset (decide automatically); an
     /// unrecognised value is also `None` here and surfaces as a build error from
     /// `object_store` itself. Parsing mirrors `object_store`'s boolean grammar.
-    fn explicit_skip_signature() -> Option<bool> {
-        let value = std::env::var("AWS_SKIP_SIGNATURE").ok()?;
+    fn explicit_skip_signature(get_var: &impl Fn(&str) -> Option<String>) -> Option<bool> {
+        let value = get_var("AWS_SKIP_SIGNATURE")?;
         match value.to_ascii_lowercase().as_str() {
             "1" | "true" | "on" | "yes" | "y" => Some(true),
             "0" | "false" | "off" | "no" | "n" => Some(false),
@@ -161,13 +172,17 @@ impl S3Backend {
     /// `CreateBucket`) the `LocationConstraint`, so it must match the built
     /// store.
     fn endpoint_and_region() -> (String, String) {
-        let region = std::env::var("S3_REGION")
-            .or_else(|_| std::env::var("AWS_REGION"))
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".into());
-        let allow_http = std::env::var("S3_ALLOW_HTTP").is_ok_and(|v| v == "true");
-        let endpoint = Self::configured_endpoint().unwrap_or_else(|| {
-            let scheme = if allow_http { "https" } else { "http" };
+        Self::endpoint_and_region_internal(|k| std::env::var(k).ok())
+    }
+
+    fn endpoint_and_region_internal(get_var: impl Fn(&str) -> Option<String>) -> (String, String) {
+        let region = get_var("S3_REGION")
+            .or_else(|| get_var("AWS_REGION"))
+            .or_else(|| get_var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| "us-east-1".into());
+        let allow_http = get_var("S3_ALLOW_HTTP").is_some_and(|v| v == "true");
+        let endpoint = Self::configured_endpoint(&get_var).unwrap_or_else(|| {
+            let scheme = if allow_http { "http" } else { "https" };
             format!("{scheme}://s3.{region}.amazonaws.com")
         });
         (endpoint, region)
@@ -359,5 +374,63 @@ impl Backend for S3Backend {
             );
         }
         Ok(pre_signed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::ObjectStoreExt;
+
+    #[test]
+    fn test_endpoint_and_region_scheme_logic() {
+        let get_var = |k: &str| match k {
+            "S3_ALLOW_HTTP" => Some("true".to_string()),
+            _ => None,
+        };
+        let (endpoint, _) = S3Backend::endpoint_and_region_internal(get_var);
+        assert!(
+            endpoint.starts_with("http://"),
+            "Should be http when allow_http is true, got {endpoint}"
+        );
+
+        let get_var_https = |k: &str| match k {
+            "S3_ALLOW_HTTP" => Some("false".to_string()),
+            _ => None,
+        };
+        let (endpoint_https, _) = S3Backend::endpoint_and_region_internal(get_var_https);
+        assert!(
+            endpoint_https.starts_with("https://"),
+            "Should be https when allow_http is false, got {endpoint_https}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_regression_builder_error() {
+        // Verify that providing an http endpoint now automatically enables allow_http,
+        // preventing the "builder error".
+        let get_var = |k: &str| match k {
+            "S3_ENDPOINT" => Some("http://localhost:9000".to_string()),
+            "S3_ALLOW_HTTP" => Some("false".to_string()),
+            "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY" => Some("minioadmin".to_string()),
+            "S3_REGION" => Some("us-east-1".to_string()),
+            _ => None,
+        };
+
+        let backend = S3Backend::from_env_internal(Some("api-proxy"), get_var)
+            .expect("Failed to create S3Backend");
+        let path = ObjectPath::from("audit/test.txt");
+
+        // We expect a connection error (since no MinIO is running at localhost:9000),
+        // but NOT a "builder error". A connection error means the request was successfully built.
+        let result = backend.store().put(&path, Bytes::from("data").into()).await;
+
+        if let Err(e) = result {
+            let err_str = format!("{e}");
+            assert!(
+                !err_str.contains("builder error"),
+                "Should NOT have failed with builder error, got: {err_str}"
+            );
+        }
     }
 }

@@ -2,6 +2,7 @@
 authors = ["Olegs Korsaks <olegs.korsaks@bixority.com>"]
 categories = ["api-bindings", "filesystem"]
 description = "Unified object storage client API"
+rust-version = "1.98"
 edition = "2024"
 keywords = ["object-store", "s3", "gcs", "azure", "python"]
 license = "GPL-3.0-only"

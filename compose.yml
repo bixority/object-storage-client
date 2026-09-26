@@ -1,0 +1,62 @@
+name: object-storage-client
+
+services:
+  garage:
+    image: docker.io/dxflrs/garage:v2.4.1
+    command: [ "/garage", "server", "--single-node", "--default-bucket" ]
+    ports:
+      - "3900:3900"
+      - "3902:3902"
+      - "3903:3903"
+    environment:
+      GARAGE_DEFAULT_ACCESS_KEY: "${S3_ACCESS_KEY_ID:-rootroot}"
+      GARAGE_DEFAULT_SECRET_KEY: "${S3_SECRET_ACCESS_KEY:-rootrootrootroot}"
+      GARAGE_DEFAULT_BUCKET: "${S3_BUCKET:-sl-data-importer}"
+    healthcheck:
+      test: [ "CMD", "/garage", "health" ]
+      interval: 3s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - ./.docker/garage.toml:/etc/garage.toml:ro,Z
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks:
+      common:
+        aliases:
+          - garage
+
+  garage-webui:
+    image: docker.io/noooste/garage-ui:latest
+    ports:
+      - "3909:8080"
+    environment:
+      GARAGE_UI_GARAGE_TOML: "/etc/garage.toml"
+      GARAGE_UI_GARAGE_ENDPOINT: "http://garage:3900"
+      GARAGE_UI_GARAGE_ADMIN_ENDPOINT: "http://garage:3903"
+      GARAGE_UI_GARAGE_ADMIN_TOKEN: "${GARAGE_ADMIN_TOKEN:-0123456789abcdef0123456789abcdef}"
+      GARAGE_UI_GARAGE_REGION: "${S3_REGION:-lv-riga-1}"
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - ./.docker/garage.toml:/etc/garage.toml:ro,Z
+    depends_on:
+      garage:
+        condition: service_healthy
+    networks:
+      common:
+        aliases:
+          - garage-webui
+
+
+volumes:
+  garage-meta:
+  garage-data:
+
+
+networks:
+  common:
+    driver: bridge

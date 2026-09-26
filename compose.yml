@@ -11,7 +11,7 @@ services:
     environment:
       GARAGE_DEFAULT_ACCESS_KEY: "${S3_ACCESS_KEY_ID:-rootroot}"
       GARAGE_DEFAULT_SECRET_KEY: "${S3_SECRET_ACCESS_KEY:-rootrootrootroot}"
-      GARAGE_DEFAULT_BUCKET: "${S3_BUCKET:-sl-data-importer}"
+      GARAGE_DEFAULT_BUCKET: "${S3_BUCKET:-default}"
     healthcheck:
       test: [ "CMD", "/garage", "health" ]
       interval: 3s

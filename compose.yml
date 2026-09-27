@@ -35,7 +35,7 @@ services:
       GARAGE_UI_GARAGE_ENDPOINT: "http://garage:3900"
       GARAGE_UI_GARAGE_ADMIN_ENDPOINT: "http://garage:3903"
       GARAGE_UI_GARAGE_ADMIN_TOKEN: "${GARAGE_ADMIN_TOKEN:-0123456789abcdef0123456789abcdef}"
-      GARAGE_UI_GARAGE_REGION: "${S3_REGION:-lv-riga-1}"
+      GARAGE_UI_GARAGE_REGION: "${S3_REGION:-eu-north-1}"
     healthcheck:
       test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health" ]
       interval: 5s

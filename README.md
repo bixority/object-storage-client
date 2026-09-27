@@ -1,12 +1,14 @@
 # Object Storage Client
 
-A unified object storage client for Rust and Python, supporting S3, GCS, Azure Blob Storage, HTTP/HTTPS, and Local Filesystem. It provides a simple, URL-based API for object operations, including cross-provider copy and move.
+A unified object storage client for Rust and Python, supporting S3, GCS, Azure Blob Storage, HTTP/HTTPS, and Local 
+Filesystem. It provides a simple, URL-based API for object operations, including cross-provider copy and move.
 
 ## Features
 
 - **Unified API**: Single interface for various storage backends.
 - **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
-- **Listing**: List a prefix, or the whole bucket from a bucket-root URL (e.g. `s3://bucket`). Listing is flat and recursive — every key under the prefix is returned, not just the immediate level.
+- **Listing**: List a prefix, or the whole bucket from a bucket-root URL (e.g. `s3://bucket`). Listing is flat and 
+- recursive — every key under the prefix is returned, not just the immediate level.
 - **Existence checks**: Test whether an object or bucket exists without raising on a miss.
 - **Bucket creation**: Create buckets/containers on S3, GCS and Azure (or directories for local paths).
 - **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
@@ -41,20 +43,20 @@ between them. The local filesystem needs no variables.
 
 ### AWS S3 (`s3://`)
 
-Also covers S3-compatible stores such as MinIO and SeaweedFS.
+Also covers S3-compatible stores such as Garage and SeaweedFS.
 
 ```bash
 export S3_ACCESS_KEY_ID="AKIA..."
 export S3_SECRET_ACCESS_KEY="..."
-export AWS_REGION="us-east-1"
+export AWS_REGION="eu-north-1"
 # Optional: temporary credentials
 export AWS_SESSION_TOKEN="..."
-# Optional: custom endpoint for S3-compatible stores (e.g. MinIO)
-export AWS_ENDPOINT_URL_S3="http://localhost:9000"
+# Optional: custom endpoint for S3-compatible stores (e.g. Garage)
+export AWS_ENDPOINT_URL_S3="http://localhost:3900"
 
 # Convenience overrides honoured by this client (take precedence when set):
 #   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
-# Allow plain HTTP (e.g. a local MinIO):
+# Allow plain HTTP (e.g. a local Garage):
 #   export S3_ALLOW_HTTP=true
 ```
 
@@ -98,7 +100,8 @@ The `osc` tool allows you to interact with object storage directly from your ter
 
 ### Installation
 
-Install the `osc` binary directly from the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client) with Cargo. Point Cargo at the registry with an environment variable, then install:
+Install the `osc` binary directly from the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client) with Cargo. Point Cargo at the 
+registry with an environment variable, then install:
 
 ```bash
 export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
@@ -195,7 +198,8 @@ cargo install --path .
 
 ### Installation
 
-The crate is published to the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client). Point Cargo at the registry with an environment variable:
+The crate is published to the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client). Point Cargo at the registry with an environment 
+variable:
 
 ```bash
 export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
@@ -305,7 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Python 3.13+ Usage
+## Python 3.14+ Usage
 
 ### Installation
 
@@ -400,8 +404,8 @@ if __name__ == "__main__":
 
 ### Prerequisites
 
-- Rust 1.85+ (or latest stable)
-- Python 3.13+
+- Rust 1.98+ (or latest stable)
+- Python 3.14+
 - `maturin` (for Python bindings)
 
 ### Building
@@ -413,5 +417,5 @@ if __name__ == "__main__":
 ### Testing
 
 ```bash
-cargo test
+cargo nextest run --workspace
 ```

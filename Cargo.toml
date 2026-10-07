@@ -2,14 +2,14 @@
 authors = ["Olegs Korsaks <olegs.korsaks@bixority.com>"]
 categories = ["api-bindings", "filesystem"]
 description = "Unified object storage client API"
-rust-version = "1.98"
+rust-version = "1.99"
 edition = "2024"
 keywords = ["object-store", "s3", "gcs", "azure", "python"]
 license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.1.12"
+version = "0.1.13"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

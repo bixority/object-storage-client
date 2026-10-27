@@ -7,12 +7,13 @@
 //! abstract are implemented per provider by the trait methods below.
 //!
 //! Backends are built lazily by [`build`] and cached by the
-//! [`ObjectStorageClient`](crate::ObjectStorageClient) keyed on (scheme, host),
+//! [`ObjectStorageClient`](crate::ObjectStorageClient) keyed on (scheme, userinfo, host, port),
 //! so each provider's `object_store` — and the credential / HTTP machinery it
 //! carries — is constructed once and reused across calls rather than rebuilt on
 //! every request.
 
 mod azure;
+mod body;
 mod gcs;
 mod http;
 mod local;
@@ -20,20 +21,80 @@ mod s3;
 
 use crate::client::{Error, Result};
 use crate::sign::{SignMethod, SignOptions};
+pub use body::body_stream;
 use bytes::Bytes;
 use object_store::ObjectStore;
 use object_store::client::HttpRequest;
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+
+/// Where backend configuration is read from.
+///
+/// Production clients use [`Vars::Env`], the process environment. [`Vars::Map`]
+/// is an injected, fixed set of variables used by tests so parallel tests never
+/// share (or mutate) global environment state.
+#[derive(Clone, Default)]
+pub enum Vars {
+    #[default]
+    Env,
+    Map(Arc<HashMap<String, String>>),
+}
+
+impl Vars {
+    /// An injected variable set, for tests.
+    #[cfg(test)]
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self::Map(Arc::new(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        ))
+    }
+
+    /// The value of `key`, if set.
+    pub fn get(&self, key: &str) -> Option<String> {
+        match self {
+            Self::Env => std::env::var(key).ok(),
+            Self::Map(map) => map.get(key).cloned(),
+        }
+    }
+
+    /// For [`Vars::Map`], the entries whose name starts with `prefix` and whose
+    /// lower-cased name parses as a builder config key `K`, mirroring what the
+    /// `object_store` builders' `from_env` does with the process environment.
+    /// Empty for [`Vars::Env`], where `from_env` does the reading itself.
+    fn config_entries<K: FromStr>(&self, prefix: &str) -> Vec<(K, String)> {
+        match self {
+            Self::Env => Vec::new(),
+            Self::Map(map) => map
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .filter_map(|(k, v)| Some((k.to_ascii_lowercase().parse().ok()?, v.clone())))
+                .collect(),
+        }
+    }
+}
+
+/// A boolean setting in `object_store`'s grammar; `None` for anything else.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "y" => Some(true),
+        "0" | "false" | "off" | "no" | "n" => Some(false),
+        _ => None,
+    }
+}
 
 /// A resolved, provider-specific storage backend.
 ///
 /// Implementations are small wrappers over an `object_store` plus whatever extra
 /// provider state (concrete store, credentials) is needed for the operations
-/// `object_store` does not expose. They are constructed once per (scheme, host)
+/// `object_store` does not expose. They are constructed once per (scheme, userinfo, host, port)
 /// and shared behind an `Arc`.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
@@ -43,6 +104,19 @@ pub trait Backend: Send + Sync {
 
     /// The URL scheme this backend was built for, used in error messages.
     fn scheme(&self) -> &str;
+
+    /// Whether the store supports multipart uploads. `false` makes
+    /// [`upload_stream`](crate::upload::upload_stream) buffer and issue one `put`.
+    fn supports_multipart(&self) -> bool {
+        true
+    }
+
+    /// The file system path `path` maps to, for the local backend on Unix;
+    /// `None` for every other backend. Writes to such a path go through the
+    /// crate's own private-staging writer instead of the store's `put`.
+    fn local_path(&self, _path: &ObjectPath) -> Result<Option<std::path::PathBuf>> {
+        Ok(None)
+    }
 
     /// Create the bucket / container identified by `url`.
     ///
@@ -60,52 +134,60 @@ pub trait Backend: Send + Sync {
         Err(Error::BucketExistenceUnsupported(self.scheme().to_string()))
     }
 
-    /// Generate a pre-signed URL for a single object.
-    ///
-    /// Defaults to [`Error::SigningUnsupported`].
-    async fn pre_signed_url(
-        &self,
-        _path: &ObjectPath,
-        _method: SignMethod,
-        _expires_in: Duration,
-        _options: &SignOptions,
-    ) -> Result<String> {
-        Err(Error::SigningUnsupported(self.scheme().to_string()))
+    /// The `object_store` signer for host-only pre-signing, if the store has one.
+    fn signer(&self) -> Option<&dyn Signer> {
+        None
     }
 
     /// Generate pre-signed URLs for several objects sharing this backend.
     ///
-    /// Defaults to [`Error::SigningUnsupported`].
+    /// Signs host-only through [`Backend::signer`]; backends that bind headers
+    /// (S3) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SigningUnsupported`] without a signer, an error if
+    /// `options` requests header binding (unsupported off S3), or the signer's
+    /// error.
     async fn pre_signed_urls(
         &self,
-        _paths: &[ObjectPath],
-        _method: SignMethod,
-        _expires_in: Duration,
-        _options: &SignOptions,
+        paths: &[ObjectPath],
+        method: SignMethod,
+        expires_in: Duration,
+        options: &SignOptions,
     ) -> Result<Vec<String>> {
-        Err(Error::SigningUnsupported(self.scheme().to_string()))
+        let signer = self
+            .signer()
+            .ok_or_else(|| Error::SigningUnsupported(self.scheme().to_string()))?;
+        if !options.is_empty() {
+            return Err(crate::sign::content_binding_unsupported());
+        }
+        let urls = signer
+            .signed_urls(method.into_http(), paths, expires_in)
+            .await?;
+        Ok(urls.into_iter().map(Into::into).collect())
     }
 }
 
-/// Build the backend for `url`'s scheme, reading provider configuration from the
-/// environment.
+/// Build the backend for `url`'s scheme, reading provider configuration from
+/// `vars` (the environment unless injected).
 ///
-/// Called once per (scheme, host); the [`ObjectStorageClient`](crate::ObjectStorageClient)
+/// Called once per registry key; the [`ObjectStorageClient`](crate::ObjectStorageClient)
 /// caches the result.
 ///
 /// # Errors
 ///
 /// Returns an error if the scheme is unsupported, required URL components are
 /// missing, or the underlying `object_store` fails to build.
-pub fn build(url: &Url) -> Result<Arc<dyn Backend>> {
+pub fn build(url: &Url, vars: &Vars) -> Result<Arc<dyn Backend>> {
     let scheme = url.scheme();
     let host = url.host_str();
 
     let backend: Arc<dyn Backend> = match scheme {
-        "s3" => Arc::new(s3::S3Backend::from_env(host)?),
-        "gs" | "gcs" => Arc::new(gcs::GcsBackend::from_env(scheme, host)?),
+        "s3" => Arc::new(s3::S3Backend::new(host, vars)?),
+        "gs" | "gcs" => Arc::new(gcs::GcsBackend::new(scheme, host, vars)?),
         "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
-            Arc::new(azure::AzureBackend::from_env(scheme, host)?)
+            Arc::new(azure::AzureBackend::new(scheme, host, vars)?)
         }
         "http" | "https" => Arc::new(http::HttpBackend::new(scheme, url)?),
         "file" => Arc::new(local::LocalBackend::new()),
@@ -138,7 +220,7 @@ pub async fn bucket_exists_from_response(
         404 => Ok(false),
         401 | 403 => Ok(true),
         _ => {
-            let text = response.text().await.unwrap_or_default();
+            let text = error_body(response).await;
             Err(Error::Generic(format!(
                 "{scheme} bucket existence check failed (HTTP {status}): {text}"
             )))
@@ -146,49 +228,23 @@ pub async fn bucket_exists_from_response(
     }
 }
 
-/// Host-only pre-signing through an `object_store` [`Signer`], used by the cloud
-/// backends that do not support binding extra headers (GCS, Azure).
-///
-/// # Errors
-///
-/// Returns an error if `options` requests header binding (unsupported off S3) or
-/// the signer fails.
-pub async fn generic_pre_signed_url(
-    signer: &dyn Signer,
-    path: &ObjectPath,
-    method: SignMethod,
-    expires_in: Duration,
-    options: &SignOptions,
-) -> Result<String> {
-    if !options.is_empty() {
-        return Err(crate::sign::content_binding_unsupported());
+/// The start of an error response's body, for messages: at most 4 KiB, with
+/// control characters (terminal escapes) replaced by spaces. A server that
+/// answers with a huge or hostile body costs neither memory nor a corrupted
+/// terminal.
+pub async fn error_body(mut response: reqwest::Response) -> String {
+    const LIMIT: usize = 4096;
+    let mut body = Vec::new();
+    while body.len() < LIMIT
+        && let Ok(Some(chunk)) = response.chunk().await
+    {
+        body.extend_from_slice(&chunk);
     }
-    let url = signer
-        .signed_url(method.into_http(), path, expires_in)
-        .await?;
-    Ok(url.into())
-}
-
-/// Batch counterpart of [`generic_pre_signed_url`].
-///
-/// # Errors
-///
-/// Returns an error if `options` requests header binding (unsupported off S3) or
-/// the signer fails.
-pub async fn generic_pre_signed_urls(
-    signer: &dyn Signer,
-    paths: &[ObjectPath],
-    method: SignMethod,
-    expires_in: Duration,
-    options: &SignOptions,
-) -> Result<Vec<String>> {
-    if !options.is_empty() {
-        return Err(crate::sign::content_binding_unsupported());
-    }
-    let urls = signer
-        .signed_urls(method.into_http(), paths, expires_in)
-        .await?;
-    Ok(urls.into_iter().map(Into::into).collect())
+    body.truncate(LIMIT);
+    String::from_utf8_lossy(&body)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Sends a request already signed by an `object_store` authorizer.
@@ -209,4 +265,64 @@ pub async fn send_signed(
         .send()
         .await
         .map_err(|e| Error::Generic(format!("Signed request failed: {e}")))
+}
+
+/// Wraps an arbitrary store as a [`Backend`] for unit tests.
+#[cfg(test)]
+pub struct TestBackend {
+    pub store: Arc<dyn ObjectStore>,
+    pub multipart: bool,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Backend for TestBackend {
+    fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    fn scheme(&self) -> &'static str {
+        "test"
+    }
+
+    fn supports_multipart(&self) -> bool {
+        self.multipart
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn error_body_of(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.expect("accept");
+            let _ = conn.read(&mut [0; 1024]).await;
+            let head = format!(
+                "HTTP/1.1 500 Oops\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = conn.write_all(head.as_bytes()).await;
+            let _ = conn.write_all(&body).await;
+        });
+        let response = reqwest::get(format!("http://{addr}/")).await.expect("get");
+        error_body(response).await
+    }
+
+    #[tokio::test]
+    async fn error_bodies_are_capped_and_stripped_of_control_characters() {
+        let mut body = b"\x1b[31mred\x07 text\n".to_vec();
+        body.extend(std::iter::repeat_n(b'a', 100_000));
+        let text = error_body_of(body).await;
+        assert_eq!(text.len(), 4096);
+        assert!(text.starts_with(" [31mred  text a"), "{text}");
+        assert!(!text.chars().any(char::is_control));
+
+        assert_eq!(error_body_of(b"short".to_vec()).await, "short");
+    }
 }

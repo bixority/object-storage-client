@@ -1,0 +1,13 @@
+# A counting allocator for the `throughput` bench and the `perf_guards` test.
+# It is its own package because `GlobalAlloc` is an unsafe trait and the main
+# crate forbids `unsafe_code`; neither the library nor the wheel depends on it.
+[package]
+name = "alloc-counter"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"

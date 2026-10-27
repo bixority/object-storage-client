@@ -21,3 +21,8 @@ target
 .idea/
 
 #Cargo.lock
+
+# Python
+python/object_storage_client/*.so
+__pycache__/
+.venv/

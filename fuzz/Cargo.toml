@@ -1,0 +1,39 @@
+[package]
+name = "object-storage-client-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.object-storage-client]
+path = ".."
+default-features = false
+features = ["fuzzing"]
+
+[[bin]]
+name = "header_parse"
+path = "fuzz_targets/header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decryptor_feed"
+path = "fuzz_targets/decryptor_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypt_mutate"
+path = "fuzz_targets/encrypt_mutate.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

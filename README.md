@@ -1,231 +1,55 @@
 # Object Storage Client
 
-A unified object storage client for Rust and Python, supporting S3, GCS, Azure Blob Storage, HTTP/HTTPS, and Local 
-Filesystem. It provides a simple, URL-based API for object operations, including cross-provider copy and move.
+One URL-based API for AWS S3, Google Cloud Storage, Azure Blob Storage,
+HTTP(S) and the local filesystem, as a Rust library, Python bindings and the
+`osc` command-line tool. The scheme of each URL picks the backend, so a single
+client can copy and move objects between providers, stream large objects in
+bounded memory and generate pre-signed URLs. Optional client-side encryption
+keeps object contents hidden from the storage provider.
 
-## Features
+- **One API for every backend**, including cross-provider copy and move.
+- **Streaming** uploads and downloads, with multipart uploads for large objects.
+- **Listing** of a prefix or a whole bucket (flat and recursive), existence
+  checks and bucket creation.
+- **Pre-signed URLs** for S3, GCS and Azure.
+- **Client-side encryption** (Cargo feature `encryption`, on by default) with
+  self-reloading keyrings and key rotation.
 
-- **Unified API**: Single interface for various storage backends.
-- **Cross-Provider**: Copy or move objects between different storage providers (e.g., S3 to Local FS).
-- **Listing**: List a prefix, or the whole bucket from a bucket-root URL (e.g. `s3://bucket`). Listing is flat and 
-- recursive — every key under the prefix is returned, not just the immediate level.
-- **Existence checks**: Test whether an object or bucket exists without raising on a miss.
-- **Bucket creation**: Create buckets/containers on S3, GCS and Azure (or directories for local paths).
-- **Pre-signed URLs**: Generate time-limited, credential-free URLs for S3, GCS and Azure.
-- **Multi-Language**: Native Rust library with Python 3.13+ bindings.
-- **Streaming**: Async streaming support for both Rust and Python.
-- **CLI**: `osc` command-line tool for quick operations.
+| URL                                                        | Backend                                                |
+|------------------------------------------------------------|--------------------------------------------------------|
+| `s3://bucket/key`                                          | AWS S3 and S3-compatible stores (Garage, SeaweedFS, …) |
+| `gs://bucket/key`, `gcs://bucket/key`                      | Google Cloud Storage                                   |
+| `az://`, `wasb(s)://`, `abfs(s)://` + `container/key`      | Azure Blob Storage                                     |
+| `http://host/path`, `https://host/path`                    | HTTP/HTTPS                                             |
+| `file:///abs/path`, `/abs/path`, `~/path`, `relative/path` | Local filesystem                                       |
 
-## Supported Schemes
+For the cloud schemes the host is the bucket or container and the path is the
+object key. A bucket-root URL such as `s3://bucket` addresses the bucket
+itself: list it, create it or check that it exists. Credentials come from
+environment variables; see [Configuration](docs/CONFIGURATION.md).
 
-- `s3://bucket/path` (AWS S3)
-- `gs://bucket/path` or `gcs://bucket/path` (Google Cloud Storage)
-- `az://`, `wasb://`, `wasbs://`, `abfs://`, or `abfss://` (Azure Blob Storage)
-- `http://host/path` or `https://host/path` (HTTP/HTTPS)
-- `file:///absolute/path`, `/absolute/path`, `~/path.txt` or `local_path` (Local Filesystem)
+## Rust
 
-For the cloud schemes the host is the bucket / container and the path is the
-object key. The path is optional: a bucket-root URL such as `s3://bucket` (or
-`s3://bucket/`) is valid and addresses the bucket itself — use it to list the
-whole bucket, create it, or check that it exists.
-
----
-
-## Environment Variables
-
-Credentials are read from the environment the first time a backend is used — the
-client never takes them as constructor arguments. The bucket / container always
-comes from the URL host, so a single process can talk to several buckets across
-several providers at once. That is exactly what makes the cross-provider copy
-and move shown in the walk-throughs below work: export the variables for every
-provider you touch, and a single `ObjectStorageClient` can shuttle objects
-between them. The local filesystem needs no variables.
-
-### AWS S3 (`s3://`)
-
-Also covers S3-compatible stores such as Garage and SeaweedFS.
-
-```bash
-export S3_ACCESS_KEY_ID="AKIA..."
-export S3_SECRET_ACCESS_KEY="..."
-export AWS_REGION="eu-north-1"
-# Optional: temporary credentials
-export AWS_SESSION_TOKEN="..."
-# Optional: custom endpoint for S3-compatible stores (e.g. Garage)
-export AWS_ENDPOINT_URL_S3="http://localhost:3900"
-
-# Convenience overrides honoured by this client (take precedence when set):
-#   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
-# Allow plain HTTP (e.g. a local Garage):
-#   export S3_ALLOW_HTTP=true
-```
-
-### Google Cloud Storage (`gs://` / `gcs://`)
-
-```bash
-# Path to a service-account JSON key file...
-export GOOGLE_SERVICE_ACCOUNT="/path/to/service-account.json"
-# (GOOGLE_SERVICE_ACCOUNT_PATH and the standard
-#  GOOGLE_APPLICATION_CREDENTIALS are also recognised.)
-
-# ...or the service-account JSON supplied inline instead of a path:
-#   export GOOGLE_SERVICE_ACCOUNT_KEY='{"type":"service_account", ...}'
-```
-
-### Azure Blob Storage (`az://`, `wasb(s)://`, `abfs(s)://`)
-
-```bash
-export AZURE_STORAGE_ACCOUNT_NAME="mystorageaccount"
-
-# Pick ONE authentication method:
-# 1. Shared account key
-export AZURE_STORAGE_ACCOUNT_KEY="..."
-# 2. Shared Access Signature (SAS) token
-#   export AZURE_STORAGE_SAS_KEY="?sv=..."
-# 3. Service principal (Azure AD)
-#   export AZURE_STORAGE_CLIENT_ID="..."
-#   export AZURE_STORAGE_CLIENT_SECRET="..."
-#   export AZURE_STORAGE_TENANT_ID="..."
-```
-
-### Local Filesystem (`file://`)
-
-No environment variables — no credentials are required.
-
----
-
-## CLI Usage (`osc`)
-
-The `osc` tool allows you to interact with object storage directly from your terminal.
-
-### Installation
-
-Install the `osc` binary directly from the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client) with Cargo. Point Cargo at the 
-registry with an environment variable, then install:
-
-```bash
-export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
-cargo install object-storage-client --registry bixority
-```
-
-Alternatively, install straight from Git:
-
-```bash
-cargo install --git https://codeberg.org/bixority/object-storage-client
-```
-
-Or, if you have the source code, install it from the local checkout:
-
-```bash
-cargo install --path .
-```
-
-### Examples
-
-- **Upload a local file**:
-  ```bash
-  osc put my_file.txt s3://my-bucket/remote_file.txt
-  ```
-
-- **Upload a directory recursively**:
-  ```bash
-  osc put --recursive my_dir s3://my-bucket/remote_dir/
-  ```
-
-- **Download an object**:
-  ```bash
-  osc get gs://my-bucket/data.json ./local_data.json
-  ```
-
-- **Copy between providers**:
-  ```bash
-  osc cp s3://source-bucket/image.png az://dest-container/image.png
-  ```
-
-- **Move an object**:
-  ```bash
-  osc mv s3://my-bucket/old_name.txt s3://my-bucket/new_name.txt
-  ```
-
-- **List objects**:
-  ```bash
-  osc ls s3://my-bucket/logs/
-  ```
-
-- **Delete an object**:
-  ```bash
-  osc rm s3://my-bucket/temp_file.tmp
-  ```
-
-- **Check whether an object exists** (prints `true`/`false`):
-  ```bash
-  osc exists s3://my-bucket/report.pdf
-  ```
-
-- **Create a bucket** (S3, GCS, Azure, or a directory for local paths):
-  ```bash
-  osc mb s3://my-new-bucket
-  ```
-
-- **Check whether a bucket exists** (prints `true`/`false`):
-  ```bash
-  osc bucket-exists s3://my-bucket
-  ```
-
-- **Stream an object**:
-  ```bash
-  osc get-stream gs://my-bucket/large_file.bin
-  ```
-
-- **Generate a pre-signed URL** (S3, GCS, Azure):
-  ```bash
-  # Pre-signed download URL, valid for the default 1 hour
-  osc sign s3://my-bucket/report.pdf
-
-  # Pre-signed upload URL (PUT), valid for 15 minutes
-  osc sign --method PUT --expires-in 900 s3://my-bucket/upload.bin
-
-  # Pre-signed upload URL binding the exact size and type the client must send
-  # (S3 only): the upload is rejected unless Content-Length and Content-Type
-  # match, so the object store enforces size/type up front.
-  osc sign --method PUT --content-length 1048576 \
-      --content-type application/pdf s3://my-bucket/upload.pdf
-  ```
-
----
-
-## Rust Usage
-
-### Installation
-
-The crate is published to the [Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client). Point Cargo at the registry with an environment 
-variable:
+The crate is published to the
+[Bixority Codeberg crate registry](https://codeberg.org/bixority/object-storage-client):
 
 ```bash
 export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
 ```
 
-Then add `object-storage-client` to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-object-storage-client = { version = "0.0.36", registry = "bixority" }
-tokio = { version = "1.0", features = ["full"] }
+object-storage-client = { version = "0.2", registry = "bixority" }
+# or: object-storage-client = { git = "https://codeberg.org/bixority/object-storage-client" }
+tokio = { version = "1", features = ["full"] }
 ```
 
-Alternatively, you can depend on it directly from Git:
+The `encryption` and `cli` features are on by default. A library that does not
+need the CLI can drop `clap` and `tokio-util`:
 
 ```toml
-[dependencies]
-object-storage-client = { git = "https://codeberg.org/bixority/object-storage-client" }
-tokio = { version = "1.0", features = ["full"] }
+object-storage-client = { version = "0.2", registry = "bixority", default-features = false, features = ["encryption"] }
 ```
-
-### Walk-through
-
-A single client works across every provider — the scheme in each URL selects the
-backend, so you can upload to S3, then copy or move the object straight to GCS,
-Azure or the local disk with no intermediate download on your side.
 
 ```rust
 use object_storage_client::{ObjectStorageClient, SignMethod, SignOptions};
@@ -307,29 +131,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
----
+With encryption, the same calls on an encrypting view:
 
-## Python 3.14+ Usage
+```rust
+use object_storage_client::encryption::{EncryptionConfig, Keyring};
+use object_storage_client::ObjectStorageClient;
+use std::sync::Arc;
 
-### Installation
+let keyring = Arc::new(Keyring::from_file("/var/run/secrets/osc/keyring")?); // reloads itself
+let secure = ObjectStorageClient::new().with_encryption(EncryptionConfig::new(keyring.clone()));
 
-The package is published on [PyPI](https://pypi.org/project/object-storage-client/). Note that it requires Python 3.13+.
+secure.put("s3://my-bucket/payroll.csv", &b"id,salary"[..]).await?; // only ciphertext is stored
+let csv = secure.get("s3://my-bucket/payroll.csv").await?;          // authenticated before it is returned
+let health = keyring.status(); // active key, key ages, last reload error
+```
+
+## Python
+
+The package is published on [PyPI](https://pypi.org/project/object-storage-client/)
+and needs Python 3.13+:
 
 ```bash
 pip install object-storage-client
 ```
-
-Or if you are developing locally, you can use `maturin`:
-
-```bash
-maturin develop
-```
-
-### Walk-through
-
-The same client handles every provider; the scheme in each URL picks the
-backend, so copying or moving an object between S3, GCS, Azure and local disk is
-a single call.
 
 ```python
 import asyncio
@@ -400,22 +224,76 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Developer Instructions
+With encryption (key bytes never reach Python):
 
-### Prerequisites
+```python
+from object_storage_client import ObjectStorageClient, Keyring
 
-- Rust 1.98+ (or latest stable)
-- Python 3.14+
-- `maturin` (for Python bindings)
+keyring = Keyring.from_file("/var/run/secrets/osc/keyring")    # reloads itself
+secure = ObjectStorageClient().with_encryption(keyring)
 
-### Building
+await secure.put_object("s3://my-bucket/payroll.csv", b"id,salary")  # only ciphertext is stored
+data = await secure.get_object("s3://my-bucket/payroll.csv")         # authenticated before it is returned
+health = keyring.status()  # active key, key ages, last reload error
+```
 
-- **Rust**: `cargo build --release`
-- **Python**: `maturin build --release`
-- **CLI**: `cargo build --bin osc`
-
-### Testing
+## CLI (`osc`)
 
 ```bash
-cargo nextest run --workspace
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+cargo install object-storage-client --registry bixority
+# or: cargo install --git https://codeberg.org/bixority/object-storage-client
+# or, from a checkout: cargo install --path .
 ```
+
+```bash
+osc put my_file.txt s3://my-bucket/remote_file.txt              # upload a file
+osc put --recursive my_dir s3://my-bucket/remote_dir/           # upload a directory
+osc get gs://my-bucket/data.json ./local_data.json              # download
+osc get-stream gs://my-bucket/large_file.bin > large_file.bin   # stream to stdout; progress on stderr
+osc cp s3://source-bucket/image.png az://dest-container/image.png   # copy between providers
+osc mv s3://my-bucket/old_name.txt s3://my-bucket/new_name.txt
+osc ls s3://my-bucket/logs/
+osc rm s3://my-bucket/temp_file.tmp
+osc exists s3://my-bucket/report.pdf                            # prints true or false
+osc mb s3://my-new-bucket                                       # create a bucket (a directory for local paths)
+osc bucket-exists s3://my-bucket                                # prints true or false
+
+# Pre-signed URLs (S3, GCS, Azure): a download link valid for the default
+# 1 hour, and an upload (PUT) link valid for 15 minutes
+osc sign s3://my-bucket/report.pdf
+osc sign --method PUT --expires-in 900 s3://my-bucket/upload.bin
+# S3 only: the upload is rejected unless Content-Length and Content-Type match
+osc sign --method PUT --content-length 1048576 \
+    --content-type application/pdf s3://my-bucket/upload.pdf
+```
+
+With a keyring, `put`, `get`, `get-stream`, `cp` and `mv` encrypt and decrypt
+transparently:
+
+```bash
+umask 077                                    # keyring files must not be readable by others
+osc keyring new > keyring                    # a keyring with one fresh key
+osc --keyring keyring put report.csv s3://my-bucket/report.csv
+osc --keyring keyring get s3://my-bucket/report.csv report.csv
+osc enc inspect s3://my-bucket/report.csv    # header details; no keys needed
+
+# Rotation: add a new active key, then move objects off the old one
+osc keyring rotate < keyring > keyring.new && mv keyring.new keyring
+osc --keyring keyring enc reencrypt s3://my-bucket/ --from <old key ID>
+```
+
+`--keyring` can also come from `OSC_KEYRING_FILE`, or from a command that
+prints the keyring (`OSC_KEYRING_COMMAND`), so the keyring never touches the
+disk.
+
+## Documentation
+
+- [Configuration](docs/CONFIGURATION.md): credentials and environment variables
+  for each provider.
+- [Encryption](docs/ENCRYPTION.md): what it protects, keyrings, Kubernetes, key
+  rotation, responding to a key leak, the format and interop.
+- [Behaviour and limits](docs/BEHAVIOR.md): URL rules, copy and move, deletes,
+  file permissions, large objects, pre-signing, CLI and Python details.
+- [Upgrading](docs/UPGRADING.md): breaking changes in 0.2.0.
+- [Development](docs/DEVELOPMENT.md) and [Testing](docs/TESTING.md).

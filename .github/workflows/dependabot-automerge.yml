@@ -1,8 +1,15 @@
 name: Dependabot update - test and merge
 
+# `pull_request` (not `pull_request_target`): the PR's code runs with a
+# read-only token and no repository secrets, and its build cache is scoped to
+# the PR, so it cannot poison the cache used by the release workflow. A fork PR
+# never gets a write token here, so the merge job cannot act on one.
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
 
 concurrency:
   group: dependabot-automerge-${{ github.event.pull_request.number }}
@@ -11,16 +18,13 @@ concurrency:
 jobs:
   test:
     name: Run unit tests (Dependabot PR)
-    if: github.actor == 'dependabot[bot]'
+    # The PR author, not `github.actor` (whoever triggered the latest event).
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
-      - name: Check out PR head
+      - name: Check out PR
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Set up Rust toolchain
@@ -35,7 +39,11 @@ jobs:
   merge:
     name: Approve and merge
     needs: test
-    if: needs.test.result == 'success' && github.actor == 'dependabot[bot]'
+    if: >-
+      needs.test.result == 'success'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -60,10 +68,12 @@ jobs:
           script: |
             const pr = context.payload.pull_request;
             try {
+              // Merge exactly the commit that was tested.
               await github.rest.pulls.merge({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: pr.number,
+                sha: pr.head.sha,
                 merge_method: 'merge'
               });
               core.info('PR merged successfully.');

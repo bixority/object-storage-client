@@ -1,0 +1,50 @@
+name: Performance
+
+# Not part of the PR checks: the deterministic guards in `tests/perf_guards.rs`
+# run with `cargo test` in tests.yaml. This workflow measures the release
+# binary. Peak RSS over budget fails it; throughput only warns, because shared
+# runners are noisy.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: bench + 512 MiB smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release osc
+        run: cargo build --release --bin osc
+      - name: Bench (256 MiB, median of 3)
+        shell: bash
+        run: cargo bench --bench throughput --no-default-features --features encryption | tee bench.txt
+        env:
+          BENCH_DIR: ${{ github.workspace }}/target/bench-data
+      - name: Smoke (512 MiB file://, plain and encrypted)
+        run: |
+          mkdir -p target/perf-smoke
+          python3 scripts/perf_smoke.py \
+            --osc target/release/osc \
+            --runs 5 \
+            --dir target/perf-smoke \
+            --out perf-smoke.json
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: perf-${{ github.sha }}
+          path: |
+            bench.txt
+            perf-smoke.json
+          if-no-files-found: warn

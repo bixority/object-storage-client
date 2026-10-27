@@ -1,6 +1,16 @@
 #[path = "functional/client.rs"]
 mod client;
-#[path = "functional/local_path_tests.rs"]
-mod local_path_tests;
-#[path = "functional/storage_ops.rs"]
-mod storage_ops;
+#[path = "support/mod.rs"]
+mod support;
+#[macro_use]
+#[path = "functional/suite.rs"]
+mod suite;
+#[cfg(all(feature = "encryption", feature = "cli"))]
+#[path = "functional/cli.rs"]
+mod cli;
+#[cfg(feature = "encryption")]
+#[path = "functional/encryption.rs"]
+mod encryption;
+#[cfg(feature = "encryption")]
+#[path = "functional/golden.rs"]
+mod golden;

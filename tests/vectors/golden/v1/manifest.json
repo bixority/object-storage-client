@@ -1,0 +1,50 @@
+{
+  "active_key_id": "golden-2026-10-a065e952",
+  "files": [
+    {
+      "context": {},
+      "file": "size_0.bin",
+      "key_id": "golden-2026-10-a065e952",
+      "plaintext_len": 0,
+      "plaintext_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "context": {},
+      "file": "size_1.bin",
+      "key_id": "golden-2026-10-a065e952",
+      "plaintext_len": 1,
+      "plaintext_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    },
+    {
+      "context": {},
+      "file": "size_65536.bin",
+      "key_id": "golden-2026-10-a065e952",
+      "plaintext_len": 65536,
+      "plaintext_sha256": "568f12ba93e8dab920795c710afd644df68be7132c0e49e8bb72270d8339bc40"
+    },
+    {
+      "context": {},
+      "file": "size_200000.bin",
+      "key_id": "golden-2026-10-a065e952",
+      "plaintext_len": 200000,
+      "plaintext_sha256": "e870fec3223bac8f6147b08b31e6e6e4bb9abd783820bcd212b7737af6a02174"
+    },
+    {
+      "context": {
+        "tenant": "acme"
+      },
+      "file": "context.bin",
+      "key_id": "golden-2026-10-a065e952",
+      "plaintext_len": 1000,
+      "plaintext_sha256": "1d9d471927b6f0cbc77aed8969dfc6ef43ff35fdcdd8aa0032630c0063ff95a5"
+    },
+    {
+      "context": {},
+      "file": "old_key.bin",
+      "key_id": "golden-2026-09-6a235f95",
+      "plaintext_len": 70000,
+      "plaintext_sha256": "c0ee3d75b5c48bca2bad6910a1425b61759d186b275a800729e9a4e0a1988228"
+    }
+  ],
+  "note": "TEST-ONLY keys; see README.md"
+}

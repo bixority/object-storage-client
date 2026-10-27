@@ -11,11 +11,11 @@
 //! object store.
 
 use crate::client::{Error, Result};
+use aws_lc_rs::{digest, hmac};
 use chrono::{DateTime, Utc};
 use http::Method;
 use object_store::aws::AwsCredential;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use ring::{digest, hmac};
 use std::time::Duration;
 use url::Url;
 
@@ -86,37 +86,17 @@ impl SignOptions {
     pub(crate) const fn is_empty(&self) -> bool {
         self.content_length.is_none() && self.content_type.is_none()
     }
-
-    /// Borrow these options as the lower-level [`BoundHeaders`].
-    pub(crate) fn bound_headers(&self) -> BoundHeaders<'_> {
-        BoundHeaders {
-            content_length: self.content_length,
-            content_type: self.content_type.as_deref(),
-        }
-    }
 }
 
 /// Error returned when `Content-Length`/`Content-Type` binding is requested for
 /// a backend other than S3, which is the only one this client can re-sign with
 /// extra headers.
-#[must_use]
-pub fn content_binding_unsupported() -> Error {
+pub(crate) fn content_binding_unsupported() -> Error {
     Error::Generic(
         "binding Content-Length/Content-Type into a pre-signed URL is only supported for S3 \
          (s3://) backends"
             .into(),
     )
-}
-
-/// Resolve the AWS region used for `SigV4` signing, mirroring how the S3 backend
-/// is configured: explicit `S3_REGION`, then the standard AWS environment
-/// variables, falling back to `us-east-1`.
-#[must_use]
-pub fn s3_region() -> String {
-    std::env::var("S3_REGION")
-        .or_else(|_| std::env::var("AWS_REGION"))
-        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string())
 }
 
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
@@ -132,31 +112,13 @@ const STRICT_ENCODE_SET: AsciiSet = NON_ALPHANUMERIC
     .remove(b'_')
     .remove(b'~');
 
-/// Request headers to bind into the `SigV4` signature, forcing the client using
-/// the pre-signed URL to send exactly these values.
-#[derive(Clone, Copy, Default)]
-pub struct BoundHeaders<'a> {
-    pub content_length: Option<u64>,
-    pub content_type: Option<&'a str>,
-}
-
 fn hmac_sha256(secret: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> hmac::Tag {
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_ref());
     hmac::sign(&key, bytes.as_ref())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 fn hex_digest(bytes: &[u8]) -> String {
-    hex_encode(digest::digest(&digest::SHA256, bytes).as_ref())
+    crate::hex::encode(digest::digest(&digest::SHA256, bytes).as_ref())
 }
 
 /// Collapse leading/trailing and repeated internal whitespace, matching the
@@ -173,42 +135,31 @@ fn sign_string(cred: &AwsCredential, to_sign: &str, date_stamp: &str, region: &s
     let region_hmac = hmac_sha256(date_hmac.as_ref(), region);
     let service_hmac = hmac_sha256(region_hmac.as_ref(), SERVICE);
     let signing_hmac = hmac_sha256(service_hmac.as_ref(), b"aws4_request");
-    hex_encode(hmac_sha256(signing_hmac.as_ref(), to_sign).as_ref())
+    crate::hex::encode(hmac_sha256(signing_hmac.as_ref(), to_sign).as_ref())
 }
 
 /// Canonicalize the query parameters of `url` into AWS canonical form: sorted
 /// by key, strictly percent-encoded. Mirrors `object_store`'s implementation.
 fn canonicalize_query(url: &Url) -> String {
-    use std::fmt::Write;
-
-    if url.query().is_none_or(str::is_empty) {
-        return String::new();
-    }
-
     let mut pairs = url.query_pairs().collect::<Vec<_>>();
     pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-
-    let mut encoded = String::new();
-    let mut first = true;
-    for (key, value) in pairs {
-        if !first {
-            encoded.push('&');
-        }
-        first = false;
-        let _ = write!(
-            encoded,
-            "{}={}",
-            utf8_percent_encode(key.as_ref(), &STRICT_ENCODE_SET),
-            utf8_percent_encode(value.as_ref(), &STRICT_ENCODE_SET)
-        );
-    }
-    encoded
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                utf8_percent_encode(key, &STRICT_ENCODE_SET),
+                utf8_percent_encode(value, &STRICT_ENCODE_SET)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Generate a `SigV4` pre-signed URL for `base`
 ///
 /// (a clean resource URL, i.e. scheme, host and path with no query) authorizing `method` for
-/// `expires_in`, binding the supplied `content_length` and/or `content_type` into the
+/// `expires_in`, binding the `content_length` and/or `content_type` of `options` into the
 /// signature so the client is forced to send those exact header values.
 ///
 /// `base` is expected to already encode the correct host and path style
@@ -221,9 +172,9 @@ pub fn presign_s3(
     expires_in: Duration,
     cred: &AwsCredential,
     region: &str,
-    headers: BoundHeaders<'_>,
+    options: &SignOptions,
 ) -> Url {
-    presign_s3_at(base, method, expires_in, cred, region, headers, Utc::now())
+    presign_s3_at(base, method, expires_in, cred, region, options, Utc::now())
 }
 
 /// As [`presign_s3`], but with an explicit signing timestamp (for testing
@@ -236,7 +187,7 @@ pub fn presign_s3_at(
     expires_in: Duration,
     cred: &AwsCredential,
     region: &str,
-    headers: BoundHeaders<'_>,
+    options: &SignOptions,
     date: DateTime<Utc>,
 ) -> Url {
     let date_stamp = date.format("%Y%m%d").to_string();
@@ -245,16 +196,15 @@ pub fn presign_s3_at(
 
     // Headers to sign, sorted by (lower-case) name as required by SigV4.
     let host = base[url::Position::BeforeHost..url::Position::AfterPort].to_string();
-    let mut signed: Vec<(&str, String)> = Vec::with_capacity(3);
-    if let Some(len) = headers.content_length {
-        signed.push(("content-length", len.to_string()));
+    let mut headers: Vec<(&str, String)> = Vec::with_capacity(3);
+    if let Some(len) = options.content_length {
+        headers.push(("content-length", len.to_string()));
     }
-    if let Some(content_type) = headers.content_type {
-        signed.push(("content-type", normalize_whitespace(content_type)));
+    if let Some(content_type) = &options.content_type {
+        headers.push(("content-type", normalize_whitespace(content_type)));
     }
-    signed.push(("host", host));
-    signed.sort_by_key(|(name, _)| *name);
-    let headers = signed;
+    headers.push(("host", host));
+    headers.sort_by_key(|(name, _)| *name);
 
     let signed_headers = headers
         .iter()
@@ -279,13 +229,11 @@ pub fn presign_s3_at(
 
     let canonical_query = canonicalize_query(&url);
 
-    let mut canonical_headers = String::new();
-    for (name, value) in &headers {
-        canonical_headers.push_str(name);
-        canonical_headers.push(':');
-        canonical_headers.push_str(value);
-        canonical_headers.push('\n');
-    }
+    let canonical_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect::<Vec<_>>()
+        .concat();
 
     // For S3 the path is encoded only once, so it is used verbatim.
     let canonical_request = format!(

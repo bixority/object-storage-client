@@ -1,12 +1,14 @@
 //! Amazon S3 (and S3-compatible, e.g. `MinIO` / `SeaweedFS`) backend.
 
-use super::{Backend, bucket_exists_from_response, send_signed};
+use super::{Backend, Vars, bucket_exists_from_response, error_body, parse_bool, send_signed};
 use crate::client::{Error, Result};
 use crate::sign::{self, SignMethod, SignOptions};
 use bytes::Bytes;
 use http::Method;
 use object_store::ObjectStore;
-use object_store::aws::{AmazonS3, AmazonS3Builder, AwsAuthorizer, AwsCredential};
+use object_store::aws::{
+    AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsAuthorizer, AwsCredential,
+};
 use object_store::client::{HttpRequest, HttpRequestBody};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
@@ -22,8 +24,10 @@ pub struct S3Backend {
     inner: Arc<AmazonS3>,
     /// When set, requests are sent unsigned (anonymous) and the credential
     /// provider is never consulted. This is what keeps a non-AWS store from
-    /// reaching for IMDS (`http://169.254.169.254`); see [`S3Backend::from_env`].
+    /// reaching for IMDS (`http://169.254.169.254`); see [`S3Backend::new`].
     skip_signature: bool,
+    bucket: String,
+    vars: Vars,
 }
 
 impl S3Backend {
@@ -46,17 +50,18 @@ impl S3Backend {
     ///
     /// Returns an error if the bucket (URL host) is missing or the store fails
     /// to build.
-    pub fn from_env(host: Option<&str>) -> Result<Self> {
-        Self::from_env_internal(host, |k| std::env::var(k).ok())
-    }
-
-    fn from_env_internal(
-        host: Option<&str>,
-        get_var: impl Fn(&str) -> Option<String>,
-    ) -> Result<Self> {
+    pub fn new(host: Option<&str>, vars: &Vars) -> Result<Self> {
+        let get_var = |k: &str| vars.get(k);
         let s3_allow_http = get_var("S3_ALLOW_HTTP").unwrap_or_else(|| "false".into());
         let bucket = host.ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+        let mut builder = match vars {
+            Vars::Env => AmazonS3Builder::from_env(),
+            Vars::Map(_) => vars
+                .config_entries::<AmazonS3ConfigKey>("AWS_")
+                .into_iter()
+                .fold(AmazonS3Builder::new(), |b, (k, v)| b.with_config(k, v)),
+        }
+        .with_bucket_name(bucket);
 
         if let Some(region) = get_var("S3_REGION") {
             builder = builder.with_region(region);
@@ -65,7 +70,7 @@ impl S3Backend {
         // Honour the crate's own `S3_ENDPOINT` alongside the `AWS_*` names
         // `from_env` already reads, so every endpoint name resolves the store to
         // the same place as `endpoint_and_region`.
-        let endpoint = Self::configured_endpoint(&get_var);
+        let endpoint = Self::configured_endpoint(vars);
         if let Some(ep) = endpoint.as_deref() {
             builder = builder.with_endpoint(ep);
         }
@@ -86,8 +91,8 @@ impl S3Backend {
             builder = builder.with_allow_http(true);
         }
 
-        let skip_signature = Self::explicit_skip_signature(&get_var)
-            .unwrap_or_else(|| endpoint.is_some() && !Self::has_credentials(&get_var));
+        let skip_signature = Self::explicit_skip_signature(vars)
+            .unwrap_or_else(|| endpoint.is_some() && !Self::has_credentials(vars));
         if skip_signature {
             builder = builder.with_skip_signature(true);
         }
@@ -97,6 +102,8 @@ impl S3Backend {
             store: Arc::clone(&inner) as Arc<dyn ObjectStore>,
             inner,
             skip_signature,
+            bucket: bucket.to_string(),
+            vars: vars.clone(),
         })
     }
 
@@ -104,7 +111,7 @@ impl S3Backend {
     /// precedence `AmazonS3Builder::from_env` uses (`AWS_ENDPOINT_URL_S3` wins),
     /// extended with the crate's own `S3_ENDPOINT`. `None` means "no custom
     /// endpoint" — i.e. real AWS, where the IMDS credential fallback is valid.
-    fn configured_endpoint(get_var: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    fn configured_endpoint(vars: &Vars) -> Option<String> {
         [
             "S3_ENDPOINT",
             "AWS_ENDPOINT_URL_S3",
@@ -112,7 +119,7 @@ impl S3Backend {
             "AWS_ENDPOINT_URL",
         ]
         .into_iter()
-        .find_map(|key| get_var(key).filter(|v| !v.is_empty()))
+        .find_map(|key| vars.get(key).filter(|v| !v.is_empty()))
     }
 
     /// Whether the environment provides any credential source other than the
@@ -120,8 +127,8 @@ impl S3Backend {
     /// web-identity (IRSA) or container credentials. When none of these is set
     /// against a guest endpoint, IMDS is the only thing left for `object_store`
     /// to try — which is exactly what we want to avoid.
-    fn has_credentials(get_var: &impl Fn(&str) -> Option<String>) -> bool {
-        let set = |key: &str| get_var(key).is_some_and(|v| !v.is_empty());
+    fn has_credentials(vars: &Vars) -> bool {
+        let set = |key: &str| vars.get(key).is_some_and(|v| !v.is_empty());
         set("S3_ACCESS_KEY_ID")
             || set("AWS_ACCESS_KEY_ID")
             || set("AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -135,13 +142,8 @@ impl S3Backend {
     /// store. `None` means the variable is unset (decide automatically); an
     /// unrecognised value is also `None` here and surfaces as a build error from
     /// `object_store` itself. Parsing mirrors `object_store`'s boolean grammar.
-    fn explicit_skip_signature(get_var: &impl Fn(&str) -> Option<String>) -> Option<bool> {
-        let value = get_var("AWS_SKIP_SIGNATURE")?;
-        match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "on" | "yes" | "y" => Some(true),
-            "0" | "false" | "off" | "no" | "n" => Some(false),
-            _ => None,
-        }
+    fn explicit_skip_signature(vars: &Vars) -> Option<bool> {
+        parse_bool(&vars.get("AWS_SKIP_SIGNATURE")?)
     }
 
     /// The signing credential, or `None` when signing is skipped.
@@ -159,11 +161,6 @@ impl S3Backend {
         Ok(Some(self.inner.credentials().get_credential().await?))
     }
 
-    /// The concrete store as an `object_store` [`Signer`].
-    fn signer(&self) -> Arc<dyn Signer> {
-        Arc::clone(&self.inner) as Arc<dyn Signer>
-    }
-
     /// Resolve the `(endpoint, region)` the bucket-management requests target.
     ///
     /// Mirrors the env the store was built from: `from_env` uses `S3_REGION`,
@@ -171,21 +168,45 @@ impl S3Backend {
     /// / `AWS_DEFAULT_REGION`. Region drives both the `SigV4` scope and (for
     /// `CreateBucket`) the `LocationConstraint`, so it must match the built
     /// store.
-    fn endpoint_and_region() -> (String, String) {
-        Self::endpoint_and_region_internal(|k| std::env::var(k).ok())
+    fn endpoint_and_region(&self) -> (String, String) {
+        let vars = &self.vars;
+        let region = vars
+            .get("S3_REGION")
+            .or_else(|| vars.get("AWS_REGION"))
+            .or_else(|| vars.get("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| "us-east-1".into());
+        // The AWS default endpoint is always https, whatever `S3_ALLOW_HTTP`
+        // says: that setting is for custom endpoints, and the object path
+        // (object_store) talks https to AWS too. A custom endpoint is used as
+        // configured, as for the object path (an `http://` endpoint enables
+        // plain HTTP for the store, see `S3Backend::new`).
+        let endpoint = Self::configured_endpoint(vars)
+            .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"));
+        (endpoint, region)
     }
 
-    fn endpoint_and_region_internal(get_var: impl Fn(&str) -> Option<String>) -> (String, String) {
-        let region = get_var("S3_REGION")
-            .or_else(|| get_var("AWS_REGION"))
-            .or_else(|| get_var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|| "us-east-1".into());
-        let allow_http = get_var("S3_ALLOW_HTTP").is_some_and(|v| v == "true");
-        let endpoint = Self::configured_endpoint(&get_var).unwrap_or_else(|| {
-            let scheme = if allow_http { "http" } else { "https" };
-            format!("{scheme}://s3.{region}.amazonaws.com")
-        });
-        (endpoint, region)
+    /// A bucket-level request (`/<bucket>`) carrying `body`, `SigV4`-signed
+    /// unless signing is skipped. The credential comes from
+    /// [`S3Backend::credential`], so `skip_signature` never reaches IMDS.
+    async fn bucket_request(&self, method: Method, body: Bytes) -> Result<HttpRequest> {
+        let (endpoint, region) = self.endpoint_and_region();
+        // Path-style addressing keeps the request endpoint-agnostic, which is
+        // what MinIO / SeaweedFS expect and AWS also accepts.
+        let uri = format!("{}/{}", endpoint.trim_end_matches('/'), self.bucket);
+        let mut request: HttpRequest = http::Request::builder()
+            .method(method)
+            .uri(&uri)
+            .body(HttpRequestBody::from(body))
+            .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
+
+        // Reuse object_store's SigV4 implementation — no signing reimplemented.
+        // When signing is skipped (anonymous store) the request is sent as-is.
+        if let Some(credential) = self.credential().await? {
+            AwsAuthorizer::new(credential.as_ref(), "s3", &region)
+                .try_authorize(&mut request, None)
+                .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
+        }
+        Ok(request)
     }
 }
 
@@ -195,10 +216,7 @@ impl Backend for S3Backend {
         &self.store
     }
 
-    // The trait ties the return to `&self`; this backend's scheme is a fixed
-    // literal, so the lifetime tie is unavoidable here.
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn scheme(&self) -> &str {
+    fn scheme(&self) -> &'static str {
         "s3"
     }
 
@@ -206,16 +224,8 @@ impl Backend for S3Backend {
     /// [`AwsAuthorizer`] (`SigV4`). A `LocationConstraint` body is sent for every
     /// region except `us-east-1`, per the S3 API. Treats
     /// `BucketAlreadyOwnedByYou` / `BucketAlreadyExists` as success.
-    async fn create_bucket(&self, client: &reqwest::Client, url: &Url) -> Result<()> {
-        let bucket = url
-            .host_str()
-            .ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
-
-        let (endpoint, region) = Self::endpoint_and_region();
-        // Path-style addressing keeps the request endpoint-agnostic, which is
-        // what MinIO / SeaweedFS expect and AWS also accepts.
-        let uri = format!("{}/{bucket}", endpoint.trim_end_matches('/'));
-
+    async fn create_bucket(&self, client: &reqwest::Client, _url: &Url) -> Result<()> {
+        let region = self.endpoint_and_region().1;
         let body = if region == "us-east-1" {
             Bytes::new()
         } else {
@@ -226,28 +236,14 @@ impl Backend for S3Backend {
             ))
         };
 
-        let mut request: HttpRequest = http::Request::builder()
-            .method(Method::PUT)
-            .uri(&uri)
-            .body(HttpRequestBody::from(body.clone()))
-            .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
-
-        // Reuse object_store's SigV4 implementation — no signing reimplemented.
-        // When signing is skipped (anonymous store) the request is sent as-is,
-        // which also avoids touching the IMDS credential provider.
-        if let Some(credential) = self.credential().await? {
-            AwsAuthorizer::new(credential.as_ref(), "s3", &region)
-                .try_authorize(&mut request, None)
-                .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
-        }
-
+        let request = self.bucket_request(Method::PUT, body.clone()).await?;
         let response = send_signed(client, request, body).await?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
         }
 
-        let text = response.text().await.unwrap_or_default();
+        let text = error_body(response).await;
         if text.contains("BucketAlreadyOwnedByYou") || text.contains("BucketAlreadyExists") {
             // Idempotent: a bucket we already own (or that already exists).
             return Ok(());
@@ -262,75 +258,14 @@ impl Backend for S3Backend {
     /// probe that avoids the `ListBucket` payload: HTTP `200` means the bucket
     /// exists, `404` that it does not, and `403` that it exists but is not
     /// visible to these credentials.
-    async fn bucket_exists(&self, client: &reqwest::Client, url: &Url) -> Result<bool> {
-        let bucket = url
-            .host_str()
-            .ok_or_else(|| Error::Generic("Missing bucket in S3 URL".into()))?;
-
-        let (endpoint, region) = Self::endpoint_and_region();
-        // Path-style addressing, as in create_bucket.
-        let uri = format!("{}/{bucket}", endpoint.trim_end_matches('/'));
-
-        let mut request: HttpRequest = http::Request::builder()
-            .method(Method::HEAD)
-            .uri(&uri)
-            .body(HttpRequestBody::empty())
-            .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
-
-        if let Some(credential) = self.credential().await? {
-            AwsAuthorizer::new(credential.as_ref(), "s3", &region)
-                .try_authorize(&mut request, None)
-                .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
-        }
-
+    async fn bucket_exists(&self, client: &reqwest::Client, _url: &Url) -> Result<bool> {
+        let request = self.bucket_request(Method::HEAD, Bytes::new()).await?;
         let response = send_signed(client, request, Bytes::new()).await?;
         bucket_exists_from_response(response, "S3").await
     }
 
     /// Host-only signing via the object store's signer, re-signed with the bound
     /// `Content-Length` / `Content-Type` headers when `options` requests them.
-    async fn pre_signed_url(
-        &self,
-        path: &ObjectPath,
-        method: SignMethod,
-        expires_in: Duration,
-        options: &SignOptions,
-    ) -> Result<String> {
-        // `object_store`'s signer reads the raw credential provider, so under
-        // `skip_signature` it would hit IMDS. Pre-signing is meaningless without
-        // credentials anyway, so fail clearly instead.
-        if self.skip_signature {
-            return Err(Error::Generic(
-                "Cannot pre-sign an S3 URL without credentials (this store runs unsigned)".into(),
-            ));
-        }
-
-        let base = self
-            .signer()
-            .signed_url(method.into_http(), path, expires_in)
-            .await?;
-
-        if options.is_empty() {
-            return Ok(base.into());
-        }
-
-        let credential = self.inner.credentials().get_credential().await?;
-        let region = sign::s3_region();
-        let mut base = base;
-        // Drop the host-only query produced by the object store's signer; we
-        // generate our own SigV4 query over the bound headers.
-        base.set_query(None);
-        Ok(sign::presign_s3(
-            &base,
-            &method.into_http(),
-            expires_in,
-            &credential,
-            &region,
-            options.bound_headers(),
-        )
-        .into())
-    }
-
     async fn pre_signed_urls(
         &self,
         paths: &[ObjectPath],
@@ -338,15 +273,20 @@ impl Backend for S3Backend {
         expires_in: Duration,
         options: &SignOptions,
     ) -> Result<Vec<String>> {
+        // `object_store`'s signer reads the raw credential provider, so under
+        // `skip_signature` it would hit IMDS. Pre-signing is meaningless without
+        // credentials anyway, so fail clearly instead. This must stay the first
+        // statement, and this override never falls through to the default.
         if self.skip_signature {
             return Err(Error::Generic(
                 "Cannot pre-sign S3 URLs without credentials (this store runs unsigned)".into(),
             ));
         }
 
+        let http_method = method.into_http();
         let bases = self
-            .signer()
-            .signed_urls(method.into_http(), paths, expires_in)
+            .inner
+            .signed_urls(http_method.clone(), paths, expires_in)
             .await?;
 
         if options.is_empty() {
@@ -355,25 +295,24 @@ impl Backend for S3Backend {
 
         // Resolve credentials once, then re-sign each URL with the bound headers.
         let credential = self.inner.credentials().get_credential().await?;
-        let region = sign::s3_region();
-        let http_method = method.into_http();
-
-        let mut pre_signed = Vec::with_capacity(bases.len());
-        for mut base in bases {
-            base.set_query(None);
-            pre_signed.push(
+        let region = self.endpoint_and_region().1;
+        Ok(bases
+            .into_iter()
+            .map(|mut base| {
+                // Drop the host-only query produced by the object store's signer;
+                // we generate our own SigV4 query over the bound headers.
+                base.set_query(None);
                 sign::presign_s3(
                     &base,
                     &http_method,
                     expires_in,
                     &credential,
                     &region,
-                    options.bound_headers(),
+                    options,
                 )
-                .into(),
-            );
-        }
-        Ok(pre_signed)
+                .into()
+            })
+            .collect())
     }
 }
 
@@ -384,21 +323,27 @@ mod tests {
 
     #[test]
     fn test_endpoint_and_region_scheme_logic() {
-        let get_var = |k: &str| match k {
-            "S3_ALLOW_HTTP" => Some("true".to_string()),
-            _ => None,
-        };
-        let (endpoint, _) = S3Backend::endpoint_and_region_internal(get_var);
-        assert!(
-            endpoint.starts_with("http://"),
-            "Should be http when allow_http is true, got {endpoint}"
-        );
+        // The AWS default endpoint is https even when plain HTTP is allowed,
+        // so bucket calls never send credentials in the clear to AWS.
+        let http = S3Backend::new(Some("b"), &Vars::from_pairs(&[("S3_ALLOW_HTTP", "true")]))
+            .expect("build");
+        let (endpoint, region) = http.endpoint_and_region();
+        assert_eq!(endpoint, format!("https://s3.{region}.amazonaws.com"));
 
-        let get_var_https = |k: &str| match k {
-            "S3_ALLOW_HTTP" => Some("false".to_string()),
-            _ => None,
-        };
-        let (endpoint_https, _) = S3Backend::endpoint_and_region_internal(get_var_https);
+        // A custom endpoint is used as configured.
+        let custom = S3Backend::new(
+            Some("b"),
+            &Vars::from_pairs(&[
+                ("S3_ALLOW_HTTP", "true"),
+                ("S3_ENDPOINT", "http://127.0.0.1:9000"),
+            ]),
+        )
+        .expect("build");
+        assert_eq!(custom.endpoint_and_region().0, "http://127.0.0.1:9000");
+
+        let https = S3Backend::new(Some("b"), &Vars::from_pairs(&[("S3_ALLOW_HTTP", "false")]))
+            .expect("build");
+        let (endpoint_https, _) = https.endpoint_and_region();
         assert!(
             endpoint_https.starts_with("https://"),
             "Should be https when allow_http is false, got {endpoint_https}"
@@ -406,19 +351,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn map_vars_configure_endpoint_and_region_without_env() {
+        let backend = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[
+                ("AWS_ENDPOINT_URL_S3", "http://127.0.0.1:3900"),
+                ("AWS_REGION", "eu-north-1"),
+                ("AWS_ACCESS_KEY_ID", "k"),
+                ("AWS_SECRET_ACCESS_KEY", "s"),
+            ]),
+        )
+        .expect("build");
+        let (endpoint, region) = backend.endpoint_and_region();
+        assert_eq!(endpoint, "http://127.0.0.1:3900");
+        assert_eq!(region, "eu-north-1");
+        assert!(!backend.skip_signature);
+        // The built store itself must carry the Map-provided config.
+        let url = backend
+            .inner
+            .signed_url(Method::GET, &ObjectPath::from("o"), Duration::from_secs(60))
+            .await
+            .expect("sign");
+        let url = url.as_str();
+        assert!(url.starts_with("http://127.0.0.1:3900/"), "{url}");
+        assert!(url.contains("eu-north-1"), "{url}");
+        assert!(url.contains("k%2F"), "{url}");
+    }
+
+    #[test]
+    fn map_vars_without_credentials_skip_signature_for_custom_endpoint() {
+        let backend = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[("S3_ENDPOINT", "http://127.0.0.1:3900")]),
+        )
+        .expect("build");
+        assert!(backend.skip_signature);
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_store_refuses_to_pre_sign_without_a_credential_lookup() {
+        let backend = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[("S3_ENDPOINT", "http://127.0.0.1:3900")]),
+        )
+        .expect("build");
+        assert!(backend.skip_signature);
+        // A credential lookup would go to IMDS and hang; this fails at once.
+        let err = backend
+            .pre_signed_urls(
+                &[ObjectPath::from("o")],
+                SignMethod::Get,
+                Duration::from_mins(1),
+                &SignOptions::default(),
+            )
+            .await
+            .expect_err("unsigned");
+        assert!(matches!(err, Error::Generic(m) if m.contains("without credentials")));
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_store_builds_bucket_requests_without_a_credential_lookup() {
+        let backend = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[("S3_ENDPOINT", "http://127.0.0.1:3900/")]),
+        )
+        .expect("build");
+        // A credential lookup would go to IMDS and hang.
+        let request = backend
+            .bucket_request(Method::HEAD, Bytes::new())
+            .await
+            .expect("request");
+        assert_eq!(request.uri(), "http://127.0.0.1:3900/bkt");
+        assert!(request.headers().get(http::header::AUTHORIZATION).is_none());
+    }
+
+    #[tokio::test]
     async fn test_regression_builder_error() {
         // Verify that providing an http endpoint now automatically enables allow_http,
         // preventing the "builder error".
-        let get_var = |k: &str| match k {
-            "S3_ENDPOINT" => Some("http://localhost:9000".to_string()),
-            "S3_ALLOW_HTTP" => Some("false".to_string()),
-            "S3_ACCESS_KEY_ID" | "S3_SECRET_ACCESS_KEY" => Some("minioadmin".to_string()),
-            "S3_REGION" => Some("us-east-1".to_string()),
-            _ => None,
-        };
+        let v = Vars::from_pairs(&[
+            ("S3_ENDPOINT", "http://localhost:9000"),
+            ("S3_ALLOW_HTTP", "false"),
+            ("S3_ACCESS_KEY_ID", "minioadmin"),
+            ("S3_SECRET_ACCESS_KEY", "minioadmin"),
+            ("S3_REGION", "us-east-1"),
+        ]);
 
-        let backend = S3Backend::from_env_internal(Some("api-proxy"), get_var)
-            .expect("Failed to create S3Backend");
+        let backend = S3Backend::new(Some("api-proxy"), &v).expect("Failed to create S3Backend");
         let path = ObjectPath::from("audit/test.txt");
 
         // We expect a connection error (since no MinIO is running at localhost:9000),

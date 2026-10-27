@@ -1,0 +1,99 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  integration:
+    name: integration (Garage, Azurite, fake-gcs-server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The 4 GiB round trips are local only (see docs/TESTING.md, "Checksum round trips").
+      - run: cargo test --all-features --test integration -- --ignored --skip _4gib
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  features:
+    name: feature builds + fuzz crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings -W clippy::pedantic
+      - run: cargo check --no-default-features --features python
+      - run: cargo check --features fuzzing
+      # Keeps `encryption::fuzzing` and the fuzz targets compiling.
+      - run: cargo check --manifest-path fuzz/Cargo.toml
+
+  python:
+    name: python tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --group dev --group oracle --locked --no-install-project
+      - run: uv run --no-sync maturin develop
+      - run: uv run --no-sync pytest
+      # Container tests (Garage, Azurite) without the local-only 4 GiB tier.
+      - run: uv run --no-sync pytest -m "integration and not large"
+
+  esdk-interop:
+    name: ESDK interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.14"
+      - run: uv sync --group oracle --locked --no-install-project
+      - run: cargo test --all-features -- --ignored oracle
+        env:
+          UV_NO_SYNC: "1"

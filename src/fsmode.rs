@@ -1,0 +1,107 @@
+//! File-mode rules shared by the `file://` writer and the CLI download.
+#![cfg_attr(not(unix), allow(dead_code))]
+
+/// The process umask, or `None` when it cannot be read. It is read from
+/// `/proc/self/status`, which avoids the racy set-and-restore of `umask(2)`,
+/// so it is available on Linux only: on other platforms, and where `/proc` is
+/// not mounted, this is `None` and callers keep the default creation mode.
+pub fn current_umask() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Umask:"))
+            .and_then(|v| u32::from_str_radix(v.trim(), 8).ok())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// The permission bits (`0o777`, never setuid, setgid or sticky) of the
+/// `(mode, owner)` of an existing file, if the effective user `euid` owns it.
+/// A file owned by someone else (planted in a shared directory) must not
+/// decide who can read what is written over it.
+pub fn owned_mode(existing: Option<(u32, u32)>, euid: u32) -> Option<u32> {
+    existing
+        .filter(|&(_, owner)| owner == euid)
+        .map(|(mode, _)| mode & 0o777)
+}
+
+/// Decides `(creation mode, final mode)` of a written file.
+///
+/// `existing` is the `(mode, owner)` of the regular file being replaced; its
+/// mode is adopted only when `euid` owns it (see [`owned_mode`]). Otherwise a
+/// copy takes `source` and anything else `0o666`, both less the umask. The
+/// file is created 0600 and gets the final mode once complete. Without a
+/// readable umask a new file keeps the default mode (`None, None`).
+pub fn modes(
+    existing: Option<(u32, u32)>,
+    euid: u32,
+    source: Option<u32>,
+    umask: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    if let Some(mode) = owned_mode(existing, euid) {
+        return (Some(0o600), Some(mode));
+    }
+    umask.map_or((None, None), |m| {
+        let base = source.map_or(0o666, |s| s & 0o777);
+        (Some(0o600), Some(base & !m & 0o777))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::modes;
+
+    #[test]
+    fn new_file_gets_default_less_umask_after_private_staging() {
+        assert_eq!(
+            modes(None, 1000, None, Some(0o022)),
+            (Some(0o600), Some(0o644))
+        );
+        assert_eq!(
+            modes(None, 1000, None, Some(0o077)),
+            (Some(0o600), Some(0o600))
+        );
+    }
+
+    #[test]
+    fn unreadable_umask_keeps_the_default() {
+        assert_eq!(modes(None, 1000, Some(0o600), None), (None, None));
+    }
+
+    #[test]
+    fn own_destination_keeps_its_mode_without_special_bits() {
+        assert_eq!(
+            modes(Some((0o104_600, 1000)), 1000, None, None),
+            (Some(0o600), Some(0o600))
+        );
+        assert_eq!(
+            modes(Some((0o100_640, 1000)), 1000, Some(0o600), Some(0o022)),
+            (Some(0o600), Some(0o640))
+        );
+    }
+
+    #[test]
+    fn foreign_destination_is_treated_as_new() {
+        assert_eq!(
+            modes(Some((0o100_666, 0)), 1000, None, Some(0o022)),
+            (Some(0o600), Some(0o644))
+        );
+    }
+
+    #[test]
+    fn copy_takes_source_mode_less_umask() {
+        assert_eq!(
+            modes(None, 1000, Some(0o104_755), Some(0o022)),
+            (Some(0o600), Some(0o755))
+        );
+        assert_eq!(
+            modes(None, 1000, Some(0o600), Some(0o022)),
+            (Some(0o600), Some(0o600))
+        );
+    }
+}

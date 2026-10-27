@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -11,13 +11,14 @@ authors = [
 ]
 license-files = [ "LICENSE" ]
 readme = "README.md"
-requires-python = ">=3.13.9,<3.15.0"
+requires-python = ">=3.13.9,<3.16.0"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
 ]
 keywords = ["object-store", "s3", "gcs", "azure", "python"]
 
@@ -27,6 +28,20 @@ Repository = "https://github.com/bixority/object-storage-client"
 Documentation = "https://github.com/bixority/object-storage-client/blob/main/README.md"
 
 [tool.maturin]
-features = ["python"]
+no-default-features = true
+features = ["python", "encryption"]
 python-source = "python"
 module-name = "object_storage_client._object_storage_client"
+
+[dependency-groups]
+dev = ["maturin>=1.15,<2", "pytest>=8", "pytest-asyncio>=0.24", "testcontainers>=4.15"]
+oracle = ["aws-encryption-sdk>=4,<5"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/python"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs a container runtime (docker or podman)",
+    "large: 4 GiB round trips; local only",
+]

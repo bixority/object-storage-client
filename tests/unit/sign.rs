@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use http::Method;
-use object_storage_client::sign::{BoundHeaders, SignMethod, presign_s3, presign_s3_at};
+use object_storage_client::sign::{SignMethod, SignOptions, presign_s3, presign_s3_at};
 use object_store::aws::AwsCredential;
 use std::time::Duration;
 use url::Url;
@@ -38,7 +38,7 @@ fn matches_aws_documented_vector() -> std::result::Result<(), Box<dyn std::error
         Duration::from_hours(24),
         &cred,
         "us-east-1",
-        BoundHeaders::default(),
+        &SignOptions::default(),
         date,
     );
 
@@ -72,9 +72,9 @@ fn presign_binds_content_headers() -> std::result::Result<(), Box<dyn std::error
         Duration::from_mins(15),
         &test_credential(),
         "us-east-1",
-        BoundHeaders {
+        &SignOptions {
             content_length: Some(1234),
-            content_type: Some("application/octet-stream"),
+            content_type: Some("application/octet-stream".into()),
         },
     );
 
@@ -95,7 +95,7 @@ fn presign_host_only_when_no_headers() -> std::result::Result<(), Box<dyn std::e
         Duration::from_mins(1),
         &test_credential(),
         "eu-west-1",
-        BoundHeaders::default(),
+        &SignOptions::default(),
     );
 
     let query = signed.query().ok_or("signed URL has no query string")?;
@@ -115,7 +115,7 @@ fn security_token_is_included_when_present() -> std::result::Result<(), Box<dyn 
         Duration::from_mins(5),
         &cred,
         "us-east-1",
-        BoundHeaders {
+        &SignOptions {
             content_length: Some(10),
             content_type: None,
         },

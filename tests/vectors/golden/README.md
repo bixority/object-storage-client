@@ -9,5 +9,7 @@
   `old_key.bin` was written under the older key while the newer one was active.
 - Git does not keep file modes; the test `golden_v1_decrypts` reads the text
   and uses `Keyring::parse`, which has no file checks.
-- CI never regenerates these. To regenerate (replaces the keyring too):
-  `cargo test --test functional regenerate_golden_v1 -- --ignored`
+- v1 is frozen: it means "written by v0.2.0" and is never regenerated. The
+  test `golden_v1_files_are_the_committed_ones` pins every file's SHA-256 and
+  the key IDs. A new format version adds a `v2/` directory with its own
+  generator; the v1 generator is in git history (commit 3a18816).

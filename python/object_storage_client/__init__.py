@@ -1,8 +1,8 @@
 """Unified object storage client.
 
-Multiprocessing: use spawn/forkserver, or fork before the first use of any
-client (the async runtime does not survive a fork). A client used in a child
-forked after the runtime started raises ``RuntimeError`` instead of hanging.
+Multiprocessing: use spawn/forkserver, or fork before the first client call
+(the async runtime does not survive a fork). A client used in a child forked
+after the runtime started raises ``RuntimeError`` instead of hanging.
 """
 
 from typing import TypedDict
@@ -15,7 +15,7 @@ from ._object_storage_client import (
     ObjectStorageClient,
     UnknownKeyError,
 )
-from ._stream import ByteStream
+from ._stream import ByteStream, ListStream
 
 class EncryptionInfo(TypedDict):
     format: str
@@ -37,14 +37,27 @@ class EncryptedObjectMetadata(ObjectMetadata):
     encrypted: bool
     encryption: EncryptionInfo
 
+class KeyInfo(TypedDict):
+    id: str
+    created: str
+
+class KeyringStatus(TypedDict):
+    active: str
+    keys: list[KeyInfo]
+    active_age_days: int
+    last_reload_error: str | None
+
 __all__ = [
     "ObjectStorageClient",
     "EncryptedObjectStorageClient",
     "Keyring",
     "ByteStream",
+    "ListStream",
     "ObjectMetadata",
     "EncryptedObjectMetadata",
     "EncryptionInfo",
+    "KeyInfo",
+    "KeyringStatus",
     "EncryptionError",
     "DecryptionError",
     "UnknownKeyError",

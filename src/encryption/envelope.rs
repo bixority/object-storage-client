@@ -16,15 +16,15 @@ use url::Url;
 use super::context::{EncryptionContext, KEY_OBJECT, is_reserved};
 use super::frame::{Decryptor, Encryptor, FrameLayout, Progress};
 use super::header::{DecodeLimits, FormatError, Header, HeaderCodec, HeaderParse};
-use super::keys::raw_aes::edk_key_name;
+use super::keys::keyring::NAMESPACE;
+use super::keys::raw_aes::key_name_in;
 use super::keys::{KeyError, KeyProvider};
 use super::suite::{DecryptError, fresh_message_material};
 use crate::backend::{Backend, body_stream};
 use crate::client::{EncryptionInfo, Error, ObjectMetadata, ReencryptOptions, Reencrypted, Result};
-use crate::codec::sealed::CodecImpl as _;
 use crate::codec::{
-    ByteStream, CallerContext, Codec, Location, Resolved, delete_unchanged_source, redacted,
-    same_object, sealed, server_side_copy,
+    ByteStream, CallerContext, Codec, Location, MAX_PREALLOC, Resolved, delete_unchanged_source,
+    redacted, same_object, sealed, server_side_copy,
 };
 use crate::hex;
 use crate::upload::{UploadOptions, upload_stream};
@@ -33,8 +33,6 @@ use crate::upload::{UploadOptions, upload_stream};
 const DEFAULT_FRAME_LENGTH: u32 = 65536;
 /// Most plaintext handled between two await points (spec §9).
 const SLICE: usize = 1 << 20;
-/// Initial buffer cap when collecting a whole object.
-const MAX_PREALLOC: usize = 16 << 20;
 
 /// The `format` reported by [`EncryptionInfo`].
 const FORMAT_NAME: &str = "osc-esdk2-0478-v1";
@@ -48,14 +46,15 @@ pub(crate) struct StoredHeader {
     pub attributes: Attributes,
 }
 
-pub(crate) fn encryption_info(h: &Header) -> EncryptionInfo {
+/// `namespace` is the provider ID whose EDKs name the keys listed.
+pub(crate) fn encryption_info(h: &Header, namespace: &str) -> EncryptionInfo {
     EncryptionInfo {
         format: FORMAT_NAME.to_owned(),
         message_id: hex::encode(&h.message_id),
         key_names: h
             .edks
             .iter()
-            .filter_map(|e| edk_key_name(e).map(str::to_owned))
+            .filter_map(|e| key_name_in(e, namespace).map(str::to_owned))
             .collect(),
         frame_length: h.frame_length,
         context: h.context.0.clone(),
@@ -66,13 +65,13 @@ pub(crate) fn encryption_info(h: &Header) -> EncryptionInfo {
 #[derive(Clone, Debug)]
 pub struct EncryptionConfig {
     /// Wraps and unwraps data keys.
-    pub key_provider: Arc<dyn KeyProvider>,
+    key_provider: Arc<dyn KeyProvider>,
     /// Bind each ciphertext to its object key (`osc:key`); on by default.
-    pub bind_object_key: bool,
+    bind_object_key: bool,
     /// Frame length of new messages.
-    pub frame_length: u32,
+    frame_length: u32,
     /// Limits applied to untrusted headers, and checked on write.
-    pub limits: DecodeLimits,
+    limits: DecodeLimits,
 }
 
 impl EncryptionConfig {
@@ -235,7 +234,7 @@ pub(crate) async fn inspect_encryption_raw(
 ) -> Result<EncryptionInfo> {
     let r = client.resolve(url)?;
     let h = read_header(r.backend.as_ref(), &r.loc, &DecodeLimits::default()).await?;
-    Ok(encryption_info(&h.header))
+    Ok(encryption_info(&h.header, NAMESPACE))
 }
 
 impl Envelope {
@@ -261,43 +260,103 @@ impl Envelope {
     ) -> Result<EncryptionInfo> {
         Ok(encryption_info(
             &self.read_header(backend, loc).await?.header,
+            self.cfg.key_provider.namespace(),
         ))
     }
 
-    /// Decrypting stream; with `expect`, fails unless the authenticated
-    /// header equals it. With `echo`, yields the stored chunks unchanged
-    /// instead of the plaintext: a verifying pass-through.
-    fn decode_expecting(
+    /// Checks `required` like a write context (reserved keys are rejected
+    /// with [`Error::InvalidInput`]), before any I/O.
+    pub(crate) fn check_required(required: &CallerContext) -> Result<()> {
+        EncryptionContext::new_reserved(None)
+            .with_caller(required)
+            .map(drop)
+            .map_err(|e| write_err(&e))
+    }
+
+    /// Like [`CodecImpl::decode`], and the header must carry `required`.
+    pub(crate) fn decode_requiring(
         &self,
         loc: Location,
         stored: BoxStream<'static, object_store::Result<Bytes>>,
-        expect: Option<Header>,
-        echo: bool,
+        required: CallerContext,
     ) -> ByteStream {
-        self.decode_stream(loc, stored, expect, echo, None)
+        let dec =
+            Decryptor::new(self.cfg.limits.clone(), self.bound_key(&loc)).require_context(required);
+        self.decode_with(dec, loc, stored, DecodeMode::Plaintext { expect: None })
     }
 
-    /// Decrypting stream that fills `slot` with the caller context of the
-    /// authenticated header, before it yields any plaintext.
-    fn decode_filling(
+    /// Like [`CodecImpl::get_bytes`], and the header must carry `required`.
+    pub(crate) async fn get_bytes_requiring(
         &self,
-        loc: Location,
-        stored: BoxStream<'static, object_store::Result<Bytes>>,
-        slot: Arc<OnceLock<CallerContext>>,
-    ) -> ByteStream {
-        self.decode_stream(loc, stored, None, false, Some(slot))
+        loc: &Location,
+        result: GetResult,
+        required: CallerContext,
+    ) -> Result<Bytes> {
+        let dec =
+            Decryptor::new(self.cfg.limits.clone(), self.bound_key(loc)).require_context(required);
+        self.get_bytes_with(dec, loc, result).await
     }
 
+    async fn get_bytes_with(
+        &self,
+        dec: Decryptor,
+        loc: &Location,
+        result: GetResult,
+    ) -> Result<Bytes> {
+        let size = usize::try_from(result.meta.size).unwrap_or(usize::MAX);
+        let mut dec = dec.whole_object();
+        let mut stored = body_stream(result);
+        let mut reserved = false;
+        // The header, key and every frame are checked as they arrive, so a
+        // bad or over-long object fails before the rest is downloaded. A
+        // chunk longer than SLICE is fed in slices, yielding between them, so
+        // one poll never decrypts more than SLICE.
+        while let Some(chunk) = stored.next().await {
+            let mut chunk = chunk?;
+            while !chunk.is_empty() {
+                let slice = chunk.split_to(chunk.len().min(SLICE));
+                push(&mut dec, slice, self.cfg.key_provider.as_ref())
+                    .await
+                    .map_err(|e| read_err(&loc.url, e))?;
+                if !reserved && dec.header().is_some() {
+                    dec.reserve(size.min(MAX_PREALLOC));
+                    reserved = true;
+                }
+                if !chunk.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        dec.finish_whole().map_err(|e| read_err(&loc.url, e))
+    }
+
+    /// The `osc:key` a header stored at `loc` must carry, if keys are bound.
+    fn bound_key(&self, loc: &Location) -> Option<String> {
+        self.cfg.bind_object_key.then(|| loc.path.to_string())
+    }
+
+    /// A decrypting stream; `mode` says what it yields and what it checks or
+    /// records once the header authenticated. `expected_key` is the `osc:key`
+    /// the header must carry, if any.
     fn decode_stream(
         &self,
         loc: Location,
         stored: BoxStream<'static, object_store::Result<Bytes>>,
-        expect: Option<Header>,
-        echo: bool,
-        slot: Option<Arc<OnceLock<CallerContext>>>,
+        expected_key: Option<String>,
+        mode: DecodeMode,
     ) -> ByteStream {
-        let expected = self.cfg.bind_object_key.then(|| loc.path.to_string());
-        let dec = Decryptor::new(self.cfg.limits.clone(), expected);
+        let dec = Decryptor::new(self.cfg.limits.clone(), expected_key);
+        self.decode_with(dec, loc, stored, mode)
+    }
+
+    /// [`Self::decode_stream`] with the decryptor given.
+    fn decode_with(
+        &self,
+        dec: Decryptor,
+        loc: Location,
+        stored: BoxStream<'static, object_store::Result<Bytes>>,
+        mode: DecodeMode,
+    ) -> ByteStream {
         stream::unfold(
             DecodeState {
                 stored,
@@ -306,11 +365,23 @@ impl Envelope {
                 ready: VecDeque::new(),
                 cfg: Arc::clone(&self.cfg),
                 url: loc.url,
-                expect,
-                echo,
-                slot,
+                mode,
+                header_seen: false,
             },
             DecodeState::step,
+        )
+        .boxed()
+    }
+
+    /// Encrypting stream that writes a header with `context`.
+    fn encode_with(&self, context: EncryptionContext, plain: ByteStream) -> ByteStream {
+        stream::unfold(
+            EncodeState::Start {
+                envelope: self.clone(),
+                context,
+                plain,
+            },
+            EncodeState::step,
         )
         .boxed()
     }
@@ -337,11 +408,11 @@ impl Envelope {
 
     /// Whether an EDK of the header is wrapped by the key `name`.
     fn names_key(&self, header: &Header, name: &str) -> bool {
-        let provider = &self.cfg.key_provider;
+        let namespace = self.cfg.key_provider.namespace();
         header
             .edks
             .iter()
-            .any(|e| e.provider_id == provider.namespace() && edk_key_name(e) == Some(name))
+            .any(|e| key_name_in(e, namespace) == Some(name))
     }
 
     /// Rewrites the object at `r` from key `opts.from` to the active key; see
@@ -365,8 +436,30 @@ impl Envelope {
         if !self.names_key(&stored.header, &opts.from) {
             return Ok(Reencrypted::Skipped);
         }
-        if opts.before.is_some_and(|b| stored.meta.last_modified >= b) {
+        // A store that reports no modification time yields the epoch; such an
+        // object cannot be shown to predate the cutoff.
+        let modified = stored.meta.last_modified;
+        if opts
+            .before
+            .is_some_and(|b| modified >= b || modified == chrono::DateTime::UNIX_EPOCH)
+        {
             return Ok(Reencrypted::AfterCutoff);
+        }
+        // The object keeps its own binding (or none), whatever this client's
+        // `bind_object_key`; a binding client still refuses an object bound to
+        // another name, as its reads would.
+        let binding = stored.header.context.get(KEY_OBJECT).map(str::to_owned);
+        if self.cfg.bind_object_key
+            && let Some(found) = &binding
+            && found.as_str() != r.loc.path.as_ref()
+        {
+            return Err(read_err(
+                &r.loc.url,
+                DecryptError::BindingMismatch {
+                    expected: r.loc.path.to_string(),
+                    found: found.clone(),
+                },
+            ));
         }
         if opts.dry_run {
             return Ok(Reencrypted::WouldRewrite);
@@ -379,6 +472,9 @@ impl Envelope {
                 redacted(&r.loc.url)
             )));
         }
+
+        // Before any write: a context that cannot be written fails here.
+        let context = self.context_bound(binding.as_deref(), &caller_context(&stored.header))?;
 
         // The body is pinned to the version whose header was just read.
         let version = UpdateVersion {
@@ -402,10 +498,15 @@ impl Envelope {
             Err(e) => return Err(e.into()),
         };
         let size = got.meta.size;
-        let ctx = caller_context(&stored.header);
-        let plain =
-            self.decode_expecting(r.loc.clone(), body_stream(got), Some(stored.header), false);
-        let upload = self.encode_stream(r.loc.clone(), ctx, plain);
+        let plain = self.decode_stream(
+            r.loc.clone(),
+            body_stream(got),
+            binding,
+            DecodeMode::Plaintext {
+                expect: Some(stored.header),
+            },
+        );
+        let upload = self.encode_with(context, plain);
         let options = UploadOptions {
             if_unchanged: Some(version),
             ..UploadOptions::copying_from(r.backend.as_ref(), &r.loc.path, size)
@@ -436,20 +537,26 @@ impl Envelope {
     fn names_active_key(&self, header: &Header) -> bool {
         let provider = &self.cfg.key_provider;
         let active = provider.active_key_name();
-        header.edks.iter().any(|e| {
-            e.provider_id == provider.namespace() && edk_key_name(e) == Some(active.as_str())
-        })
+        header
+            .edks
+            .iter()
+            .any(|e| key_name_in(e, provider.namespace()) == Some(active.as_str()))
     }
 
     /// The context of a message written to `loc`. Fails on reserved caller
     /// keys, before any I/O.
     fn context(&self, loc: &Location, ctx: &CallerContext) -> Result<EncryptionContext> {
-        // The config fields are public and can bypass the builder's check.
+        self.context_bound(self.cfg.bind_object_key.then(|| loc.path.as_ref()), ctx)
+    }
+
+    /// Like [`Self::context`] with the `osc:key` binding given explicitly.
+    fn context_bound(&self, bound: Option<&str>, ctx: &CallerContext) -> Result<EncryptionContext> {
+        // `limits()` set after `frame_length()` can leave the pair inconsistent;
+        // fail here, before any I/O.
         self.cfg
             .limits
             .check_frame_length(self.cfg.frame_length)
             .map_err(|e| write_err(&e))?;
-        let bound = self.cfg.bind_object_key.then(|| loc.path.as_ref());
         EncryptionContext::new_reserved(bound)
             .with_caller(ctx)
             .map_err(|e| write_err(&e))
@@ -607,13 +714,23 @@ struct DecodeState {
     ready: VecDeque<Bytes>,
     cfg: Arc<EncryptionConfig>,
     url: Url,
-    /// A header read earlier (copy only): the authenticated one must equal it.
-    expect: Option<Header>,
-    /// Yield the stored chunks, not the plaintext (the plaintext is dropped).
-    echo: bool,
-    /// Receives the caller context of the authenticated header (re-encrypting
-    /// copy only), once the data key and the binding verified.
-    slot: Option<Arc<OnceLock<CallerContext>>>,
+    mode: DecodeMode,
+    /// The authenticated header was handled (compared or recorded).
+    header_seen: bool,
+}
+
+/// What a decrypting stream yields, and what it checks or records once the
+/// header authenticated.
+enum DecodeMode {
+    /// The plaintext; a `Some` header must equal the authenticated one
+    /// (compared once).
+    Plaintext { expect: Option<Header> },
+    /// The plaintext; `slot` receives the authenticated header's caller
+    /// context before any plaintext is yielded.
+    PlaintextFilling { slot: Arc<OnceLock<CallerContext>> },
+    /// The stored bytes unchanged, each slice yielded only after it was fed
+    /// and accepted; the authenticated header must equal `expect`.
+    Stored { expect: Header },
 }
 
 impl DecodeState {
@@ -636,30 +753,35 @@ impl DecodeState {
                     if chunk.len() > SLICE {
                         self.cur = chunk.split_off(SLICE);
                     }
-                    let raw = self.echo.then(|| chunk.clone());
+                    let raw = matches!(self.mode, DecodeMode::Stored { .. }).then(|| chunk.clone());
                     match push(&mut dec, chunk, self.cfg.key_provider.as_ref()).await {
                         Ok(frames) => {
                             // `push` unwraps the key before returning, so the
-                            // header is authenticated as soon as it exists.
-                            // Compare it once, then stop comparing.
-                            if let Some(got) = dec.header()
-                                && self.expect.take().is_some_and(|x| &x != got)
-                            {
-                                return Some((
-                                    Err(Error::Generic(
-                                        "source changed while it was being copied".to_owned(),
-                                    )),
-                                    self,
-                                ));
-                            }
-                            if let Some(slot) = &self.slot
-                                && self.cfg.bind_object_key
+                            // header is authenticated (tag and, with binding on,
+                            // `osc:key`) as soon as it exists. Handle it once.
+                            if !self.header_seen
                                 && let Some(got) = dec.header()
                             {
-                                // Same point as above: the header tag, and
-                                // with binding on the `osc:key` entry, have
-                                // verified. The slot is set once.
-                                let _ = slot.set(caller_context(got));
+                                self.header_seen = true;
+                                let changed = match &self.mode {
+                                    DecodeMode::Plaintext { expect } => {
+                                        expect.as_ref().is_some_and(|x| x != got)
+                                    }
+                                    DecodeMode::Stored { expect } => expect != got,
+                                    DecodeMode::PlaintextFilling { slot } => {
+                                        let _ = slot.set(caller_context(got));
+                                        self.mode = DecodeMode::Plaintext { expect: None };
+                                        false
+                                    }
+                                };
+                                if changed {
+                                    return Some((
+                                        Err(Error::Generic(
+                                            "source changed while it was being copied".to_owned(),
+                                        )),
+                                        self,
+                                    ));
+                                }
                             }
                             match raw {
                                 Some(raw) => self.ready.push_back(raw),
@@ -712,15 +834,7 @@ impl sealed::CodecImpl for Envelope {
 
     fn encode_stream(&self, loc: Location, ctx: CallerContext, plain: ByteStream) -> ByteStream {
         match self.context(&loc, &ctx) {
-            Ok(context) => stream::unfold(
-                EncodeState::Start {
-                    envelope: self.clone(),
-                    context,
-                    plain,
-                },
-                EncodeState::step,
-            )
-            .boxed(),
+            Ok(context) => self.encode_with(context, plain),
             Err(e) => stream::once(async move { Err(e) }).boxed(),
         }
     }
@@ -730,35 +844,19 @@ impl sealed::CodecImpl for Envelope {
         loc: Location,
         stored: BoxStream<'static, object_store::Result<Bytes>>,
     ) -> ByteStream {
-        self.decode_expecting(loc, stored, None, false)
+        let expected_key = self.bound_key(&loc);
+        self.decode_stream(
+            loc,
+            stored,
+            expected_key,
+            DecodeMode::Plaintext { expect: None },
+        )
     }
 
     async fn get_bytes(&self, loc: &Location, result: GetResult) -> Result<Bytes> {
-        let size = usize::try_from(result.meta.size).unwrap_or(usize::MAX);
-        let expected = self.cfg.bind_object_key.then(|| loc.path.to_string());
-        let mut dec = Decryptor::new(self.cfg.limits.clone(), expected).whole_object();
-        let mut stored = body_stream(result);
-        let mut reserved = false;
-        // The header and key are checked as the first chunks arrive, so a bad
-        // object fails before the rest is downloaded; the frames are opened
-        // in place once all of it is buffered.
-        while let Some(chunk) = stored.next().await {
-            push(&mut dec, chunk?, self.cfg.key_provider.as_ref())
-                .await
-                .map_err(|e| read_err(&loc.url, e))?;
-            if !reserved && dec.header().is_some() {
-                dec.reserve(size.min(MAX_PREALLOC));
-                reserved = true;
-            }
-        }
-        let opened = if size <= SLICE {
-            dec.finish_whole()
-        } else {
-            tokio::task::spawn_blocking(move || dec.finish_whole())
-                .await
-                .map_err(|e| Error::Generic(format!("decryption task failed: {e}")))?
-        };
-        opened.map_err(|e| read_err(&loc.url, e))
+        let expected = self.bound_key(loc);
+        let dec = Decryptor::new(self.cfg.limits.clone(), expected);
+        self.get_bytes_with(dec, loc, result).await
     }
 
     async fn describe(&self, backend: &dyn Backend, loc: &Location) -> Result<ObjectMetadata> {
@@ -784,7 +882,10 @@ impl sealed::CodecImpl for Envelope {
                 .map(|v| v.as_ref().to_owned()),
             e_tag: h.meta.e_tag,
             version: h.meta.version,
-            encryption: Some(encryption_info(&h.header)),
+            encryption: Some(encryption_info(
+                &h.header,
+                self.cfg.key_provider.namespace(),
+            )),
         })
     }
 
@@ -792,9 +893,58 @@ impl sealed::CodecImpl for Envelope {
     /// re-wrapped: a second header tag under the same data key and message ID
     /// would reuse a GCM nonce. A copy is therefore either a byte copy (same
     /// bound key, source already on the active key) or a full decrypt and
-    /// re-encrypt with a fresh data key and message ID.
+    /// re-encrypt with a fresh data key and message ID. Onto itself, it does
+    /// nothing.
     async fn copy(&self, src: &Resolved, dst: &Resolved, delete_source: bool) -> Result<()> {
-        let (read, upload) = if self.cfg.bind_object_key && src.loc.path != dst.loc.path {
+        let in_place = same_object(&src.loc, &dst.loc);
+        let same_key = !self.cfg.bind_object_key || src.loc.path == dst.loc.path;
+        // Copying an object onto itself does nothing, whatever its key.
+        if in_place && same_key {
+            return Ok(());
+        }
+        let (read, upload) = if same_key {
+            let header = self
+                .read_header(src.backend.as_ref(), &src.loc)
+                .await?
+                .header;
+            // Compare trusted locations, and require the header to bind the source
+            // path: an unbound source must fail the binding check on the slow path.
+            let src_key = self.cfg.bind_object_key.then(|| src.loc.path.as_ref());
+            let byte_copy =
+                header.context.get(KEY_OBJECT) == src_key && self.names_active_key(&header);
+            if byte_copy {
+                // A server-side copy inside one store is not verified (spec §13).
+                if server_side_copy(src, dst, delete_source, None).await? {
+                    return Ok(());
+                }
+            }
+            let got = src.backend.store().get(&src.loc.path).await?;
+            let read = got.meta.clone();
+            let upload = if byte_copy {
+                // Streams the stored bytes unchanged through a decryptor, so a bad
+                // source fails the upload before it commits.
+                let expected_key = self.bound_key(&src.loc);
+                self.decode_stream(
+                    src.loc.clone(),
+                    body_stream(got),
+                    expected_key,
+                    DecodeMode::Stored { expect: header },
+                )
+            } else {
+                let ctx = caller_context(&header);
+                let expected_key = self.bound_key(&src.loc);
+                let plain = self.decode_stream(
+                    src.loc.clone(),
+                    body_stream(got),
+                    expected_key,
+                    DecodeMode::Plaintext {
+                        expect: Some(header),
+                    },
+                );
+                self.encode_stream(dst.loc.clone(), ctx, plain)
+            };
+            (read, upload)
+        } else {
             // Another name never takes the byte-copy path, so no probe is
             // needed: the source is decrypted and re-encrypted, and the new
             // header's caller context comes from the source header once its
@@ -804,57 +954,33 @@ impl sealed::CodecImpl for Envelope {
             let got = src.backend.store().get(&src.loc.path).await?;
             let read = got.meta.clone();
             let slot = Arc::new(OnceLock::new());
-            let plain = self.decode_filling(src.loc.clone(), body_stream(got), Arc::clone(&slot));
+            let expected_key = self.bound_key(&src.loc);
+            let plain = self.decode_stream(
+                src.loc.clone(),
+                body_stream(got),
+                expected_key,
+                DecodeMode::PlaintextFilling {
+                    slot: Arc::clone(&slot),
+                },
+            );
             (read, self.encode_deferred(dst.loc.clone(), slot, plain))
-        } else {
-            let header = self
-                .read_header(src.backend.as_ref(), &src.loc)
-                .await?
-                .header;
-            // Compare trusted locations, and require the header to bind the source
-            // path: an unbound source must fail the binding check on the slow path.
-            let src_key = self.cfg.bind_object_key.then(|| src.loc.path.as_ref());
-            let same_key = !self.cfg.bind_object_key || src.loc.path == dst.loc.path;
-            let byte_copy = same_key
-                && header.context.get(KEY_OBJECT) == src_key
-                && self.names_active_key(&header);
-            if byte_copy {
-                // Copying an object onto itself is a no-op (a local copy would
-                // leave a hidden hard link behind). With binding on, `same_key`
-                // makes the source path the destination path.
-                if same_object(&src.loc, &dst.loc) {
-                    return Ok(());
-                }
-                // A server-side copy inside one store is not verified (spec §13).
-                if server_side_copy(src, dst, delete_source).await? {
-                    return Ok(());
-                }
-            }
-            let got = src.backend.store().get(&src.loc.path).await?;
-            let read = got.meta.clone();
-            let upload = if byte_copy {
-                // Streams the stored bytes unchanged through a decryptor, so a bad
-                // source fails the upload before it commits.
-                self.decode_expecting(src.loc.clone(), body_stream(got), Some(header), true)
-            } else {
-                let ctx = caller_context(&header);
-                let plain =
-                    self.decode_expecting(src.loc.clone(), body_stream(got), Some(header), false);
-                self.encode_stream(dst.loc.clone(), ctx, plain)
-            };
-            (read, upload)
         };
-        upload_stream(
-            dst.backend.as_ref(),
-            &dst.loc.path,
-            upload,
-            &UploadOptions::copying_from(src.backend.as_ref(), &src.loc.path, read.size),
-        )
-        .await?;
+        let mut options =
+            UploadOptions::copying_from(src.backend.as_ref(), &src.loc.path, read.size);
+        if in_place {
+            // A re-bind through a `file://` alias (a symlinked directory)
+            // rewrites the file it reads: commit only if it is still the
+            // version that was read.
+            options.if_unchanged = Some(UpdateVersion {
+                e_tag: read.e_tag.clone(),
+                version: read.version.clone(),
+            });
+        }
+        upload_stream(dst.backend.as_ref(), &dst.loc.path, upload, &options).await?;
 
         // Only after the destination committed, and never the object just
         // written: through another name for the source, the write replaced it.
-        if delete_source && !same_object(&src.loc, &dst.loc) {
+        if delete_source && !in_place {
             delete_unchanged_source(src, &read).await?;
         }
         Ok(())
@@ -871,14 +997,76 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::{
-        CopyOptions, GetOptions, ListResult, MultipartUpload, ObjectStoreExt, PutMultipartOptions,
-        PutOptions, PutPayload, PutResult,
+        CopyOptions, GetOptions, GetResultPayload, ListResult, MultipartUpload, ObjectStoreExt,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
 
     use super::*;
     use crate::backend::TestBackend;
+    use crate::codec::sealed::CodecImpl as _;
     use crate::encryption::keys::Keyring;
     use crate::encryption::keys::{DataKey, EncryptedDataKey};
+
+    type StoredStream = BoxStream<'static, object_store::Result<Bytes>>;
+
+    fn plain_expecting(
+        env: &Envelope,
+        loc: &Location,
+        stored: StoredStream,
+        expect: Option<Header>,
+    ) -> ByteStream {
+        env.decode_stream(
+            loc.clone(),
+            stored,
+            env.bound_key(loc),
+            DecodeMode::Plaintext { expect },
+        )
+    }
+
+    fn stored_expecting(
+        env: &Envelope,
+        loc: &Location,
+        stored: StoredStream,
+        expect: Header,
+    ) -> ByteStream {
+        env.decode_stream(
+            loc.clone(),
+            stored,
+            env.bound_key(loc),
+            DecodeMode::Stored { expect },
+        )
+    }
+
+    fn header_of(env: &Envelope, message: &[u8]) -> Header {
+        match HeaderCodec::parse(message, &env.cfg.limits).expect("parse") {
+            HeaderParse::Done { header, .. } => header,
+            HeaderParse::NeedMore => panic!("complete header"),
+        }
+    }
+
+    #[tokio::test]
+    async fn encryption_info_lists_only_own_namespace_keys() {
+        let kms = EncryptedDataKey {
+            provider_id: "aws-kms".to_owned(),
+            provider_info:
+                b"arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+                    .to_vec(),
+            ciphertext: vec![0; 48],
+        };
+        let dek = DataKey::from_slice(&[7; 32]).expect("32 bytes");
+        let ctx = EncryptionContext::new_reserved(None);
+        let ring = Keyring::from_material("kek-1", &[("kek-1", &[1; 32])]);
+        let own = ring.wrap(&dek, &ctx).await.expect("wrap").remove(0);
+        let header = Header {
+            message_id: [0; 32],
+            context: EncryptionContext::new_reserved(None),
+            edks: vec![kms, own],
+            frame_length: 4096,
+            commitment: [0; 32],
+            auth_tag: [0; 16],
+        };
+        assert_eq!(encryption_info(&header, NAMESPACE).key_names, ["kek-1"]);
+    }
 
     /// An `InMemory` wrapper with optional faults, recording the range of every
     /// `get_opts` call.
@@ -890,7 +1078,7 @@ mod tests {
         full: Option<InMemory>,
         fail_ranged_reads: bool,
         /// A raw OS error code the copy fails with.
-        copy_error: Option<i32>,
+        copy_error: Option<std::io::ErrorKind>,
         ranges: Mutex<Vec<Option<GetRange>>>,
         /// Multipart uploads started.
         multiparts: AtomicUsize,
@@ -973,7 +1161,7 @@ mod tests {
             if let Some(code) = self.copy_error {
                 return Err(object_store::Error::Generic {
                     store: "faulty",
-                    source: std::io::Error::from_raw_os_error(code).into(),
+                    source: std::io::Error::from(code).into(),
                 });
             }
             self.inner.copy_opts(from, to, options).await
@@ -1428,17 +1616,12 @@ mod tests {
             .header;
 
         let raw = x.backend.store().get(&x.loc.path).await.expect("get");
-        let mut ok = env.decode_expecting(
-            x.loc.clone(),
-            raw.into_stream(),
-            Some(probed.clone()),
-            false,
-        );
+        let mut ok = plain_expecting(&env, &x.loc, raw.into_stream(), Some(probed.clone()));
         while let Some(frame) = ok.next().await {
             frame.expect("same header");
         }
         let forged_stream = stream::once(async move { Ok(forged) }).boxed();
-        let mut bad = env.decode_expecting(x.loc.clone(), forged_stream, Some(probed), false);
+        let mut bad = plain_expecting(&env, &x.loc, forged_stream, Some(probed));
         assert!(bad.next().await.expect("item").is_err());
     }
 
@@ -1465,20 +1648,122 @@ mod tests {
             let chunks: Vec<_> = b.iter().map(|&c| Ok(Bytes::from(vec![c]))).collect();
             stream::iter(chunks).boxed()
         };
-        let mut ok =
-            env.decode_expecting(x.loc.clone(), one_byte(&bytes), Some(right.clone()), false);
+        let mut ok = plain_expecting(&env, &x.loc, one_byte(&bytes), Some(right.clone()));
         let mut out = Vec::new();
         while let Some(frame) = ok.next().await {
             out.extend_from_slice(&frame.expect("same header"));
         }
         assert_eq!(out, b"data");
 
-        let mut bad = env.decode_expecting(x.loc.clone(), one_byte(&other), Some(right), false);
+        let mut bad = plain_expecting(&env, &x.loc, one_byte(&other), Some(right));
         let mut failed = false;
         while let Some(frame) = bad.next().await {
             failed |= frame.is_err();
         }
         assert!(failed);
+    }
+
+    /// A streamed `GetResult` of `head` followed by `garbage_chunks` chunks of
+    /// `GARBAGE_CHUNK` bytes, produced lazily and counted in `pulled`.
+    fn tailed_result(head: Bytes, garbage_chunks: usize, pulled: &Arc<AtomicUsize>) -> GetResult {
+        const GARBAGE_CHUNK: usize = 64 * 1024;
+        let counter = pulled.clone();
+        let tail = stream::iter(0..garbage_chunks).map(move |_| {
+            counter.fetch_add(GARBAGE_CHUNK, Ordering::SeqCst);
+            Ok(Bytes::from(vec![0xA5; GARBAGE_CHUNK]))
+        });
+        let counter = pulled.clone();
+        let head_len = head.len();
+        let first = stream::once(async move {
+            counter.fetch_add(head_len, Ordering::SeqCst);
+            Ok(head)
+        });
+        let size = (head_len + garbage_chunks * GARBAGE_CHUNK) as u64;
+        GetResult {
+            payload: GetResultPayload::Stream(first.chain(tail).boxed()),
+            meta: ObjectMeta {
+                location: ObjectPath::from("obj"),
+                last_modified: chrono::DateTime::UNIX_EPOCH,
+                size,
+                e_tag: None,
+                version: None,
+            },
+            range: 0..size,
+            attributes: object_store::Attributes::new(),
+            extensions: http::Extensions::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_bytes_stops_reading_a_tampered_object_early() {
+        const GARBAGE_CHUNK: usize = 64 * 1024;
+        let (env, _, _, loc) = fixture();
+        let frame = env.cfg.frame_length as usize;
+        let stride = frame + 32;
+        // Two data frames and a final one, so the first frame is genuine and
+        // non-final.
+        let stored = env
+            .encode(
+                &loc,
+                &CallerContext::new(),
+                Bytes::from(vec![7; 2 * frame + 5]),
+            )
+            .await
+            .expect("encode");
+        let header_len = match HeaderCodec::parse(&stored, &env.cfg.limits).expect("parse") {
+            HeaderParse::Done { header_len, .. } => header_len,
+            HeaderParse::NeedMore => panic!("complete header"),
+        };
+        // Garbage in place of frame 2: rejected once its sequence number is
+        // seen, long before 64 MiB were pulled.
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let result = tailed_result(stored.slice(..header_len + stride), 1024, &pulled);
+        let e = env.get_bytes(&loc, result).await.expect_err("tampered");
+        assert!(
+            matches!(
+                e,
+                Error::Decryption(
+                    DecryptError::FrameAuth { .. } | DecryptError::BadSequence { .. }
+                )
+            ),
+            "{e:?}"
+        );
+        assert!(pulled.load(Ordering::SeqCst) <= header_len + stride + GARBAGE_CHUNK);
+
+        // Garbage after a complete genuine message.
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let result = tailed_result(stored.clone(), 1024, &pulled);
+        let e = env.get_bytes(&loc, result).await.expect_err("trailing");
+        assert!(
+            matches!(e, Error::Decryption(DecryptError::TrailingBytes)),
+            "{e:?}"
+        );
+        assert!(pulled.load(Ordering::SeqCst) <= stored.len() + GARBAGE_CHUNK);
+    }
+
+    #[tokio::test]
+    async fn get_bytes_decrypts_a_single_oversized_chunk() {
+        let (env, _, _, loc) = fixture();
+        let plain = Bytes::from(vec![0x5a; 5 * SLICE / 2]);
+        let stored = env
+            .encode(&loc, &CallerContext::new(), plain.clone())
+            .await
+            .expect("encode");
+        let size = stored.len() as u64;
+        let result = GetResult {
+            payload: GetResultPayload::Stream(stream::iter(vec![Ok(stored)]).boxed()),
+            meta: ObjectMeta {
+                location: ObjectPath::from("obj"),
+                last_modified: chrono::DateTime::UNIX_EPOCH,
+                size,
+                e_tag: None,
+                version: None,
+            },
+            range: 0..size,
+            attributes: object_store::Attributes::new(),
+            extensions: http::Extensions::new(),
+        };
+        assert_eq!(env.get_bytes(&loc, result).await.expect("decrypt"), plain);
     }
 
     #[tokio::test]
@@ -1492,16 +1777,16 @@ mod tests {
         let one_chunk = |b: &Bytes| stream::iter(vec![Ok(b.clone())]).boxed();
 
         let mut got = BytesMut::new();
-        let mut dec = env.decode_expecting(loc.clone(), one_chunk(&stored), None, false);
+        let mut dec = plain_expecting(&env, &loc, one_chunk(&stored), None);
         while let Some(frame) = dec.next().await {
             got.extend_from_slice(&frame.expect("decrypt"));
         }
         assert_eq!(got, plain);
 
-        // Echo mode yields the stored bytes unchanged, one slice at a time.
+        // Stored mode yields the stored bytes unchanged, one slice at a time.
         let mut echoed = BytesMut::new();
         let mut pieces = 0;
-        let mut dec = env.decode_expecting(loc.clone(), one_chunk(&stored), None, true);
+        let mut dec = stored_expecting(&env, &loc, one_chunk(&stored), header_of(&env, &stored));
         while let Some(piece) = dec.next().await {
             let piece = piece.expect("echo");
             assert!(piece.len() <= SLICE);
@@ -1516,7 +1801,7 @@ mod tests {
         let mut bad = stored.to_vec();
         *bad.last_mut().expect("non-empty") ^= 1;
         let bad = Bytes::from(bad);
-        let mut dec = env.decode_expecting(loc, one_chunk(&bad), None, true);
+        let mut dec = stored_expecting(&env, &loc, one_chunk(&bad), header_of(&env, &stored));
         let mut echoed = Vec::new();
         let mut failed = false;
         while let Some(piece) = dec.next().await {
@@ -1532,9 +1817,16 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_range_frame_length_fails_before_any_wrap() {
-        let (env, _, _, loc) = fixture();
-        let mut cfg = (*env.cfg).clone();
-        cfg.frame_length = 1;
+        let (_, _, _, loc) = fixture();
+        let provider = Keyring::from_material("kek-1", &[("kek-1", &[7; 32])]);
+        // Limits set after the frame length leave an inconsistent pair.
+        let cfg = EncryptionConfig::new(Arc::new(provider))
+            .frame_length(65536)
+            .expect("in range for the default limits")
+            .limits(DecodeLimits {
+                max_frame_length: 4096,
+                ..DecodeLimits::default()
+            });
         let env = Envelope::new(cfg);
         let r = env
             .encode(&loc, &CallerContext::new(), Bytes::from_static(b"x"))
@@ -1623,25 +1915,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn moving_an_old_key_object_onto_itself_keeps_it() {
-        let (old_env, _, _, _) = fixture();
-        let provider = Keyring::from_material("kek-2", &[("kek-2", &[9; 32]), ("kek-1", &[7; 32])]);
-        let env = Envelope::new(EncryptionConfig::new(Arc::new(provider)));
-        let store = Arc::new(InMemory::new());
-        let x = resolved_at("a", "x", &store);
-        put_at(&old_env, &x, &x, b"data").await;
-
-        env.copy(&x, &x, true).await.expect("move onto itself");
-        let info = env
-            .inspect(x.backend.as_ref(), &x.loc)
+    async fn copy_or_move_onto_itself_does_nothing_whatever_the_key() {
+        let (old, active) = rotated();
+        let store = Arc::new(TestStore::default());
+        let at = |scheme: &str, name: &str| Resolved {
+            backend: Arc::new(TestBackend {
+                store: store.clone(),
+                multipart: false,
+            }),
+            loc: Location {
+                url: Url::parse(&format!("{scheme}://bucket/{name}")).expect("url"),
+                path: ObjectPath::from(name),
+            },
+        };
+        // One object under the old key, one under the active key.
+        for (env, name) in [(&old, "old-key"), (&active, "active-key")] {
+            let loc = at("gs", name).loc;
+            let bytes = env
+                .encode(&loc, &CallerContext::new(), Bytes::from_static(b"data"))
+                .await
+                .expect("encode");
+            store.inner.put(&loc.path, bytes.into()).await.expect("put");
+        }
+        let stored = |name: &str| {
+            let store = store.clone();
+            let path = ObjectPath::from(name);
+            async move {
+                store
+                    .inner
+                    .get(&path)
+                    .await
+                    .expect("get")
+                    .bytes()
+                    .await
+                    .expect("bytes")
+            }
+        };
+        for name in ["old-key", "active-key"] {
+            let before = stored(name).await;
+            for delete_source in [false, true] {
+                // The same URL, and a `gcs://` alias of it.
+                for alias in ["gs", "gcs"] {
+                    active
+                        .copy(&at("gs", name), &at(alias, name), delete_source)
+                        .await
+                        .expect("onto itself");
+                    assert_eq!(stored(name).await, before, "{name} {alias} {delete_source}");
+                }
+            }
+        }
+        assert!(store.requested().is_empty(), "{:?}", store.requested());
+        let info = active
+            .inspect(
+                at("gs", "old-key").backend.as_ref(),
+                &at("gs", "old-key").loc,
+            )
             .await
             .expect("inspect");
-        assert_eq!(info.key_names, ["kek-2"]);
-        let got = env
-            .get_bytes(&x.loc, store.get(&x.loc.path).await.expect("get"))
-            .await
-            .expect("decrypt");
-        assert_eq!(got.as_ref(), b"data");
+        assert_eq!(info.key_names, ["kek-1"]);
     }
 
     #[tokio::test]
@@ -1694,11 +2025,15 @@ mod tests {
     async fn copy_falls_back_to_streaming_only_on_a_cross_device_error() {
         let provider = Keyring::from_material("kek-1", &[("kek-1", &[7; 32])]);
         let env = Envelope::new(EncryptionConfig::new(Arc::new(provider)).bind_object_key(false));
+        // `same_object` stats the paths of two file URLs, so they live in a
+        // private tempdir; the objects themselves are in memory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().display().to_string();
         for (scheme, error, copied) in [
-            // EXDEV, EACCES
-            ("file", 18, true),
-            ("file", 13, false),
-            ("test", 18, false),
+            // cross-device, permission denied
+            ("file", std::io::ErrorKind::CrossesDevices, true),
+            ("file", std::io::ErrorKind::PermissionDenied, false),
+            ("test", std::io::ErrorKind::CrossesDevices, false),
         ] {
             let store = Arc::new(TestStore {
                 copy_error: Some(error),
@@ -1708,14 +2043,16 @@ mod tests {
                 store: store.clone(),
                 multipart: false,
             });
-            let at = |name: &str| Resolved {
-                backend: Arc::clone(&backend),
-                loc: Location {
-                    url: Url::parse(&format!("{scheme}:///{name}")).expect("url"),
-                    path: ObjectPath::from(name),
-                },
+            let at = |name: &str| {
+                let url = Url::parse(&format!("{scheme}://{root}/{name}")).expect("url");
+                let path = ObjectPath::from_url_path(url.path()).expect("path");
+                Resolved {
+                    backend: Arc::clone(&backend),
+                    loc: Location { url, path },
+                }
             };
             let (x, y) = (at("x"), at("y"));
+            assert!(!same_object(&x.loc, &y.loc), "{scheme}: x and y differ");
             let bytes = env
                 .encode(&x.loc, &CallerContext::new(), Bytes::from_static(b"data"))
                 .await
@@ -1836,7 +2173,7 @@ mod tests {
     /// writer would, and counts multipart aborts.
     #[derive(Debug)]
     struct Meddle {
-        inner: Arc<InMemory>,
+        inner: Arc<dyn ObjectStore>,
         when: When,
         newer: Option<Bytes>,
         fired: std::sync::atomic::AtomicBool,
@@ -2039,6 +2376,101 @@ mod tests {
         assert_eq!(raw(&at).await, after);
     }
 
+    /// [`rotated`] with the binding chosen per side.
+    fn rotated_binding(old_bound: bool, new_bound: bool) -> (Envelope, Envelope) {
+        let old = Keyring::from_material("kek-1", &[("kek-1", &[7; 32])]);
+        let new = Keyring::from_material("kek-2", &[("kek-2", &[9; 32]), ("kek-1", &[7; 32])]);
+        (
+            Envelope::new(EncryptionConfig::new(Arc::new(old)).bind_object_key(old_bound)),
+            Envelope::new(EncryptionConfig::new(Arc::new(new)).bind_object_key(new_bound)),
+        )
+    }
+
+    #[tokio::test]
+    async fn reencrypt_on_an_unbound_client_keeps_a_bound_objects_binding() {
+        let (old, new) = rotated_binding(true, false);
+        let at = resolved_with(Arc::new(InMemory::new()), false);
+        seal_with(&old, &at, b"payload").await;
+
+        let r = new.reencrypt(&at, &from_kek1(None, false)).await;
+        assert_eq!(r.expect("reencrypt"), Reencrypted::Rewritten);
+        let info = new
+            .inspect(at.backend.as_ref(), &at.loc)
+            .await
+            .expect("info");
+        assert_eq!(info.key_names, ["kek-2"]);
+        assert_eq!(info.context["osc:key"], "dir/obj");
+        // A bound reader still opens it.
+        let (_, bound) = rotated_binding(true, true);
+        assert_eq!(read_back(&bound, &at).await.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn reencrypt_on_a_binding_client_keeps_an_unbound_object_unbound() {
+        let (old, new) = rotated_binding(false, true);
+        let at = resolved_with(Arc::new(InMemory::new()), false);
+        seal_with(&old, &at, b"payload").await;
+
+        let dry = new.reencrypt(&at, &from_kek1(None, true)).await;
+        assert_eq!(dry.expect("dry run"), Reencrypted::WouldRewrite);
+        let real = new.reencrypt(&at, &from_kek1(None, false)).await;
+        assert_eq!(real.expect("reencrypt"), Reencrypted::Rewritten);
+        let info = new
+            .inspect(at.backend.as_ref(), &at.loc)
+            .await
+            .expect("info");
+        assert_eq!(info.key_names, ["kek-2"]);
+        assert!(!info.context.contains_key("osc:key"), "{:?}", info.context);
+        assert_eq!(info.context["tenant"], "acme");
+        let (_, unbound) = rotated_binding(false, false);
+        assert_eq!(read_back(&unbound, &at).await.as_ref(), b"payload");
+    }
+
+    #[tokio::test]
+    async fn reencrypt_of_an_object_bound_to_another_name() {
+        let (old, new_bound) = rotated_binding(true, true);
+        let (_, new_unbound) = rotated_binding(true, false);
+        let at = resolved_with(Arc::new(InMemory::new()), false);
+        let other = Location {
+            url: Url::parse("test://bucket/other").expect("url"),
+            path: ObjectPath::from("other"),
+        };
+        let bytes = old
+            .encode(
+                &other,
+                &CallerContext::new(),
+                Bytes::from_static(b"payload"),
+            )
+            .await
+            .expect("encode");
+        at.backend
+            .store()
+            .put(&at.loc.path, bytes.clone().into())
+            .await
+            .expect("put");
+
+        for dry_run in [true, false] {
+            let r = new_bound.reencrypt(&at, &from_kek1(None, dry_run)).await;
+            assert!(
+                matches!(
+                    r,
+                    Err(Error::Decryption(DecryptError::BindingMismatch { .. }))
+                ),
+                "dry_run {dry_run}: {r:?}"
+            );
+            assert_eq!(raw(&at).await, bytes);
+        }
+
+        let r = new_unbound.reencrypt(&at, &from_kek1(None, false)).await;
+        assert_eq!(r.expect("reencrypt"), Reencrypted::Rewritten);
+        let info = new_unbound
+            .inspect(at.backend.as_ref(), &at.loc)
+            .await
+            .expect("info");
+        assert_eq!(info.key_names, ["kek-2"]);
+        assert_eq!(info.context["osc:key"], "other");
+    }
+
     #[tokio::test]
     async fn reencrypt_skips_other_keys_and_refuses_the_active_one() {
         let (_, env) = rotated();
@@ -2151,25 +2583,30 @@ mod tests {
         );
     }
 
-    /// An `InMemory` wrapper whose reads report neither an e-tag nor a version.
-    #[derive(Debug)]
-    struct Unversioned(InMemory);
+    /// An `InMemory` wrapper whose reads leave out the e-tag and version
+    /// (`strip_version`) and report `last_modified` when it is set.
+    #[derive(Debug, Default)]
+    struct Doctored {
+        inner: InMemory,
+        strip_version: bool,
+        last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    }
 
-    impl fmt::Display for Unversioned {
+    impl fmt::Display for Doctored {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "Unversioned")
+            write!(f, "Doctored")
         }
     }
 
     #[async_trait]
-    impl ObjectStore for Unversioned {
+    impl ObjectStore for Doctored {
         async fn put_opts(
             &self,
             location: &ObjectPath,
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
-            self.0.put_opts(location, payload, opts).await
+            self.inner.put_opts(location, payload, opts).await
         }
 
         async fn put_multipart_opts(
@@ -2177,7 +2614,7 @@ mod tests {
             location: &ObjectPath,
             opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.0.put_multipart_opts(location, opts).await
+            self.inner.put_multipart_opts(location, opts).await
         }
 
         async fn get_opts(
@@ -2185,9 +2622,14 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
-            let mut got = self.0.get_opts(location, options).await?;
-            got.meta.e_tag = None;
-            got.meta.version = None;
+            let mut got = self.inner.get_opts(location, options).await?;
+            if self.strip_version {
+                got.meta.e_tag = None;
+                got.meta.version = None;
+            }
+            if let Some(t) = self.last_modified {
+                got.meta.last_modified = t;
+            }
             Ok(got)
         }
 
@@ -2195,21 +2637,21 @@ mod tests {
             &self,
             locations: BoxStream<'static, object_store::Result<ObjectPath>>,
         ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
-            self.0.delete_stream(locations)
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&ObjectPath>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.0.list(prefix)
+            self.inner.list(prefix)
         }
 
         async fn list_with_delimiter(
             &self,
             prefix: Option<&ObjectPath>,
         ) -> object_store::Result<ListResult> {
-            self.0.list_with_delimiter(prefix).await
+            self.inner.list_with_delimiter(prefix).await
         }
 
         async fn copy_opts(
@@ -2218,14 +2660,41 @@ mod tests {
             to: &ObjectPath,
             options: CopyOptions,
         ) -> object_store::Result<()> {
-            self.0.copy_opts(from, to, options).await
+            self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    #[tokio::test]
+    async fn reencrypt_treats_a_missing_modification_time_as_after_the_cutoff() {
+        let (old, env) = rotated();
+        let at = resolved_with(
+            Arc::new(Doctored {
+                last_modified: Some(chrono::DateTime::UNIX_EPOCH),
+                ..Doctored::default()
+            }),
+            false,
+        );
+        let bytes = seal_with(&old, &at, b"payload").await;
+
+        let cutoff = Some(chrono::Utc::now());
+        let r = env.reencrypt(&at, &from_kek1(cutoff, false)).await;
+        assert_eq!(r.expect("reencrypt"), Reencrypted::AfterCutoff);
+        assert_eq!(raw(&at).await, bytes);
+
+        let r = env.reencrypt(&at, &from_kek1(None, false)).await;
+        assert_eq!(r.expect("reencrypt"), Reencrypted::Rewritten);
     }
 
     #[tokio::test]
     async fn reencrypt_refuses_an_object_without_an_e_tag_or_version() {
         let (old, env) = rotated();
-        let at = resolved_with(Arc::new(Unversioned(InMemory::new())), false);
+        let at = resolved_with(
+            Arc::new(Doctored {
+                strip_version: true,
+                ..Doctored::default()
+            }),
+            false,
+        );
         let bytes = seal_with(&old, &at, b"payload").await;
 
         // A dry run decides without writing, so it still answers.
@@ -2237,6 +2706,54 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(raw(&at).await, bytes);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_alias_rebind_is_abandoned_when_the_file_changed() {
+        let (env, _) = rotated();
+        let tmp = tempfile::tempdir().expect("dir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).expect("dir");
+        std::os::unix::fs::symlink(&real, tmp.path().join("link")).expect("symlink");
+        let at = |dir: &str| {
+            let file = tmp.path().join(dir).join("x");
+            Location {
+                url: Url::from_file_path(&file).expect("url"),
+                path: ObjectPath::from_absolute_path(&file).expect("path"),
+            }
+        };
+        let (via_link, direct) = (at("link"), at("real"));
+        let store = Arc::new(Meddle {
+            inner: Arc::new(object_store::local::LocalFileSystem::new()),
+            when: When::Head,
+            newer: Some(Bytes::from_static(b"newer")),
+            fired: std::sync::atomic::AtomicBool::new(false),
+            aborts: Arc::default(),
+        });
+        let resolved = |loc: Location| Resolved {
+            backend: Arc::new(TestBackend {
+                store: store.clone(),
+                multipart: false,
+            }),
+            loc,
+        };
+        // Encrypted for (bound to) the link name, stored under the real one.
+        let bytes = env
+            .encode(
+                &via_link,
+                &CallerContext::new(),
+                Bytes::from_static(b"data"),
+            )
+            .await
+            .expect("encode");
+        std::fs::write(real.join("x"), &bytes).expect("write");
+
+        let r = env
+            .copy(&resolved(via_link), &resolved(direct), false)
+            .await;
+        assert!(matches!(r, Err(Error::Changed)), "{r:?}");
+        assert_eq!(std::fs::read(real.join("x")).expect("read"), b"newer");
     }
 
     /// Runs a reencrypt of an object that `when` replaces with `newer` (or

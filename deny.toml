@@ -1,0 +1,19 @@
+# cargo-deny configuration. CI runs `cargo deny --all-features check advisories bans sources`.
+
+[advisories]
+yanked = "deny"
+# Triage an advisory by updating the crate; only if that is impossible, add
+# its id here with a reason.
+ignore = []
+
+[bans]
+multiple-versions = "allow"
+deny = [
+    { crate = "ring", reason = "AWS-LC is the only crypto provider since 0.2.0" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

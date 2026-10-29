@@ -9,7 +9,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.2.0"
+version = "0.2.1"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -18,12 +18,19 @@ name = "object_storage_client"
 
 [dependencies]
 async-trait = "0.1"
+aws-config = { version = "1.13", default-features = false, features = ["rt-tokio", "default-https-client", "sso", "credentials-process"] }
+aws-credential-types = "1.3"
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-runtime = "1.10"
+aws-sigv4 = { version = "1.6", default-features = false, features = ["sign-http", "http1"] }
+aws-types = "1.7"
 bytes = "1.12"
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "env"], optional = true }
 futures = "0.3"
 http = "1.5"
+http-body = "1"
+http-body-util = "0.1"
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
 percent-encoding = "2.3"
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
@@ -32,6 +39,7 @@ pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"], optional
 thiserror = "2.0"
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
+tracing = "0.1"
 url = "2.5"
 zeroize = { version = "1", optional = true }
 
@@ -64,6 +72,8 @@ required-features = ["encryption"]
 
 [dev-dependencies]
 alloc-counter = { path = "benches/alloc-counter" }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-smithy-types = "1"
 proptest = "1"
 serde_json = "1"
 tempfile = "3.27"
@@ -87,9 +97,10 @@ incremental = true
 opt-level = 0
 
 [profile.release]
+# No panic = "abort": the cdylib must unwind so pyo3 turns panics into
+# exceptions, and drop guards must run.
 codegen-units = 1
 debug = false
 lto = "fat"
 opt-level = 3
-panic = "abort"
 strip = true

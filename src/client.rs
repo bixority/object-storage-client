@@ -3,7 +3,8 @@ use crate::codec::{ByteStream, CallerContext, Codec, Location, Plain, Resolved, 
 #[cfg(feature = "encryption")]
 use crate::encryption::{EncryptionConfig, Envelope};
 use crate::registry::{StoreRegistry, object_path, origin, parse_url};
-use crate::sign::{SignMethod, SignOptions};
+use crate::sign::{MAX_PRESIGN_EXPIRY, SignMethod, SignOptions};
+use crate::text;
 use crate::upload::{UploadOptions, put_bytes, upload_stream};
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -21,13 +22,19 @@ mod local_delete;
 #[non_exhaustive]
 pub enum Error {
     /// A storage error. Its message may include the request URL, so do not
-    /// embed secrets (userinfo, SAS or other query tokens) in object URLs.
+    /// put secrets in object URLs (queries and user names are refused).
+    ///
+    /// Provider text in it is escaped and capped when the error is converted
+    /// (see the `From<object_store::Error>` impl), so it is safe to log.
     #[error("Object store error: {0}")]
-    ObjectStore(#[from] object_store::Error),
+    ObjectStore(#[source] object_store::Error),
 
     #[error("Invalid URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
+    /// A local file operation of this crate failed (the `file://` store, the
+    /// staging of writes and downloads, the local delete walk). Operations that
+    /// go through `object_store` report [`Error::ObjectStore`] instead.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -109,6 +116,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// read from the object's attributes — useful for verifying that a completed
 /// upload wrote the bytes and content type a presigned URL was issued for.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ObjectMetadata {
     /// The object's path within the store.
     pub location: String,
@@ -130,6 +138,7 @@ pub struct ObjectMetadata {
 
 /// Envelope details of an encrypted object.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncryptionInfo {
     pub format: String,
     /// Message ID, hex-encoded.
@@ -150,8 +159,6 @@ pub struct Client<C: Codec = Plain> {
 /// The plain (unencrypted) client.
 pub type ObjectStorageClient = Client<Plain>;
 
-/// The client that encrypts every object it writes and decrypts every object
-/// it reads.
 /// Settings of [`Client::reencrypt`](Client::<Envelope>::reencrypt).
 #[cfg(feature = "encryption")]
 #[derive(Debug, Clone)]
@@ -159,6 +166,17 @@ pub struct ReencryptOptions {
     /// The key ID whose objects are rewritten under the active key.
     pub from: String,
     /// Only objects last modified before this time are rewritten.
+    ///
+    /// The cutoff compares the modification time the store reports, which is
+    /// not authenticated. It only screens out forgeries by holders of leaked
+    /// storage credentials on stores that set the time themselves at commit.
+    /// The provider, anyone who can set file times on `file://` or NFS, and
+    /// S3 multipart uploads started before the cutoff are exceptions. An
+    /// object for which the store reports no time counts as after the cutoff.
+    /// If a party that may hold the leaked key can also influence
+    /// modification times, treat every object under that key as suspect and
+    /// check candidates against an independent record (application records,
+    /// provider audit logs or inventory) before re-encrypting.
     pub before: Option<chrono::DateTime<chrono::Utc>>,
     /// Decide only; never write.
     pub dry_run: bool,
@@ -177,7 +195,9 @@ pub enum Reencrypted {
     Skipped,
     /// The object is not an encrypted object.
     NotEncrypted,
-    /// The object was last modified at or after `before`; left alone.
+    /// The object was last modified at or after `before`, or the store
+    /// reports no modification time; left alone. The time is not
+    /// authenticated: see [`ReencryptOptions::before`].
     AfterCutoff,
     /// The object changed or vanished while it was being rewritten; the newer
     /// content is untouched.
@@ -200,12 +220,15 @@ impl Reencrypted {
     }
 }
 
+/// The client that encrypts every object it writes and decrypts every object
+/// it reads.
 #[cfg(feature = "encryption")]
 pub type EncryptedObjectStorageClient = Client<crate::encryption::Envelope>;
 
 impl<C: Codec> Client<C> {
     /// Parses a URL string into a [`Url`], treating absolute or relative paths
-    /// without a scheme as `file://` URLs.
+    /// without a scheme as `file://` URLs. A local path is treated exactly like
+    /// the `file://` URL of its absolute path, so `..` is resolved lexically.
     #[doc(hidden)]
     pub fn parse_url(url: &str) -> Result<Url> {
         parse_url(url)
@@ -220,8 +243,7 @@ impl<C: Codec> Client<C> {
     /// - The URL scheme is unsupported.
     /// - The URL is missing required components (e.g., bucket name for S3/GCS).
     /// - There is an error building the underlying `ObjectStore`.
-    #[doc(hidden)]
-    pub fn get_backend(&self, url: &Url) -> Result<(Arc<dyn Backend>, ObjectPath)> {
+    pub(crate) fn get_backend(&self, url: &Url) -> Result<(Arc<dyn Backend>, ObjectPath)> {
         self.registry.resolve(url)
     }
 
@@ -245,8 +267,21 @@ impl<C: Codec> Client<C> {
         Ok((Arc::clone(backend.store()), path))
     }
 
+    /// Resolves an object URL: as [`Self::resolve_prefix`], and the URL must
+    /// name an object, not just a bucket.
     pub(crate) fn resolve(&self, url: &str) -> Result<Resolved> {
-        let url = parse_url(url)?;
+        self.resolve_checked(url, Dots::OffFile, true)
+    }
+
+    /// Resolves a URL that may be a bucket or a prefix (list, bucket calls).
+    fn resolve_prefix(&self, url: &str) -> Result<Resolved> {
+        self.resolve_checked(url, Dots::OffFile, false)
+    }
+
+    /// Parses and checks `raw` before any backend is built, then resolves it.
+    fn resolve_checked(&self, raw: &str, dots: Dots, needs_object: bool) -> Result<Resolved> {
+        let url = parse_url(raw)?;
+        check_input(raw, &url, dots, needs_object)?;
         let (backend, path) = self.registry.resolve(&url)?;
         Ok(Resolved {
             backend,
@@ -254,10 +289,32 @@ impl<C: Codec> Client<C> {
         })
     }
 
+    /// Resolves the prefix of a recursive delete, refusing the inputs that
+    /// would delete everything the process may delete. It never deletes.
+    fn resolve_delete_prefix(&self, url: &str) -> Result<Resolved> {
+        if url.trim().is_empty() {
+            return Err(Error::InvalidInput(
+                "delete_by_prefix needs a non-empty URL".into(),
+            ));
+        }
+        let r = self.resolve_checked(url, Dots::Everywhere, false)?;
+        // A root (`/`, or a drive root on Windows) has no parent.
+        if r.loc.url.scheme() == "file" && crate::backend::fs_path(&r.loc.path)?.parent().is_none()
+        {
+            return Err(Error::InvalidInput(
+                "delete_by_prefix refuses the file system root".into(),
+            ));
+        }
+        Ok(r)
+    }
+
     /// Resolves both ends of a copy or move, sharing one backend between URLs
     /// of one origin so that a server-side copy stays possible.
     fn resolve_pair(&self, from: &str, to: &str) -> Result<(Resolved, Resolved)> {
-        let (from, to) = (parse_url(from)?, parse_url(to)?);
+        let (raw_from, raw_to) = (from, to);
+        let (from, to) = (parse_url(raw_from)?, parse_url(raw_to)?);
+        check_input(raw_from, &from, Dots::OffFile, true)?;
+        check_input(raw_to, &to, Dots::OffFile, true)?;
         let ((src, src_path), (dst, dst_path)) = self.registry.resolve_pair(&from, &to)?;
         Ok((
             Resolved {
@@ -408,8 +465,15 @@ impl<C: Codec> Client<C> {
 
     /// Deletes all objects under the given URL prefix.
     ///
-    /// This method uses the underlying store's `delete_stream` to perform
-    /// efficient batch deletions concurrently where supported by the backend.
+    /// Cloud stores list the keys strictly below the prefix and delete them
+    /// through the store's `delete_stream` (batched where the backend
+    /// supports it). The prefix's own folder marker (a key ending in `/`) is
+    /// not below it and stays, as does every other key ending in `/`: such
+    /// keys cannot be addressed through `object_store`. A key that vanishes
+    /// during the run counts as deleted. A `file://` prefix is walked without
+    /// following symlinks (links are deleted as links), directories are kept,
+    /// `name#<digits>` staging files are skipped and trees deeper than 128
+    /// levels are refused with [`Error::InvalidInput`].
     ///
     /// # Errors
     ///
@@ -423,29 +487,13 @@ impl<C: Codec> Client<C> {
     /// would delete everything the process may delete. A cloud URL naming only
     /// a bucket (an empty object prefix) deletes every object in the bucket.
     pub async fn delete_by_prefix(&self, url: &str) -> Result<()> {
-        if url.trim().is_empty() {
-            return Err(Error::InvalidInput(
-                "delete_by_prefix needs a non-empty URL".into(),
-            ));
-        }
-        let r = self.resolve(url)?;
-        if r.loc.url.scheme() == "file" && r.loc.path.as_ref().is_empty() {
-            return Err(Error::InvalidInput(
-                "delete_by_prefix refuses the file system root".into(),
-            ));
-        }
+        let r = self.resolve_delete_prefix(url)?;
         if r.loc.url.scheme() == "file" {
             // object_store's local listing follows symlinked directories, so a
             // link below the prefix would redirect the deletes outside it.
             return local_delete::delete_by_prefix(r.loc.path).await;
         }
-        let (store, path) = (r.backend.store(), r.loc.path);
-        let paths = store.list(Some(&path)).map_ok(|meta| meta.location);
-        store
-            .delete_stream(paths.boxed())
-            .try_for_each(|_| async { Ok(()) })
-            .await?;
-        Ok(())
+        delete_listed(r.backend.store(), r.loc.path).await
     }
 
     /// Lists objects under the given URL prefix.
@@ -469,29 +517,27 @@ impl<C: Codec> Client<C> {
     /// Returns an error if the URL is invalid or the scheme is unsupported;
     /// listing errors come as stream items.
     pub fn list_stream(&self, url: &str) -> Result<BoxStream<'static, Result<String>>> {
-        let r = self.resolve(url)?;
+        Ok(self.list_meta_stream(url)?.map_ok(|(name, _)| name).boxed())
+    }
+
+    /// [`Self::list_stream`] with each object's listed size in bytes (for an
+    /// encrypted object the stored size, which is not authenticated).
+    pub(crate) fn list_meta_stream(
+        &self,
+        url: &str,
+    ) -> Result<BoxStream<'static, Result<(String, u64)>>> {
+        let r = self.resolve_prefix(url)?;
         let (store, path) = (r.backend.store(), r.loc.path);
-        let prefix = if path.as_ref().is_empty() {
-            String::new()
-        } else {
-            format!("{path}/")
-        };
-        Ok(store
-            .list(Some(&path))
-            .map_ok(move |meta| {
-                let location = meta.location.to_string();
-                let relative = location.strip_prefix(&prefix).unwrap_or(&location);
-                relative.strip_prefix('/').unwrap_or(relative).to_owned()
-            })
-            .map_err(Error::from)
-            .boxed())
+        Ok(relative_listing(store.list(Some(&path)), path))
     }
 
     /// Retrieves metadata for the object at the given URL.
     ///
     /// The plain client issues a single HEAD request via
     /// [`GetOptions::head`](object_store::GetOptions::head); the encrypted
-    /// client issues one or two ranged GETs for the header instead. Either
+    /// client issues one ranged GET of at most
+    /// `DecodeLimits::max_header_len` bytes (16 KiB by default) for the header instead, followed by a HEAD
+    /// only when that GET fails with an error other than not-found. Either
     /// way it returns the location, last modified time, size, e-tag and version from the object
     /// metadata together with the `Content-Type` read from the object
     /// attributes. A missing object is reported as an error
@@ -548,10 +594,13 @@ impl<C: Codec> Client<C> {
     ///
     /// - `file://` — creates the directory (and any missing parents).
     /// - `s3://` — S3 `CreateBucket` (`PUT /<bucket>`), signed with
-    ///   `AwsAuthorizer`. Idempotent against `BucketAlreadyOwnedByYou` /
-    ///   `BucketAlreadyExists`.
+    ///   `AwsAuthorizer`. Idempotent against `BucketAlreadyOwnedByYou`; an
+    ///   error for `BucketAlreadyExists` (another account owns the name) and
+    ///   for every other failure.
     /// - `gs://`, `gcs://` — GCS JSON API `buckets.insert`, authenticated with
-    ///   the backend's `OAuth2` bearer credential. Idempotent against HTTP 409.
+    ///   the backend's `OAuth2` bearer credential. On HTTP 409 the bucket's
+    ///   metadata is read: the call succeeds only if the caller can see the
+    ///   bucket, and fails if another project owns the name.
     /// - `az://`, `wasb(s)://`, `abfs(s)://` — Azure `Create Container`
     ///   (`PUT /<container>?restype=container`), signed with `AzureAuthorizer`.
     ///   Idempotent against `ContainerAlreadyExists` / HTTP 409.
@@ -572,9 +621,9 @@ impl<C: Codec> Client<C> {
     /// - The backend rejects the request for a reason other than the bucket
     ///   already existing.
     pub async fn create_bucket(&self, url: &str) -> Result<()> {
-        let r = self.resolve(url)?;
+        let r = self.resolve_prefix(url)?;
         r.backend
-            .create_bucket(self.registry.http(), &r.loc.url)
+            .create_bucket(self.registry.http()?, &r.loc.url)
             .await
     }
 
@@ -588,9 +637,10 @@ impl<C: Codec> Client<C> {
     /// - `file://` — checks that the path exists and is a directory.
     /// - `s3://`, `gs://`, `az://` (and variants) — issues the provider's
     ///   dedicated metadata probe (S3 `HeadBucket`, Azure `Get Container
-    ///   Properties`, GCS `buckets.get`) rather than listing objects. A `404
-    ///   Not Found` means the bucket is missing; success or `403 Forbidden`
-    ///   means it exists.
+    ///   Properties`, GCS `buckets.get`) rather than listing objects. Success
+    ///   means the bucket exists and `404 Not Found` that it is missing. `401`
+    ///   and `403` (also the answer to a wrong key or signature) are errors:
+    ///   existence is unknown.
     ///
     /// # Errors
     ///
@@ -599,9 +649,9 @@ impl<C: Codec> Client<C> {
     /// - The scheme does not support bucket existence checks.
     /// - The backend fails for a reason other than the bucket not existing.
     pub async fn bucket_exists(&self, url: &str) -> Result<bool> {
-        let r = self.resolve(url)?;
+        let r = self.resolve_prefix(url)?;
         r.backend
-            .bucket_exists(self.registry.http(), &r.loc.url)
+            .bucket_exists(self.registry.http()?, &r.loc.url)
             .await
     }
 
@@ -624,15 +674,15 @@ impl<C: Codec> Client<C> {
     /// Supports cross-provider moves. Moving an object onto itself does
     /// nothing.
     ///
-    /// Between stores (or two names the client cannot tell are one store) a
-    /// move streams the source to the destination and then deletes the source,
-    /// but only if the source still matches what was read: the object's
-    /// metadata is compared before the delete. If it was gone, nothing is
-    /// deleted; if it changed, for instance because the destination is another
-    /// name for the source, the source is kept and [`Error::SourceChanged`]
-    /// is returned; the destination stays written. A rewrite with identical
-    /// bytes in the same second, on a store reporting no e-tag or version, is
-    /// indistinguishable.
+    /// Every move, server-side or streamed, deletes the source only if it
+    /// still matches what was copied: the object's metadata is compared before
+    /// the delete. If it was gone, nothing is deleted; if it changed, for
+    /// instance because a writer replaced it or the destination is another
+    /// name for the source, the source is kept and [`Error::SourceChanged`] is
+    /// returned; the destination stays written. A rewrite with identical bytes
+    /// in the same second, on a store reporting no e-tag or version, is
+    /// indistinguishable. Only a move inside one `file://` file system is an
+    /// atomic rename.
     ///
     /// # Errors
     ///
@@ -664,7 +714,9 @@ impl Default for Client<Plain> {
 
 #[cfg(feature = "encryption")]
 impl Client<Envelope> {
-    /// A standalone encrypted client with its own store registry.
+    /// A standalone encrypted client with its own store registry. It takes no
+    /// AWS profile; to use one, call
+    /// `ObjectStorageClient::new().with_s3_profile(p)?.with_encryption(cfg)`.
     #[must_use]
     pub fn new(cfg: EncryptionConfig) -> Self {
         Self {
@@ -674,7 +726,7 @@ impl Client<Envelope> {
     }
 
     /// Reads the envelope details of an encrypted object from its header with
-    /// ranged reads. Needs no keys.
+    /// one ranged read. Needs no keys.
     ///
     /// The result is **unauthenticated**: the header tag is not verified, so
     /// anyone able to modify the stored object can change what is reported.
@@ -705,6 +757,11 @@ impl Client<Envelope> {
     /// As with a re-encrypting copy, the content type and user metadata of
     /// the object are not carried over.
     ///
+    /// The object keeps its encryption context and its object-key binding
+    /// (`osc:key`, or none), whatever the client's `bind_object_key`. A
+    /// binding client refuses an object bound to another name, also in a dry
+    /// run, as its reads would.
+    ///
     /// # Errors
     ///
     /// [`Error::InvalidInput`] if `opts.from` is the active key (rotate the
@@ -713,6 +770,46 @@ impl Client<Envelope> {
     pub async fn reencrypt(&self, url: &str, opts: &ReencryptOptions) -> Result<Reencrypted> {
         let r = self.resolve(url)?;
         self.codec.reencrypt(&r, opts).await
+    }
+
+    /// Like [`Self::get`], and the object must carry every pair of `required`
+    /// in its encryption context (extra stored pairs are allowed). The check
+    /// happens on the header, before any key is unwrapped; a stored context
+    /// value that was edited to match fails authentication afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] if `required` holds a reserved (`osc:`,
+    /// `aws-crypto-`) key, before any I/O; [`Error::Decryption`] with
+    /// [`DecryptError::ContextMismatch`](crate::encryption::DecryptError::ContextMismatch)
+    /// if a pair is missing or differs; otherwise as [`Self::get`].
+    pub async fn get_with_context(&self, url: &str, required: &CallerContext) -> Result<Bytes> {
+        Envelope::check_required(required)?;
+        let r = self.resolve(url)?;
+        let result = r.backend.store().get(&r.loc.path).await?;
+        self.codec
+            .get_bytes_requiring(&r.loc, result, required.clone())
+            .await
+    }
+
+    /// Like [`Self::get_stream`], and the object must carry every pair of
+    /// `required` in its encryption context. A mismatch is the first item of
+    /// the stream, before any plaintext.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::get_with_context`].
+    pub async fn get_stream_with_context(
+        &self,
+        url: &str,
+        required: &CallerContext,
+    ) -> Result<ByteStream> {
+        Envelope::check_required(required)?;
+        let r = self.resolve(url)?;
+        let result = r.backend.store().get(&r.loc.path).await?;
+        Ok(self
+            .codec
+            .decode_requiring(r.loc, body_stream(result), required.clone()))
     }
 
     /// A plain view sharing this client's store registry.
@@ -782,6 +879,35 @@ impl Client<Plain> {
         }
     }
 
+    /// A client whose S3 stores take their credentials from the AWS profile
+    /// `profile` (static keys, SSO, assumed roles and `credential_process`
+    /// helpers, from `~/.aws/config` and `~/.aws/credentials`).
+    ///
+    /// The profile is the only credential source: static keys in
+    /// `S3_ACCESS_KEY_ID` / `AWS_ACCESS_KEY_ID` are not used, `AWS_PROFILE` is
+    /// not read, and `AWS_ENDPOINT_URL` is refused (use `S3_ENDPOINT`). A
+    /// `credential_process` entry makes the library run that command, so the
+    /// profile files must be trusted. The profile is resolved on the first
+    /// signed request; a profile that cannot be resolved is an error, never a fall back
+    /// to instance metadata. Unlike [`Self::with_encryption`] this does not
+    /// share the store registry: the result has its own store registry, but
+    /// keeps this client's configuration source.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when the profile name is empty or only
+    /// whitespace.
+    pub fn with_s3_profile(&self, profile: impl Into<String>) -> Result<Self> {
+        let profile = profile.into();
+        if profile.trim().is_empty() {
+            return Err(Error::InvalidInput("the AWS profile name is empty".into()));
+        }
+        Ok(Self {
+            registry: Arc::new(self.registry.with_profile(profile)),
+            codec: Plain,
+        })
+    }
+
     /// An encrypting view sharing this client's store registry.
     #[cfg(feature = "encryption")]
     #[must_use]
@@ -807,9 +933,15 @@ impl Client<Plain> {
     /// Azure Blob Storage (`az://`, `wasb(s)://`, `abfs(s)://`). Local and
     /// plain HTTP backends do not support signing.
     ///
+    /// An `s3://` URL signed with temporary credentials stops working when that
+    /// session ends, whatever `expires_in` says.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `expires_in` is under 1 second or over 7 days (604800 s):
+    ///   [`Error::InvalidInput`]. Temporary credentials may cap the real
+    ///   lifetime of a URL further.
     /// - The URL is invalid.
     /// - The URL has a `.`/`..` path segment (also percent-encoded), a query or
     ///   a fragment, or names no object (a bucket only): [`Error::InvalidInput`].
@@ -823,12 +955,8 @@ impl Client<Plain> {
         expires_in: Duration,
         options: &SignOptions,
     ) -> Result<String> {
-        check_presign_input(url)?;
-        let r = self.resolve(url)?;
-        // The local backend rejects signing itself; keep its error.
-        if r.loc.url.scheme() != "file" {
-            check_presign_path(&r.loc.path)?;
-        }
+        check_presign_expiry(expires_in)?;
+        let r = self.resolve_checked(url, Dots::Everywhere, true)?;
         r.backend
             .pre_signed_urls(
                 std::slice::from_ref(&r.loc.path),
@@ -849,11 +977,15 @@ impl Client<Plain> {
     /// in a loop when signing many objects in the same bucket/container.
     ///
     /// `options` applies the same `Content-Length` / `Content-Type` binding to
-    /// every URL (S3 only); see [`Self::get_pre_signed_url`].
+    /// every URL (S3 only); see [`Self::get_pre_signed_url`]. An `s3://` URL
+    /// signed with temporary credentials stops working when that session ends,
+    /// whatever `expires_in` says.
     ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `expires_in` is under 1 second or over 7 days (604800 s):
+    ///   [`Error::InvalidInput`].
     /// - `urls` is empty, or any URL is invalid.
     /// - Any URL has a `.`/`..` path segment (also percent-encoded), a query or
     ///   a fragment, or names no object (a bucket only): [`Error::InvalidInput`].
@@ -868,32 +1000,26 @@ impl Client<Plain> {
         expires_in: Duration,
         options: &SignOptions,
     ) -> Result<Vec<String>> {
+        check_presign_expiry(expires_in)?;
         let Some((first, rest)) = urls.split_first() else {
-            return Err(Error::Generic("No URLs provided for signing".into()));
+            return Err(Error::InvalidInput("No URLs provided for signing".into()));
         };
 
-        for url in urls {
-            check_presign_input(url)?;
-        }
-        let first = self.resolve(first)?;
+        let first = self.resolve_checked(first, Dots::Everywhere, true)?;
 
         let mut paths = Vec::with_capacity(urls.len());
         paths.push(first.loc.path.clone());
 
         for url in rest {
             let parsed = Self::parse_url(url)?;
+            check_input(url, &parsed, Dots::Everywhere, true)?;
             if origin(&parsed) != origin(&first.loc.url) {
-                return Err(Error::Generic(
+                return Err(Error::InvalidInput(
                     "All URLs must belong to the same backend (scheme, userinfo, host and port)"
                         .into(),
                 ));
             }
             paths.push(object_path(&parsed)?);
-        }
-        if first.loc.url.scheme() != "file" {
-            for path in &paths {
-                check_presign_path(path)?;
-            }
         }
 
         first
@@ -903,58 +1029,527 @@ impl Client<Plain> {
     }
 }
 
-/// Rejects a pre-sign input the `url` crate would silently rewrite: a dot
-/// segment in any spelling (`.`, `..`, `%2e`, `%2E%2e`), which it resolves
-/// while parsing, so `uploads/../other/x` would sign `other/x`; and, for a URL,
-/// a query or fragment, which it would drop. The check runs on the raw string,
-/// before any normalisation.
-fn check_presign_input(raw: &str) -> Result<()> {
-    // The URL parser drops tabs and newlines anywhere in its input.
-    let raw: String = raw
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
+/// Where `.` and `..` path segments are refused.
+#[derive(Clone, Copy)]
+enum Dots {
+    /// Everywhere but `file://` URLs and local paths, which resolve them
+    /// lexically (the CLI builds `file:///cwd/../x`).
+    OffFile,
+    /// For every scheme, local paths included: for operations where a
+    /// rewritten path would act on the wrong objects.
+    Everywhere,
+}
+
+/// The most of an object path a converted store error keeps.
+const ERROR_PATH_CAP: usize = 1024;
+/// The most of a provider message a converted store error keeps.
+const ERROR_SOURCE_CAP: usize = 4096;
+
+/// Escaped provider text standing in for a store error's source.
+#[derive(Debug)]
+struct EscapedText(String);
+
+impl std::fmt::Display for EscapedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EscapedText {}
+
+type BoxedSource = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Rebuilds a store error with control and bidi characters escaped and its
+/// text capped. `object_store` copies provider text (error bodies, listed
+/// keys, hrefs) into its messages verbatim; anyone able to write a key could
+/// otherwise forge log lines or drive the terminal of whoever reads them.
+impl From<object_store::Error> for Error {
+    fn from(e: object_store::Error) -> Self {
+        use object_store::Error as E;
+        let source = |s: BoxedSource| -> BoxedSource {
+            Box::new(EscapedText(text::escape(&s.to_string(), ERROR_SOURCE_CAP)))
+        };
+        let path = |p: String| text::escape(&p, ERROR_PATH_CAP);
+        Self::ObjectStore(match e {
+            E::NotFound { path: p, source: s } => E::NotFound {
+                path: path(p),
+                source: source(s),
+            },
+            E::Precondition { path: p, source: s } => E::Precondition {
+                path: path(p),
+                source: source(s),
+            },
+            E::AlreadyExists { path: p, source: s } => E::AlreadyExists {
+                path: path(p),
+                source: source(s),
+            },
+            E::NotModified { path: p, source: s } => E::NotModified {
+                path: path(p),
+                source: source(s),
+            },
+            E::PermissionDenied { path: p, source: s } => E::PermissionDenied {
+                path: path(p),
+                source: source(s),
+            },
+            E::Unauthenticated { path: p, source: s } => E::Unauthenticated {
+                path: path(p),
+                source: source(s),
+            },
+            E::Generic { store, source: s } => E::Generic {
+                store,
+                source: source(s),
+            },
+            e @ (E::NotImplemented { .. } | E::JoinError { .. }) => e,
+            other => {
+                let store = match &other {
+                    E::UnknownConfigurationKey { store, .. } => store,
+                    _ => "object_store",
+                };
+                E::Generic {
+                    store,
+                    source: Box::new(EscapedText(text::escape(
+                        &other.to_string(),
+                        ERROR_SOURCE_CAP,
+                    ))),
+                }
+            }
+        })
+    }
+}
+
+/// Refuses a pre-signed URL lifetime outside 1 second to 7 days, for every
+/// scheme. It runs before any URL is parsed or backend built, so it needs no
+/// configuration, and no caller value reaches Azure's overflowing `chrono` add.
+fn check_presign_expiry(expires_in: Duration) -> Result<()> {
+    if (Duration::from_secs(1)..=MAX_PRESIGN_EXPIRY).contains(&expires_in) {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(
+        "pre-signed URL expiry must be between 1 second and 7 days (604800 s)".into(),
+    ))
+}
+
+/// Rejects input the `url` crate would silently rewrite, before any backend is
+/// built or request sent: tabs, newlines and surrounding whitespace, a query or
+/// fragment (they would be cut off the key), user names and passwords, a `.` or
+/// `..` segment in any spelling (`%2e%2E`) where `dots` says so, and, if
+/// `needs_object`, a URL that names no object (a bucket only, or a path ending
+/// in `/`). The checks run
+/// on the raw string; the messages never quote it, as it may carry tokens.
+fn check_input(raw: &str, url: &Url, dots: Dots, needs_object: bool) -> Result<()> {
+    let is_url = raw.contains("://");
+    // The URL parser drops tabs and newlines anywhere, and the C0 controls
+    // and spaces around the input.
+    if is_url
+        && (raw.contains(['\t', '\n', '\r'])
+            || raw.starts_with(|c: char| c <= ' ')
+            || raw.ends_with(|c: char| c <= ' '))
+    {
+        return Err(Error::InvalidInput(
+            "URLs must not contain tabs, newlines or surrounding whitespace".into(),
+        ));
+    }
+    // Local paths never have either: `Url::from_file_path` escapes `?` and `#`.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(Error::InvalidInput(
+            "URLs must not contain a query or fragment".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::InvalidInput(
+            "user names and passwords in URLs are not supported; configure credentials \
+             through the provider's environment variables"
+                .into(),
+        ));
+    }
+    if matches!(dots, Dots::Everywhere) || url.scheme() != "file" {
+        check_dot_segments(raw)?;
+    }
+    // A trailing `/` would be dropped from the object path, so the operation
+    // would address a different object than the one typed.
+    if needs_object && (url.path().ends_with('/') || object_path(url)?.as_ref().is_empty()) {
+        return Err(Error::InvalidInput(format!(
+            "{} names a bucket or a prefix, not an object",
+            crate::codec::redacted(url)
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a `.` or `..` path segment in `raw`, also percent-encoded, and a
+/// `.` or `..` bucket or host. `raw` is a URL if it has a scheme separator and
+/// a local path otherwise.
+fn check_dot_segments(raw: &str) -> Result<()> {
+    let decode = |s: &str| {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    let is_dot = |segment: &str| matches!(decode(segment).as_str(), "." | "..");
     let path = if let Some((_, rest)) = raw.split_once("://") {
-        if rest.contains(['?', '#']) {
-            return Err(Error::InvalidInput(
-                "Pre-signed URL input must not contain a query or fragment".into(),
-            ));
-        }
         // The authority ends at the first `/`. It is the bucket or container
         // for s3/gs/az, and the signed URL is re-parsed with `{bucket}/{key}`,
         // so a `.`/`..` bucket would move the request to another bucket.
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        let host = percent_encoding::percent_decode_str(authority).decode_utf8_lossy();
-        if host == "." || host == ".." || host.contains(['/', '\\']) {
+        if is_dot(authority) || decode(authority).contains('\\') {
             return Err(Error::InvalidInput(
-                "Pre-signed URL input must not have a '.' or '..' bucket or host".into(),
+                "URLs must not have a '.' or '..' bucket or host".into(),
             ));
         }
         path
     } else {
-        // A local path: `?` and `#` are ordinary file name characters.
-        raw.as_str()
+        raw
     };
     // A backslash separates segments for the special schemes (http, https).
-    let has_dot_segment = path.split(['/', '\\']).any(|segment| {
-        let decoded = percent_encoding::percent_decode_str(segment).decode_utf8_lossy();
-        decoded == "." || decoded == ".."
-    });
-    if has_dot_segment {
+    if path.split(['/', '\\']).any(is_dot) {
         return Err(Error::InvalidInput(
-            "Pre-signed URL input must not contain a '.' or '..' path segment".into(),
+            "URLs must not contain a '.' or '..' path segment".into(),
         ));
     }
     Ok(())
 }
 
-/// Rejects an empty object path: signing it would sign the bucket root
-/// (list, create or delete the bucket) instead of an object.
-fn check_presign_path(path: &ObjectPath) -> Result<()> {
-    if path.as_ref().is_empty() {
-        return Err(Error::InvalidInput(
-            "Pre-signed URL input must name an object, not a bucket".into(),
-        ));
+/// The name of `location` relative to `prefix`, or `None` when it is not
+/// strictly below it: the prefix's own marker (`p/` is the path `p`), a key
+/// `/` at the bucket root, or an entry outside the prefix.
+fn relative_name(location: &ObjectPath, prefix: &ObjectPath) -> Option<String> {
+    let parts: Vec<String> = location
+        .prefix_match(prefix)?
+        .map(|part| part.as_ref().to_owned())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Maps a metadata listing to the names strictly below `prefix` and the
+/// listed sizes.
+fn relative_listing(
+    listing: BoxStream<'static, object_store::Result<object_store::ObjectMeta>>,
+    prefix: ObjectPath,
+) -> BoxStream<'static, Result<(String, u64)>> {
+    listing
+        .try_filter_map(move |meta| {
+            std::future::ready(Ok(
+                relative_name(&meta.location, &prefix).map(|name| (name, meta.size))
+            ))
+        })
+        .map_err(Error::from)
+        .boxed()
+}
+
+/// Deletes the keys strictly below `prefix`. A key already gone counts as
+/// deleted; any other error stops the run.
+async fn delete_listed(store: &dyn ObjectStore, prefix: ObjectPath) -> Result<()> {
+    let owned = prefix.clone();
+    let paths = store
+        .list(Some(&prefix))
+        .try_filter(move |meta| std::future::ready(relative_name(&meta.location, &owned).is_some()))
+        .map_ok(|meta| meta.location);
+    let mut deleted = store.delete_stream(paths.boxed());
+    while let Some(result) = deleted.next().await {
+        match result {
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> ObjectStorageClient {
+        ObjectStorageClient::with_vars(std::collections::HashMap::new())
+    }
+
+    #[test]
+    fn an_empty_profile_name_is_refused() {
+        for bad in ["", "  ", "\t"] {
+            let err = client().with_s3_profile(bad).err();
+            assert!(
+                matches!(&err, Some(Error::InvalidInput(m)) if m.contains("profile name is empty")),
+                "{bad:?}: {err:?}"
+            );
+        }
+        client().with_s3_profile("dev").expect("a named profile");
+    }
+
+    #[test]
+    fn delete_prefix_guard_refuses_empty_and_root_inputs() {
+        let client = client();
+        for bad in ["", "  ", "\t\n", "file:///", "file://localhost/", "/"] {
+            let err = client.resolve_delete_prefix(bad).err();
+            assert!(
+                matches!(err, Some(Error::InvalidInput(_))),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_prefix_guard_refuses_drive_roots() {
+        for bad in [r"C:\", "file:///C:/", "file:///x"] {
+            let err = client().resolve_delete_prefix(bad).err();
+            assert!(
+                matches!(err, Some(Error::InvalidInput(_))),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_prefix_guard_accepts_a_directory_below_the_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = url::Url::from_file_path(dir.path().join("p")).expect("file URL");
+        let r = client()
+            .resolve_delete_prefix(url.as_str())
+            .expect("accepted");
+        assert!(r.loc.path.as_ref().ends_with('p'), "{:?}", r.loc.path);
+    }
+
+    #[test]
+    fn delete_prefix_guard_accepts_a_bucket_url() {
+        let vars =
+            std::collections::HashMap::from([("AWS_REGION".to_owned(), "eu-west-1".to_owned())]);
+        let client = ObjectStorageClient::with_vars(vars);
+        for url in ["s3://b", "s3://b/"] {
+            let r = client.resolve_delete_prefix(url).expect(url);
+            assert!(r.loc.path.as_ref().is_empty(), "{url}");
+        }
+    }
+
+    /// A listing entry whose size is the length of its key.
+    fn meta(key: &str) -> object_store::ObjectMeta {
+        object_store::ObjectMeta {
+            location: ObjectPath::from(key),
+            last_modified: chrono::DateTime::UNIX_EPOCH,
+            size: key.len() as u64,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    /// A store whose listing is fixed and whose deletes are recorded.
+    #[derive(Debug)]
+    struct ListingStore {
+        keys: Vec<&'static str>,
+        missing: Option<&'static str>,
+        broken: Option<&'static str>,
+        requested: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ListingStore {
+        fn new(missing: Option<&'static str>, broken: Option<&'static str>) -> Self {
+            Self {
+                keys: vec!["p", "p/a", "p/b", "q/x"],
+                missing,
+                broken,
+                requested: Arc::default(),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ListingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ListingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ListingStore {
+        async fn put_opts(
+            &self,
+            _: &ObjectPath,
+            _: object_store::PutPayload,
+            _: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _: &ObjectPath,
+            _: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            unimplemented!()
+        }
+
+        async fn get_opts(
+            &self,
+            _: &ObjectPath,
+            _: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            unimplemented!()
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            let (missing, broken) = (self.missing, self.broken);
+            let requested = Arc::clone(&self.requested);
+            locations
+                .map(move |location| {
+                    let location = location?;
+                    requested
+                        .lock()
+                        .expect("lock")
+                        .push(location.as_ref().to_owned());
+                    if Some(location.as_ref()) == missing {
+                        return Err(object_store::Error::NotFound {
+                            path: location.to_string(),
+                            source: "gone".into(),
+                        });
+                    }
+                    if Some(location.as_ref()) == broken {
+                        return Err(object_store::Error::Generic {
+                            store: "fake",
+                            source: "boom".into(),
+                        });
+                    }
+                    Ok(location)
+                })
+                .boxed()
+        }
+
+        fn list(
+            &self,
+            _: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            let metas: Vec<_> = self.keys.iter().map(|k| Ok(meta(k))).collect();
+            futures::stream::iter(metas).boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            _: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            unimplemented!()
+        }
+
+        async fn copy_opts(
+            &self,
+            _: &ObjectPath,
+            _: &ObjectPath,
+            _: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn relative_names() {
+        let table = [
+            ("p", "p", None),
+            ("p/a", "p", Some("a")),
+            ("p/a/b", "p", Some("a/b")),
+            ("q/a", "p", None),
+            ("pq", "p", None),
+            ("a", "", Some("a")),
+            ("", "", None),
+        ];
+        for (location, prefix, want) in table {
+            let got = relative_name(&ObjectPath::from(location), &ObjectPath::from(prefix));
+            assert_eq!(got.as_deref(), want, "{location:?} under {prefix:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_listed_skips_the_marker_alias_and_tolerates_vanished_keys() {
+        let store = ListingStore::new(Some("p/b"), None);
+        delete_listed(&store, ObjectPath::from("p"))
+            .await
+            .expect("ok");
+        assert_eq!(*store.requested.lock().expect("lock"), ["p/a", "p/b"]);
+
+        let store = ListingStore::new(None, Some("p/a"));
+        let err = delete_listed(&store, ObjectPath::from("p")).await.err();
+        assert!(matches!(err, Some(Error::ObjectStore(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn listed_names_are_relative_and_inside_the_prefix() {
+        let store = ListingStore::new(None, None);
+        let prefix = ObjectPath::from("p");
+        let names: Vec<_> = relative_listing(store.list(Some(&prefix)), prefix)
+            .try_collect()
+            .await
+            .expect("names");
+        // The sizes are the listed ones: the length of the whole key.
+        assert_eq!(names, [("a".to_owned(), 3), ("b".to_owned(), 3)]);
+    }
+
+    fn hostile_source() -> String {
+        "line\n\x1b[2J\x07\u{202E}".repeat(20_000)
+    }
+
+    #[test]
+    fn store_errors_are_escaped_and_capped() {
+        use object_store::Error as E;
+        let path = || "p\n\x1b[2Jq".to_owned();
+        let source = || -> Box<dyn std::error::Error + Send + Sync> { hostile_source().into() };
+        let cases = [
+            E::NotFound {
+                path: path(),
+                source: source(),
+            },
+            E::Precondition {
+                path: path(),
+                source: source(),
+            },
+            E::AlreadyExists {
+                path: path(),
+                source: source(),
+            },
+            E::NotModified {
+                path: path(),
+                source: source(),
+            },
+            E::PermissionDenied {
+                path: path(),
+                source: source(),
+            },
+            E::Unauthenticated {
+                path: path(),
+                source: source(),
+            },
+            E::Generic {
+                store: "S3",
+                source: source(),
+            },
+        ];
+        for original in cases {
+            let name = std::mem::discriminant(&original);
+            let err = Error::from(original);
+            let Error::ObjectStore(inner) = &err else {
+                panic!("not a store error: {err:?}");
+            };
+            assert_eq!(std::mem::discriminant(inner), name, "{err:?}");
+            let (display, debug) = (err.to_string(), format!("{err:?}"));
+            assert!(display.len() < 6 * 1024, "{} bytes", display.len());
+            assert!(debug.len() < 12 * 1024, "{} bytes", debug.len());
+            for text in [&display, &debug] {
+                assert!(!text.chars().any(crate::text::is_unsafe_char), "{text}");
+            }
+        }
+
+        let err = Error::from(E::NotFound {
+            path: "k".into(),
+            source: "short and clean".into(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "Object store error: Object at location k not found: short and clean"
+        );
+    }
+
+    #[test]
+    fn listing_errors_quote_keys_escaped() {
+        let source = ObjectPath::parse("a\n\x1b[2Jb").expect_err("invalid key");
+        let err = Error::from(object_store::Error::InvalidPath { source });
+        let text = err.to_string();
+        assert!(text.contains("\\u{a}\\u{1b}[2J"), "{text}");
+        assert!(!text.chars().any(crate::text::is_unsafe_char), "{text}");
+    }
 }

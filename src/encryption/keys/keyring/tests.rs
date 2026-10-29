@@ -431,6 +431,67 @@ fn new_rotate_and_retire_round_trip() {
     ));
 }
 
+#[tokio::test]
+async fn add_then_activate_is_safe_to_roll_out() {
+    let today = day(2026, 10, 28);
+    let added = add_key(&sample(), "kek", today).expect("add");
+    let before = Keyring::parse(&sample()).expect("parse").status();
+    let after_add = Keyring::parse(&added).expect("parse").status();
+    assert_eq!(after_add.active, before.active);
+    assert_eq!(after_add.keys.len(), before.keys.len() + 1);
+    let new = after_add.keys.last().expect("new key").id.clone();
+
+    let activated = activate_key(&added, &new).expect("activate");
+    assert_eq!(
+        Keyring::parse(&activated).expect("parse").status().active,
+        new
+    );
+
+    // A reader that still has the `added` text opens what a writer with the
+    // `activated` text wrapped.
+    let writer = Keyring::parse(&activated).expect("writer");
+    let reader = Keyring::parse(&added).expect("reader");
+    let edks = writer.wrap(&dek(), &ctx()).await.expect("wrap");
+    let wrapped = reader.unwrap(&edks, &ctx()).await.expect("unwrap");
+    assert_eq!(wrapped.as_bytes(), dek().as_bytes());
+}
+
+#[test]
+fn activate_refuses_an_unknown_id_and_keeps_an_active_one() {
+    assert!(matches!(
+        activate_key(&sample(), "nope").expect_err("unknown"),
+        KeyError::UnknownId { id } if id == "nope"
+    ));
+    assert_eq!(
+        *activate_key(&sample(), &new_id()).expect("active"),
+        sample()
+    );
+}
+
+#[test]
+fn add_key_stops_at_256_keys() {
+    let keys: Vec<Entry> = (0..256u32)
+        .map(|i| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            Entry {
+                id: id_for(&format!("k{i}"), &bytes),
+                created: day(2026, 1, 1),
+                material: Box::new(Zeroizing::new(bytes)),
+            }
+        })
+        .collect();
+    let full = serialize(&Document {
+        active: keys[0].id.clone(),
+        keys,
+    })
+    .expect("text");
+    assert!(matches!(
+        add_key(&full, "kek", day(2026, 10, 28)).expect_err("full"),
+        KeyError::TooManyKeys { max: 256 }
+    ));
+}
+
 #[test]
 fn operations_normalize_and_validate() {
     let messy = format!("\u{feff}{}", sample().replace('\n', "\r\n"));
@@ -500,7 +561,7 @@ mod unix {
     }
 
     #[test]
-    fn access_for_others_is_refused_group_read_is_not() {
+    fn group_write_and_access_for_others_are_refused() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("keyring");
         write_private(&path, &sample());
@@ -511,7 +572,8 @@ mod unix {
             (0o604, false),
             (0o601, false),
             (0o644, false),
-            (0o660, true),
+            (0o660, false),
+            (0o620, false),
         ] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
             let res = Keyring::from_file(&path);
@@ -539,20 +601,47 @@ mod unix {
             check_owner_and_mode(p, 0o606, 1000, 1000),
             Err(KeyError::Permissions { .. })
         ));
+        assert!(matches!(
+            check_owner_and_mode(p, 0o660, 1000, 1000),
+            Err(KeyError::Permissions { .. })
+        ));
+    }
+
+    #[test]
+    fn a_relative_path_is_stored_absolute() {
+        let dir = tempfile::tempdir().expect("dir");
+        let target = dir.path().join("keyring");
+        write_private(&target, &sample());
+        // From the current directory up to the root, then down to the file;
+        // no `chdir`.
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(target.strip_prefix("/").expect("absolute"));
+        assert!(relative.is_relative());
+
+        let ring = Keyring::from_file(&relative).expect("load");
+        let stored = &ring.source.as_ref().expect("file-backed").path;
+        assert!(stored.is_absolute(), "{stored:?}");
+        assert_eq!(stored, &std::path::absolute(&relative).expect("absolute"));
+        assert!(stored.ends_with("keyring"));
+        // An absolute input is unchanged.
+        let ring = Keyring::from_file(&target).expect("load");
+        assert_eq!(ring.source.as_ref().expect("file-backed").path, target);
     }
 
     #[test]
     fn a_fifo_in_place_of_the_file_does_not_hang() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("keyring");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )
-        .expect("mkfifo");
+        // The `mkfifo` command, not rustix: rustix's `mknodat` is compiled out on macOS.
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || tx.send(Keyring::from_file(path).err()).expect("send"));
         let err = rx
@@ -744,6 +833,23 @@ mod unix {
     }
 
     #[test]
+    fn status_reports_a_broken_file_without_a_wrap() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("keyring");
+        write_private(&path, &sample());
+        let ring = ring_at(&path);
+        assert_eq!(ring.status().last_reload_error, None);
+
+        // No explicit check, wrap or unwrap anywhere below.
+        replace(&path, "garbage\n");
+        let why = ring.status().last_reload_error.expect("broken file seen");
+        assert!(why.contains("line 1"), "{why}");
+
+        replace(&path, &sample());
+        assert_eq!(ring.status().last_reload_error, None);
+    }
+
+    #[test]
     fn a_file_that_disappears_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("keyring");
@@ -810,5 +916,44 @@ mod unix {
         );
         ring.check(Check::Due);
         assert_eq!(ring.wraps(), 0);
+    }
+
+    #[test]
+    fn build_reuses_a_key_only_for_the_same_material() {
+        let doc = |material: [u8; 32]| Document {
+            active: "k".to_owned(),
+            keys: vec![Entry {
+                id: "k".to_owned(),
+                created: NaiveDate::default(),
+                material: Box::new(Zeroizing::new(material)),
+            }],
+        };
+        let first = Snapshot::build(doc(OLD), None);
+        let same = Snapshot::build(doc(OLD), Some(&first));
+        assert!(Arc::ptr_eq(&first.keys["k"], &same.keys["k"]));
+        let other = Snapshot::build(doc(NEW), Some(&first));
+        assert!(!Arc::ptr_eq(&first.keys["k"], &other.keys["k"]));
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_only_changes_created_keeps_the_wrap_count() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("keyring");
+        write_private(&path, &sample());
+        let ring = ring_at(&path);
+        ring.wrap(&dek(), &ctx()).await.expect("wrap");
+        assert_eq!(ring.wraps(), 1);
+
+        replace(&path, &edited("created=2026-10-26", "created=2026-10-27"));
+        ring.check(Check::Due);
+        assert_eq!(ring.wraps(), 1);
+        let active = new_id();
+        let info = ring.status().keys;
+        let created = info
+            .iter()
+            .find(|k| k.id == active)
+            .expect("active")
+            .created;
+        assert_eq!(created, day(2026, 10, 27));
     }
 }

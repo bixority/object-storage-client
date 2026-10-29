@@ -166,7 +166,7 @@ struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
     const fn take(&mut self, n: usize) -> Result<&'a [u8], FormatError> {
         if self.0.len() < n {
-            return Err(FormatError::Truncated);
+            return Err(FormatError::Malformed("context field overruns the context"));
         }
         let (head, tail) = self.0.split_at(n);
         self.0 = tail;
@@ -317,10 +317,10 @@ mod tests {
             EncryptionContext::deserialize(&unsorted),
             Err(FormatError::Malformed(_))
         ));
-        // truncated pair
+        // a pair that overruns the region
         assert_eq!(
             EncryptionContext::deserialize(&[0, 1, 0, 5, b'a']),
-            Err(FormatError::Truncated)
+            Err(FormatError::Malformed("context field overruns the context"))
         );
         // trailing bytes
         assert!(matches!(
@@ -332,5 +332,50 @@ mod tests {
             EncryptionContext::deserialize(&[0, 1, 0, 1, 0xff, 0, 0]),
             Err(FormatError::Malformed(_))
         ));
+        // duplicate key: the last one must not win
+        let duplicate = [0, 2, 0, 1, b'a', 0, 0, 0, 1, b'a', 0, 1, b'x'];
+        assert!(matches!(
+            EncryptionContext::deserialize(&duplicate),
+            Err(FormatError::Malformed(_))
+        ));
+        // a count prefix with no pairs
+        assert!(matches!(
+            EncryptionContext::deserialize(&[0, 0]),
+            Err(FormatError::Malformed(_))
+        ));
+    }
+
+    /// The count prefix and the length-prefixed pairs, in the given order.
+    fn encode(pairs: &[(String, String)]) -> Vec<u8> {
+        let len = |s: &str| u16::try_from(s.len()).expect("short").to_be_bytes();
+        let mut out = u16::try_from(pairs.len())
+            .expect("few")
+            .to_be_bytes()
+            .to_vec();
+        for (k, v) in pairs {
+            out.extend_from_slice(&len(k));
+            out.extend_from_slice(k.as_bytes());
+            out.extend_from_slice(&len(v));
+            out.extend_from_slice(v.as_bytes());
+        }
+        out
+    }
+
+    proptest::proptest! {
+        /// The header tag covers the raw bytes while the unwrap AAD is the
+        /// re-serialised context, so parsing must accept exactly the canonical
+        /// encoding. The tiny alphabet makes duplicates and disorder common.
+        #[test]
+        fn deserialize_accepts_exactly_the_canonical_encoding(
+            pairs in proptest::collection::vec(("[ab]{0,2}", "[xy]{0,2}"), 1..5),
+        ) {
+            let bytes = encode(&pairs);
+            let strictly_increasing = pairs.windows(2).all(|w| w[0].0.as_bytes() < w[1].0.as_bytes());
+            let parsed = EncryptionContext::deserialize(&bytes);
+            proptest::prop_assert_eq!(parsed.is_ok(), strictly_increasing);
+            if let Ok(ctx) = parsed {
+                proptest::prop_assert_eq!(ctx.serialize().expect("serialize"), bytes);
+            }
+        }
     }
 }

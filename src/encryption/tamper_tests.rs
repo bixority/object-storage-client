@@ -6,7 +6,9 @@ use proptest::prelude::*;
 
 use super::context::{CallerContext, EncryptionContext};
 use super::fixtures::{dek, edk, encrypt, encrypt_with, plain, small_limits};
-use super::frame::{Decryptor, Encryptor, FrameLayout, Progress, drive, encrypt_full_final};
+use super::frame::{
+    Decryptor, Encryptor, FrameLayout, Progress, drive, drive_whole, encrypt_full_final,
+};
 use super::header::{DecodeLimits, FormatError};
 use super::suite::DecryptError;
 
@@ -40,6 +42,9 @@ fn assert_rejected(msg: &[u8], original: &[u8], limits: &DecodeLimits, what: &st
             original.starts_with(&out),
             "{what}: yielded unverified bytes (piece {piece})"
         );
+    }
+    for piece in [0, 1, 5] {
+        assert_same_outcome(msg, piece, 0x42, limits, what);
     }
 }
 
@@ -188,6 +193,9 @@ fn swapping_headers_between_two_messages_is_rejected() {
                 "swapped header accepted ({ka:#x},{ida},{kb:#x},{idb}, piece {piece})"
             );
             assert_eq!(out, Vec::<u8>::new(), "piece {piece}");
+            for p in [0, 1, 5] {
+                assert_same_outcome(&swapped, p, key, &small_limits(), "swapped header");
+            }
         }
     }
 }
@@ -233,7 +241,11 @@ fn header_field_tampering_is_rejected() {
             max_frame_length: u32::MAX,
             ..DecodeLimits::default()
         };
-        assert!(run(&m, 0, 0x42, relaxed).1.is_err());
+        let r = run(&m, 0, 0x42, relaxed).1;
+        assert!(
+            matches!(r, Err(DecryptError::HeaderAuth)),
+            "frame length {bad} with relaxed limits: {r:?}"
+        );
     }
 }
 
@@ -349,25 +361,31 @@ proptest! {
 
 /// Decrypts `msg` in whole-object mode, feeding `piece` bytes at a time.
 fn run_whole(msg: &[u8], piece: usize, limits: DecodeLimits) -> Result<Vec<u8>, DecryptError> {
-    let mut d = Decryptor::new(limits, None).whole_object();
-    for chunk in msg.chunks(piece.max(1)) {
-        if matches!(d.feed(Bytes::copy_from_slice(chunk))?, Progress::NeedKey) {
-            let _ = d.set_data_key(&dek(0x42))?;
-        }
-    }
-    Ok(d.finish_whole()?.to_vec())
+    run_whole_keyed(msg, piece, limits, 0x42)
+}
+
+fn run_whole_keyed(
+    msg: &[u8],
+    piece: usize,
+    limits: DecodeLimits,
+    key: u8,
+) -> Result<Vec<u8>, DecryptError> {
+    drive_whole(
+        Decryptor::new(limits, None),
+        msg,
+        || piece,
+        |d| d.set_data_key(&dek(key)),
+    )
+    .map(|b| b.to_vec())
 }
 
 /// The whole-object path must accept and reject exactly what the streaming
 /// one does, with the same error, and release the same plaintext.
 #[track_caller]
-fn assert_same_outcome(msg: &[u8], piece: usize, limits: &DecodeLimits, what: &str) {
-    let (out, streamed) = run(msg, piece, 0x42, limits.clone());
-    let whole = run_whole(
-        msg,
-        if piece == 0 { usize::MAX } else { piece },
-        limits.clone(),
-    );
+fn assert_same_outcome(msg: &[u8], piece: usize, key: u8, limits: &DecodeLimits, what: &str) {
+    let piece = if piece == 0 { usize::MAX } else { piece };
+    let (out, streamed) = run(msg, piece, key, limits.clone());
+    let whole = run_whole_keyed(msg, piece, limits.clone(), key);
     match (streamed, whole) {
         (Ok(()), Ok(got)) => assert_eq!(got, out, "{what}"),
         (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}"), "{what}"),
@@ -388,7 +406,7 @@ fn whole_object_decrypt_agrees_with_streaming_on_every_bit_flip() {
         data
     );
     for piece in [0, 1, 5] {
-        assert_same_outcome(&msg, piece, &limits, "clean");
+        assert_same_outcome(&msg, piece, 0x42, &limits, "clean");
         for at in 0..msg.len() {
             for bit in 0..8 {
                 let mut m = msg.clone();
@@ -396,6 +414,7 @@ fn whole_object_decrypt_agrees_with_streaming_on_every_bit_flip() {
                 assert_same_outcome(
                     &m,
                     piece,
+                    0x42,
                     &limits,
                     &format!("flip {at}/{bit} piece {piece}"),
                 );
@@ -414,7 +433,7 @@ fn whole_object_decrypt_rejects_every_truncation() {
             run_whole(&msg[..cut], usize::MAX, limits.clone()).is_err(),
             "cut at {cut} accepted"
         );
-        assert_same_outcome(&msg[..cut], 0, &limits, &format!("cut {cut}"));
+        assert_same_outcome(&msg[..cut], 0, 0x42, &limits, &format!("cut {cut}"));
     }
 }
 
@@ -457,4 +476,52 @@ fn whole_object_decrypt_handles_empty_and_exact_multiples() {
             "{n}"
         );
     }
+}
+
+/// The first error of a whole-object decryptor fed `msg` in `piece`-byte
+/// pieces, with the number of bytes fed when it arrived.
+fn first_whole_error(msg: &[u8], piece: usize) -> (DecryptError, usize) {
+    let mut d = Decryptor::new(small_limits(), None).whole_object();
+    let mut fed = 0;
+    for chunk in msg.chunks(piece) {
+        fed += chunk.len();
+        let step = d.feed(Bytes::copy_from_slice(chunk)).and_then(|p| {
+            if matches!(p, Progress::NeedKey) {
+                d.set_data_key(&dek(0x42))
+            } else {
+                Ok(p)
+            }
+        });
+        if let Err(e) = step {
+            return (e, fed);
+        }
+    }
+    panic!("the garbage was accepted");
+}
+
+#[test]
+fn whole_object_rejects_a_bad_frame_before_buffering_the_rest() {
+    let f = 64usize;
+    let (msg, hl) = encrypt(&plain(3 * f + 1, 0), f as u32);
+    let stride = f + TAG_AND_PREFIX;
+    // Genuine header, frame 1 with a flipped bit, then 1 MiB of garbage.
+    let mut m = msg[..hl + stride].to_vec();
+    m[hl + 20] ^= 1;
+    m.resize(m.len() + (1 << 20), 0xA5);
+    let (e, fed) = first_whole_error(&m, 1024);
+    assert!(matches!(e, DecryptError::FrameAuth { seq: 1 }), "{e:?}");
+    assert!(
+        fed <= hl + stride + 1024,
+        "{fed} bytes fed before the error"
+    );
+}
+
+#[test]
+fn whole_object_rejects_bytes_after_the_final_frame_at_once() {
+    let (msg, _) = encrypt(&plain(3 * 64 + 1, 0), 64);
+    let mut m = msg.clone();
+    m.resize(m.len() + (1 << 20), 0xA5);
+    let (e, fed) = first_whole_error(&m, 1024);
+    assert!(matches!(e, DecryptError::TrailingBytes), "{e:?}");
+    assert!(fed <= msg.len() + 1024, "{fed} bytes fed before the error");
 }

@@ -8,7 +8,11 @@ from datetime import datetime
 
 import pytest
 
-from object_storage_client import ByteStream, ObjectStorageClient
+from object_storage_client import (
+    ByteStream,
+    EncryptedObjectStorageClient,
+    ObjectStorageClient,
+)
 
 
 async def test_metadata_keys(plain, tmp_url):
@@ -22,9 +26,115 @@ async def test_metadata_keys(plain, tmp_url):
     datetime.fromisoformat(meta["last_modified"])
 
 
+def test_profile_argument_is_accepted():
+    ObjectStorageClient()
+    ObjectStorageClient(profile=None)
+    ObjectStorageClient(profile="x")
+    with pytest.raises(TypeError):
+        ObjectStorageClient(profile=1)
+
+
+@pytest.mark.parametrize("profile", ["", "  "])
+def test_an_empty_profile_name_is_a_value_error(profile):
+    with pytest.raises(ValueError, match="profile name is empty"):
+        ObjectStorageClient(profile=profile)
+
+
+async def test_profile_does_not_affect_file_urls(tmp_url):
+    client = ObjectStorageClient(profile="x")
+    await client.put_object(f"{tmp_url}/p.bin", b"abc")
+    assert await client.get_object(f"{tmp_url}/p.bin") == b"abc"
+
+
+async def test_put_object_refuses_a_url_ending_in_a_slash(plain, tmp_url):
+    # The slash used to be dropped, so this wrote an object called "dir".
+    with pytest.raises(ValueError):
+        await plain.put_object(f"{tmp_url}/dir/", b"x")
+
+
 async def test_presigned_url_unsupported_on_file(plain, tmp_url):
     with pytest.raises(RuntimeError, match="not supported"):
         await plain.get_pre_signed_url(f"{tmp_url}/a.bin")
+
+
+@pytest.mark.parametrize("expires_in_secs", [0, 604801, 10**13])
+@pytest.mark.parametrize("url", ["s3://b/k", "gs://b/k", "az://c/b"])
+async def test_presign_expiry_out_of_range_is_value_error(plain, url, expires_in_secs):
+    with pytest.raises(ValueError, match="7 days"):
+        await plain.get_pre_signed_url(url, expires_in_secs=expires_in_secs)
+    with pytest.raises(ValueError, match="7 days"):
+        await plain.get_pre_signed_urls([url], expires_in_secs=expires_in_secs)
+
+
+_ARGUMENT_ERRORS = {
+    "unknown-method": lambda c, u: c.get_pre_signed_url("s3://b/k", method="FETCH"),
+    "unsupported-scheme": lambda c, u: c.get_object("ftp://h/x"),
+    "invalid-url": lambda c, u: c.get_object("http://[::1/x"),
+    "no-urls": lambda c, u: c.get_pre_signed_urls([]),
+    "mixed-origins": lambda c, u: c.get_pre_signed_urls([f"{u}/a", "s3://b/k"]),
+    "negative-expiry": lambda c, u: c.get_pre_signed_url("s3://b/k", expires_in_secs=-1),
+    "huge-expiry": lambda c, u: c.get_pre_signed_url("s3://b/k", expires_in_secs=2**64),
+    "negative-content-length": lambda c, u: c.get_pre_signed_url(
+        "s3://b/k", content_length=-1
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_ARGUMENT_ERRORS))
+async def test_argument_errors_are_value_errors(plain, tmp_url, case):
+    with pytest.raises(ValueError):
+        await _ARGUMENT_ERRORS[case](plain, tmp_url)
+
+
+_FORBIDDEN_SCRIPT = """
+import asyncio, sys
+from object_storage_client import ObjectStorageClient
+
+url = f"http://127.0.0.1:{sys.argv[1]}/x"
+
+async def main():
+    client = ObjectStorageClient()
+    for call in (client.get_object, client.get_object_metadata):
+        try:
+            await call(url)
+        except PermissionError:
+            print("PermissionError")
+        except BaseException as e:
+            print(f"{type(e).__name__}: {e}")
+        else:
+            print("no error")
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_forbidden_is_permission_error(run_isolated, status):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _deny(self):
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_HEAD = _deny
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        proc = run_isolated(_FORBIDDEN_SCRIPT, str(server.server_address[1]), timeout=60)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["PermissionError", "PermissionError"], proc.stdout
 
 
 async def _collect(stream) -> list:
@@ -138,6 +248,9 @@ async def test_timeout_retry_with_loop_stall_loses_nothing(plain, tmp_url, metho
             break
         got += chunk
     await st
+    # The stall blocks the loop while the first read's fill is pending, so the
+    # first read must have timed out; without it this test proves nothing.
+    assert timeouts > 0
     assert got == data
 
 
@@ -311,6 +424,48 @@ def test_loop_closed_with_read_pending_then_drain_on_new_loop(tmp_path):
         loop2.close()
 
 
+def test_superseded_read_on_resumed_loop_raises_and_loses_nothing(tmp_path):
+    data = bytes(i % 251 for i in range(2_000_000))
+    url = (tmp_path / "big.bin").as_uri()
+    plain = ObjectStorageClient()
+    loop_a = asyncio.new_event_loop()
+    loop_b = asyncio.new_event_loop()
+    try:
+
+        async def setup():
+            await plain.put_object(url, data)
+            return await plain.get_object_stream(url)
+
+        stream = loop_a.run_until_complete(setup())
+        # A read waits in fill() on loop A, which then stops running.
+        stale = _start_pending_read(loop_a, stream)
+
+        # Loop B takes over and reads the first chunk.
+        first = loop_b.run_until_complete(stream.next())
+
+        async def park_a_chunk():
+            t = asyncio.ensure_future(stream.next())
+            await asyncio.sleep(0)  # awaiting fill()
+            time.sleep(0.3)  # the fill completes while the loop is blocked
+            t.cancel()  # the chunk stays parked for the next read
+            await asyncio.gather(t, return_exceptions=True)
+
+        loop_b.run_until_complete(park_a_chunk())
+
+        # Loop A runs again: the stale read must raise, not take the chunk.
+        (outcome,) = loop_a.run_until_complete(
+            asyncio.gather(stale, return_exceptions=True)
+        )
+        assert isinstance(outcome, RuntimeError)
+        assert "superseded" in str(outcome)
+
+        rest = loop_b.run_until_complete(_drain(stream))
+        assert first + rest == data
+    finally:
+        loop_a.close()
+        loop_b.close()
+
+
 class _FakeRaw:
     """Raw-stream stand-in: yields scripted items, then EOF."""
 
@@ -352,6 +507,14 @@ async def test_take_without_fill_is_runtime_error(plain, tmp_url):
     _, stream = await _big_stream(plain, tmp_url)
     with pytest.raises(RuntimeError, match="no item is ready"):
         stream._raw.take()
+
+
+async def _until(predicate, what):
+    """Poll until `predicate()` holds, failing after a 10 s deadline."""
+    deadline = time.monotonic() + 10
+    while not predicate():
+        assert time.monotonic() < deadline, what
+        await asyncio.sleep(0.01)
 
 
 def _live(*names):
@@ -486,7 +649,7 @@ async def test_put_object_stream_pipe_from_get_stream(plain, tmp_url):
     assert await plain.get_object(dst) == data
 
 
-async def test_put_object_stream_iterator_raises_no_object(plain, tmp_url):
+async def test_put_object_stream_iterator_raises_no_object(plain, tmp_url, tmp_path):
     async def gen():
         for _ in range(3):
             yield b"x" * 1024
@@ -496,6 +659,7 @@ async def test_put_object_stream_iterator_raises_no_object(plain, tmp_url):
     with pytest.raises(ValueError, match="boom"):
         await plain.put_object_stream(url, gen())
     assert not await plain.object_exists(url)
+    await _until(lambda: list(tmp_path.iterdir()) == [], "staging file left behind")
 
 
 async def test_put_object_stream_error_after_multipart_started_leaves_nothing(
@@ -508,8 +672,7 @@ async def test_put_object_stream_error_after_multipart_started_leaves_nothing(
 
     with pytest.raises(ValueError, match="late boom"):
         await plain.put_object_stream(f"{tmp_url}/m.bin", gen())
-    await asyncio.sleep(0.2)
-    assert list(tmp_path.iterdir()) == []
+    await _until(lambda: list(tmp_path.iterdir()) == [], "staging file left behind")
 
 
 @pytest.mark.parametrize("size", [0, 1])
@@ -564,43 +727,53 @@ async def test_put_object_stream_wrong_chunk_type(plain, tmp_url, bad):
     assert not await plain.object_exists(url)
 
 
-async def test_put_object_stream_no_prefetch_beyond_batch(plain, tmp_url):
-    # Read-ahead is bounded by the batch size (256 KiB): chunks that fill a
-    # batch on their own are requested only after the previous one is consumed.
-    size = 300 * 1024
-
-    class Chunk(bytearray):
-        """Weak-referenceable chunk: dies once the uploader has consumed it."""
-
-    events = []
+async def _refcount_gaps(plain, url, size, count):
+    """Upload `count` chunks of `size` bytes; return the stored size and, for
+    every request after the first, how much more the source's previous chunk
+    is referenced than an identical chunk that never left this function."""
+    held = []  # the chunks handed to the uploader
+    control = []  # same-size chunks that nothing else ever sees
+    gaps = []
 
     class Source:
-        def __init__(self):
-            self.n = 0
-            self.last = None
-
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            events.append("request")
-            # The previous chunk must already be consumed and released.
-            assert self.last is None or self.last() is None, "read-ahead"
-            await asyncio.sleep(0.005)
-            if self.n == 6:
+            if held:
+                # Same access form for both, so the counts are comparable.
+                gaps.append(sys.getrefcount(held[-1]) - sys.getrefcount(control[-1]))
+            await asyncio.sleep(0)
+            if len(held) == count:
                 raise StopAsyncIteration
-            self.n += 1
-            chunk = Chunk(b"x" * size)
-            self.last = weakref.ref(chunk)
-            events.append("deliver")
-            return chunk
+            # A runtime size, so these are fresh objects, never constants.
+            held.append(b"x" * size)
+            control.append(b"x" * size)
+            return held[-1]
 
-    src = Source()
-    url = f"{tmp_url}/p.bin"
-    await plain.put_object_stream(url, src)
-    assert src.n == 6
-    assert events == ["request", "deliver"] * 6 + ["request"]
-    assert (await plain.get_object_metadata(url))["size_bytes"] == 6 * size
+    await plain.put_object_stream(url, Source())
+    return (await plain.get_object_metadata(url))["size_bytes"], gaps
+
+
+async def test_put_object_stream_no_prefetch_beyond_batch(plain, tmp_url):
+    # Read-ahead is bounded by the batch size (256 KiB): chunks that fill a
+    # batch on their own are requested only after the previous one is consumed
+    # and released by the uploader.
+    size = 300 * 1024
+    stored, gaps = await _refcount_gaps(plain, f"{tmp_url}/p.bin", size, 6)
+    assert stored == 6 * size
+    assert len(gaps) == 6
+    assert gaps == [0] * 6, "a previous chunk is still held at the next request"
+
+
+async def test_put_object_stream_refcount_probe_detects_a_holder(plain, tmp_url):
+    # Negative control for the test above: with several chunks per batch the
+    # batch still holds the previous chunk at the next request, and the probe
+    # must see that.
+    size = 100 * 1024
+    stored, gaps = await _refcount_gaps(plain, f"{tmp_url}/q.bin", size, 12)
+    assert stored == 12 * size
+    assert max(gaps) > 0
 
 
 async def test_put_object_stream_reused_buffer_is_snapshotted(plain, tmp_url):
@@ -643,7 +816,7 @@ async def test_put_object_stream_error_after_batched_items_leaves_nothing(
     assert not await plain.object_exists(url)
 
 
-async def test_cancel_put_object_stream_leaves_no_object(plain, tmp_url):
+async def test_cancel_put_object_stream_leaves_no_object(plain, tmp_url, tmp_path):
     async def gen():
         while True:
             yield b"x" * (1024 * 1024)
@@ -651,11 +824,12 @@ async def test_cancel_put_object_stream_leaves_no_object(plain, tmp_url):
 
     url = f"{tmp_url}/c.bin"
     t = asyncio.ensure_future(plain.put_object_stream(url, gen()))
-    await asyncio.sleep(0.3)
+    # Cancel only once the upload has really started writing a staging file.
+    await _until(lambda: list(tmp_path.iterdir()) != [], "no staging file appeared")
     t.cancel()
     await asyncio.gather(t, return_exceptions=True)
-    await asyncio.sleep(0.2)
     assert not await plain.object_exists(url)
+    await _until(lambda: list(tmp_path.iterdir()) == [], "staging file left behind")
 
 
 async def test_put_object_stream_cancel_cancels_pending_anext(plain, tmp_url):
@@ -791,7 +965,12 @@ async def test_put_object_stream_size_hint_is_validated(any_client, tmp_url):
         await any_client.put_object_stream(url, gen(), size_hint="big")
     with pytest.raises(TypeError):
         await any_client.put_object_stream(url, gen(), size_hint=1.5)
-    # Keyword-only.
+    # Keyword-only: the encrypted client takes `context` before it, so give
+    # that a value and put the hint in the next positional slot.
+    if isinstance(any_client, EncryptedObjectStorageClient):
+        positional = (None, 3)
+    else:
+        positional = (3,)
     with pytest.raises(TypeError):
-        await any_client.put_object_stream(url, gen(), 3)
+        await any_client.put_object_stream(url, gen(), *positional)
     assert not await any_client.object_exists(url)

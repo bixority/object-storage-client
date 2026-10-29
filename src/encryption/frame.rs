@@ -14,7 +14,7 @@
 use aws_lc_rs::aead::{Aad, Nonce};
 use bytes::{Buf, Bytes, BytesMut};
 
-use super::context::EncryptionContext;
+use super::context::{CallerContext, EncryptionContext};
 use super::header::{
     DecodeLimits, EncryptedDataKey, FormatError, Header, HeaderCodec, HeaderParse,
 };
@@ -342,6 +342,8 @@ pub struct Decryptor {
     state: State,
     limits: DecodeLimits,
     expected_key: Option<String>,
+    /// Caller context entries the header must carry (a subset match).
+    required: CallerContext,
     buf: BytesMut,
     header: Option<Header>,
     /// Header bytes covered by the auth tag.
@@ -351,8 +353,9 @@ pub struct Decryptor {
     /// Buffer length below which re-parsing the incomplete header cannot
     /// progress (avoids quadratic work on tiny chunks).
     header_min_len: usize,
-    /// Whole-object mode: frames stay buffered until [`Self::finish_whole`].
-    whole: bool,
+    /// Whole-object mode: each frame is verified as it arrives, but the
+    /// plaintext stays in `buf` until [`Self::finish_whole`].
+    whole: Option<Cursor>,
     #[cfg(test)]
     header_parses: usize,
 }
@@ -366,24 +369,38 @@ impl Decryptor {
             state: State::Header,
             limits,
             expected_key,
+            required: CallerContext::new(),
             buf: BytesMut::new(),
             header: None,
             header_raw: Vec::new(),
             keys: None,
             next_seq: 1,
             header_min_len: 0,
-            whole: false,
+            whole: None,
             #[cfg(test)]
             header_parses: 0,
         }
     }
 
+    /// Requires every pair of `required` to be present, with an equal value,
+    /// in the header's context; extra stored pairs are allowed. Checked
+    /// together with `osc:key`, before any key is unwrapped, so a mismatch is
+    /// [`DecryptError::ContextMismatch`] naming only the key. Callers that
+    /// take a map from users validate it first (reserved keys).
+    #[must_use]
+    pub fn require_context(mut self, required: CallerContext) -> Self {
+        self.required = required;
+        self
+    }
+
     /// Switches to whole-object mode: after the header and key are accepted,
-    /// frames are only buffered (all of the ciphertext, so memory is the
-    /// object's size) and opened in place by [`Self::finish_whole`], which is
-    /// the only place plaintext is released.
+    /// every frame is opened in place as soon as it is complete, so damage or
+    /// extra bytes fail at once. The verified plaintext is compacted to the
+    /// front of the buffer (memory is the object's size, plus at most one
+    /// frame and the last fed chunk of unverified ciphertext) and released
+    /// only by [`Self::finish_whole`], after the final frame.
     pub(crate) const fn whole_object(mut self) -> Self {
-        self.whole = true;
+        self.whole = Some(Cursor { read: 0, write: 0 });
         self
     }
 
@@ -449,9 +466,6 @@ impl Decryptor {
         )?;
         self.keys = Some(keys);
         self.state = State::Frames;
-        if self.whole {
-            return Ok(Progress::NeedMore);
-        }
         self.drain_frames()
     }
 
@@ -512,9 +526,6 @@ impl Decryptor {
             State::AwaitKey => Err(DecryptError::KeyRequired),
             State::Frames => {
                 self.append(data);
-                if self.whole {
-                    return Ok(Progress::NeedMore);
-                }
                 self.drain_frames()
             }
             State::Done if data.is_empty() => Ok(Progress::NeedMore),
@@ -568,6 +579,11 @@ impl Decryptor {
                         });
                     }
                 }
+                for (key, value) in &self.required {
+                    if header.context.get(key) != Some(value.as_str()) {
+                        return Err(DecryptError::ContextMismatch { key: key.clone() });
+                    }
+                }
                 self.header_raw = self.buf[authenticated_bytes].to_vec();
                 self.buf.advance(header_len);
                 self.header = Some(header);
@@ -578,6 +594,9 @@ impl Decryptor {
     }
 
     fn drain_frames(&mut self) -> Result<Progress, DecryptError> {
+        if let Some(cursor) = self.whole {
+            return self.drain_whole(cursor);
+        }
         let mut out = Vec::new();
         while self.state == State::Frames {
             match self.next_frame()? {
@@ -627,52 +646,62 @@ impl Decryptor {
         Ok(())
     }
 
-    /// Ends a [`Self::whole_object`] decryptor: opens every buffered frame in
-    /// place, compacting the plaintext to the front of the buffer, and
-    /// returns it. Plaintext is released only once the final frame verified
-    /// and nothing follows it.
-    ///
-    /// # Errors
-    /// The errors of [`Self::feed`] and [`Self::finish`] for the same input.
-    pub(crate) fn finish_whole(mut self) -> Result<Bytes, DecryptError> {
-        if self.state != State::Frames {
-            return Err(self.finish().err().unwrap_or(DecryptError::InvalidState(
-                "a whole-object decryptor ended before its frames",
-            )));
-        }
-        let header = self.header.as_ref().ok_or(DecryptError::InvalidState(
-            "header missing while decoding frames",
-        ))?;
-        let keys = self.keys.as_ref().ok_or(DecryptError::InvalidState(
-            "data key missing while decoding frames",
-        ))?;
-        let mut buf = std::mem::take(&mut self.buf);
-        let (mut read, mut write) = (0, 0);
-        let mut next_seq = self.next_seq;
-        let mut done = false;
-        while !done {
-            let Some(o) = open_frame(keys, header, next_seq, &mut buf[read..])? else {
+    /// Whole-object counterpart of the streaming loop: opens every complete
+    /// frame at `cursor.read`, moves its plaintext to `cursor.write` and
+    /// yields nothing. `buf` is never shortened, so an empty `buf` means
+    /// nothing was read or written yet and [`Self::append`] may adopt a chunk.
+    fn drain_whole(&mut self, mut cursor: Cursor) -> Result<Progress, DecryptError> {
+        while self.state == State::Frames {
+            let header = self.header.as_ref().ok_or(DecryptError::InvalidState(
+                "header missing while decoding frames",
+            ))?;
+            let keys = self.keys.as_ref().ok_or(DecryptError::InvalidState(
+                "data key missing while decoding frames",
+            ))?;
+            let Some(o) = open_frame(keys, header, self.next_seq, &mut self.buf[cursor.read..])?
+            else {
                 break;
             };
-            let content = read + o.prefix..read + o.prefix + o.content_len;
-            buf.copy_within(content, write);
-            write += o.content_len;
-            read += o.total;
-            if o.is_final {
-                done = true;
-            } else {
-                next_seq = next_seq_after(&o)?;
-            }
+            let content = cursor.read + o.prefix..cursor.read + o.prefix + o.content_len;
+            self.buf.copy_within(content, cursor.write);
+            cursor.write += o.content_len;
+            cursor.read += o.total;
+            self.commit(&o)?;
         }
-        if !done {
-            return Err(DecryptError::MissingFinalFrame);
-        }
-        if read != buf.len() {
+        if self.state == State::Done && cursor.read != self.buf.len() {
             return Err(DecryptError::TrailingBytes);
         }
-        buf.truncate(write);
-        Ok(buf.freeze())
+        self.whole = Some(cursor);
+        Ok(Progress::NeedMore)
     }
+
+    /// Ends a [`Self::whole_object`] decryptor and returns the plaintext of
+    /// the frames verified so far. Plaintext is released only once the final
+    /// frame verified and nothing follows it.
+    ///
+    /// # Errors
+    /// The errors of [`Self::finish`] for the same input.
+    pub(crate) fn finish_whole(mut self) -> Result<Bytes, DecryptError> {
+        match (self.state, self.whole) {
+            (State::Done, Some(cursor)) => {
+                let mut buf = std::mem::take(&mut self.buf);
+                buf.truncate(cursor.write);
+                Ok(buf.freeze())
+            }
+            _ => Err(self.finish().err().unwrap_or(DecryptError::InvalidState(
+                "a whole-object decryptor ended before its frames",
+            ))),
+        }
+    }
+}
+
+/// Progress through the buffer of a whole-object decryptor.
+#[derive(Clone, Copy)]
+struct Cursor {
+    /// Offset of the first unverified byte.
+    read: usize,
+    /// Length of the verified plaintext compacted at the front.
+    write: usize,
 }
 
 /// A frame validated and opened in place by [`open_frame`].
@@ -820,6 +849,32 @@ pub fn drive(
     (out, d.finish())
 }
 
+/// Like [`drive`] for a whole-object decryptor (`d` is switched to that mode):
+/// feeds `msg` in `piece()`-sized pieces, calls `key` once the header is
+/// parsed, and returns the plaintext [`Decryptor::finish_whole`] releases.
+///
+/// # Errors
+/// The first error of a feed, of `key` or of `finish_whole`.
+#[cfg(any(test, feature = "fuzzing"))]
+pub fn drive_whole(
+    d: Decryptor,
+    msg: &[u8],
+    mut piece: impl FnMut() -> usize,
+    mut key: impl FnMut(&mut Decryptor) -> Result<Progress, DecryptError>,
+) -> Result<Bytes, DecryptError> {
+    let mut d = d.whole_object();
+    let mut rest = msg;
+    while !rest.is_empty() {
+        let (chunk, tail) = rest.split_at(piece().max(1).min(rest.len()));
+        rest = tail;
+        if matches!(d.feed(Bytes::copy_from_slice(chunk))?, Progress::NeedKey) {
+            // A whole-object decryptor yields no plaintext before the end.
+            let _ = key(&mut d)?;
+        }
+    }
+    d.finish_whole()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,6 +900,43 @@ mod tests {
         let piece = if piece == 0 { usize::MAX } else { piece };
         let (out, r) = drive(d, msg, || piece, |d| d.set_data_key(&dek(0x42)));
         r.map(|()| out)
+    }
+
+    /// Largest buffer capacity the decryptor held after any feed of `piece`
+    /// bytes, with the round-tripped plaintext.
+    fn peak_buffer(msg: &[u8], piece: usize) -> (usize, Vec<u8>) {
+        let mut d = Decryptor::new(DecodeLimits::default(), None);
+        let (mut peak, mut out) = (0, Vec::new());
+        for chunk in msg.chunks(piece) {
+            let mut step = d.feed(Bytes::copy_from_slice(chunk)).expect("feed");
+            if matches!(step, Progress::NeedKey) {
+                step = d.set_data_key(&dek(0x42)).expect("key");
+            }
+            take_plaintext(step, &mut out);
+            peak = peak.max(d.buf.capacity());
+        }
+        d.finish().expect("complete message");
+        (peak, out)
+    }
+
+    #[test]
+    fn small_feeds_keep_the_decryptor_buffer_bounded() {
+        let data = plain(8 * FU + 10, 0);
+        let (msg, _) = encrypt(&data, F);
+        assert!(msg.len() > 8 * FU, "a message of at least 5 frames");
+        for piece in [1024, 4096, 16 * 1024] {
+            let (peak, out) = peak_buffer(&msg, piece);
+            assert_eq!(out, data, "{piece}");
+            // Measured at about one frame for small pieces and the whole
+            // message for 16 KiB ones. The ceiling is two framed frames plus
+            // one piece, with 50% headroom; a buffer that grew with the
+            // number of feeds would exceed it for the small pieces.
+            let ceiling = (2 * (FU + 64) + piece) * 3 / 2;
+            assert!(
+                peak <= ceiling,
+                "pieces of {piece}: buffer capacity {peak} > {ceiling}"
+            );
+        }
     }
 
     fn sizes() -> Vec<usize> {
@@ -1018,6 +1110,11 @@ mod tests {
             decrypt(&msg[..hl - 1], 0, None),
             Err(DecryptError::Format(_))
         ));
+        // Ended inside the context region (version, suite, message ID, aad_len, then 3 bytes).
+        assert!(matches!(
+            decrypt(&msg[..40], 0, None),
+            Err(DecryptError::Format(FormatError::Truncated))
+        ));
     }
 
     #[test]
@@ -1050,6 +1147,47 @@ mod tests {
                 got: 2
             })
         ));
+    }
+
+    #[test]
+    fn required_context_is_a_subset_match_checked_before_any_key() {
+        let ctx = EncryptionContext::new_reserved(None)
+            .with_caller(&CallerContext::from([
+                ("region".to_owned(), "eu".to_owned()),
+                ("tenant".to_owned(), "acme".to_owned()),
+            ]))
+            .expect("context");
+        let (header, enc) =
+            Encryptor::new(&dek(0x42), [9; 32], ctx, vec![edk()], F).expect("encryptor");
+        let mut msg = BytesMut::from(&header[..]);
+        enc.finish(&mut msg);
+        let feed = |required: &[(&str, &str)]| {
+            let required = required
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            Decryptor::new(DecodeLimits::default(), None)
+                .require_context(required)
+                .feed(Bytes::copy_from_slice(&msg))
+        };
+        // Matching, a subset and nothing at all reach the key step.
+        for required in [
+            &[("region", "eu"), ("tenant", "acme")][..],
+            &[("region", "eu")],
+            &[],
+        ] {
+            assert!(matches!(feed(required), Ok(Progress::NeedKey)));
+        }
+        // A wrong value and a missing key fail at the header, naming the key.
+        for (required, key) in [
+            (&[("region", "us")][..], "region"),
+            (&[("zone", "a")], "zone"),
+        ] {
+            match feed(required) {
+                Err(DecryptError::ContextMismatch { key: k }) => assert_eq!(k, key),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 
     #[test]

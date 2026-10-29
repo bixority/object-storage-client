@@ -3,21 +3,31 @@
 //!
 //! The generic [`object_store::signer::Signer`] only signs the `host` header,
 //! so it cannot enforce the size or content type of an upload. This module
-//! re-implements the `SigV4` query-signing algorithm (mirroring the one inside
-//! `object_store`'s AWS backend) but additionally signs the headers a caller
-//! wants the client to be forced to send. A client using such a URL MUST send
+//! signs the `SigV4` query with `aws-sigv4` and additionally signs the headers
+//! a caller wants the client to be forced to send. A client using such a URL MUST send
 //! exactly those header values, otherwise S3 / `SeaweedFS` reject the request
 //! with a 403 signature mismatch — pushing size/type enforcement down to the
 //! object store.
 
 use crate::client::{Error, Result};
-use aws_lc_rs::{digest, hmac};
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    PercentEncodingMode, SignableBody, SignableRequest, SignatureLocation, SigningSettings,
+    UriPathNormalizationMode, sign,
+};
+use aws_sigv4::sign::v4;
 use chrono::{DateTime, Utc};
 use http::Method;
 use object_store::aws::AwsCredential;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::time::Duration;
 use url::Url;
+
+/// The longest validity of a pre-signed URL, for every scheme.
+///
+/// 7 days is the `SigV4` and GCS V4 maximum and the longest Azure
+/// user-delegation SAS. It also keeps Azure's `chrono` arithmetic
+/// (`now + expires_in`) in range.
+pub const MAX_PRESIGN_EXPIRY: Duration = Duration::from_hours(7 * 24);
 
 /// HTTP method a pre-signed URL authorizes.
 ///
@@ -60,7 +70,9 @@ impl std::str::FromStr for SignMethod {
             "POST" => Ok(Self::Post),
             "DELETE" => Ok(Self::Delete),
             "HEAD" => Ok(Self::Head),
-            other => Err(Error::Generic(format!("Invalid HTTP method: {other}"))),
+            _ => Err(Error::InvalidInput(format!(
+                "unknown HTTP method {s}; expected GET, PUT, POST, DELETE or HEAD"
+            ))),
         }
     }
 }
@@ -92,68 +104,11 @@ impl SignOptions {
 /// a backend other than S3, which is the only one this client can re-sign with
 /// extra headers.
 pub(crate) fn content_binding_unsupported() -> Error {
-    Error::Generic(
+    Error::InvalidInput(
         "binding Content-Length/Content-Type into a pre-signed URL is only supported for S3 \
          (s3://) backends"
             .into(),
     )
-}
-
-const ALGORITHM: &str = "AWS4-HMAC-SHA256";
-const SERVICE: &str = "s3";
-/// The payload is supplied directly by the client, so it is never signed.
-const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
-
-/// Characters that do *not* need to be percent-encoded in the AWS canonical
-/// form. Matches `object_store`'s `STRICT_ENCODE_SET`.
-const STRICT_ENCODE_SET: AsciiSet = NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
-
-fn hmac_sha256(secret: impl AsRef<[u8]>, bytes: impl AsRef<[u8]>) -> hmac::Tag {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_ref());
-    hmac::sign(&key, bytes.as_ref())
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    crate::hex::encode(digest::digest(&digest::SHA256, bytes).as_ref())
-}
-
-/// Collapse leading/trailing and repeated internal whitespace, matching the
-/// header value normalization S3 performs when validating a signature.
-fn normalize_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Derive the `SigV4` signing key and sign `to_sign`.
-///
-/// <https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html>
-fn sign_string(cred: &AwsCredential, to_sign: &str, date_stamp: &str, region: &str) -> String {
-    let date_hmac = hmac_sha256(format!("AWS4{}", cred.secret_key), date_stamp);
-    let region_hmac = hmac_sha256(date_hmac.as_ref(), region);
-    let service_hmac = hmac_sha256(region_hmac.as_ref(), SERVICE);
-    let signing_hmac = hmac_sha256(service_hmac.as_ref(), b"aws4_request");
-    crate::hex::encode(hmac_sha256(signing_hmac.as_ref(), to_sign).as_ref())
-}
-
-/// Canonicalize the query parameters of `url` into AWS canonical form: sorted
-/// by key, strictly percent-encoded. Mirrors `object_store`'s implementation.
-fn canonicalize_query(url: &Url) -> String {
-    let mut pairs = url.query_pairs().collect::<Vec<_>>();
-    pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-    pairs
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "{}={}",
-                utf8_percent_encode(key, &STRICT_ENCODE_SET),
-                utf8_percent_encode(value, &STRICT_ENCODE_SET)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 /// Generate a `SigV4` pre-signed URL for `base`
@@ -165,6 +120,11 @@ fn canonicalize_query(url: &Url) -> String {
 /// `base` is expected to already encode the correct host and path style
 /// (path-style vs virtual-hosted), which is why callers derive it from
 /// `object_store`'s own signer rather than reconstructing it here.
+///
+/// # Panics
+///
+/// If a header value of `options` is not valid in an HTTP header (the client
+/// checks this first and returns an error).
 #[must_use]
 pub fn presign_s3(
     base: &Url,
@@ -179,6 +139,10 @@ pub fn presign_s3(
 
 /// As [`presign_s3`], but with an explicit signing timestamp (for testing
 /// against fixed `SigV4` vectors).
+///
+/// # Panics
+///
+/// As [`presign_s3`].
 #[doc(hidden)]
 #[must_use]
 pub fn presign_s3_at(
@@ -190,70 +154,54 @@ pub fn presign_s3_at(
     options: &SignOptions,
     date: DateTime<Utc>,
 ) -> Url {
-    let date_stamp = date.format("%Y%m%d").to_string();
-    let amz_date = date.format("%Y%m%dT%H%M%SZ").to_string();
-    let scope = format!("{date_stamp}/{region}/{SERVICE}/aws4_request");
+    let identity = Credentials::new(
+        &cred.key_id,
+        &cred.secret_key,
+        cred.token.clone(),
+        None,
+        "object-storage-client",
+    )
+    .into();
+    let mut settings = SigningSettings::default();
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(expires_in);
+    // S3 encodes the path once and rejects a normalised one.
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    let params = v4::SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name("s3")
+        .time(date.into())
+        .settings(settings)
+        .build()
+        .expect("every signing parameter is set")
+        .into();
 
-    // Headers to sign, sorted by (lower-case) name as required by SigV4.
-    let host = base[url::Position::BeforeHost..url::Position::AfterPort].to_string();
-    let mut headers: Vec<(&str, String)> = Vec::with_capacity(3);
-    if let Some(len) = options.content_length {
-        headers.push(("content-length", len.to_string()));
-    }
-    if let Some(content_type) = &options.content_type {
-        headers.push(("content-type", normalize_whitespace(content_type)));
-    }
-    headers.push(("host", host));
-    headers.sort_by_key(|(name, _)| *name);
-
-    let signed_headers = headers
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(";");
+    // The host is added by the signer from the URL.
+    let length = options.content_length.map(|len| len.to_string());
+    let headers = length
+        .as_deref()
+        .map(|len| ("content-length", len))
+        .into_iter()
+        .chain(
+            options
+                .content_type
+                .as_deref()
+                .map(|ty| ("content-type", ty)),
+        );
+    let request = SignableRequest::new(
+        method.as_str(),
+        base.as_str(),
+        headers,
+        SignableBody::UnsignedPayload,
+    )
+    .expect("a parsed URL is a valid URI");
+    let (instructions, _) = sign(request, &params)
+        .expect("the headers are valid and the credential is set")
+        .into_parts();
 
     let mut url = base.clone();
-    {
-        let mut query = url.query_pairs_mut();
-        query
-            .append_pair("X-Amz-Algorithm", ALGORITHM)
-            .append_pair("X-Amz-Credential", &format!("{}/{scope}", cred.key_id))
-            .append_pair("X-Amz-Date", &amz_date)
-            .append_pair("X-Amz-Expires", &expires_in.as_secs().to_string())
-            .append_pair("X-Amz-SignedHeaders", &signed_headers);
-
-        if let Some(token) = &cred.token {
-            query.append_pair("X-Amz-Security-Token", token);
-        }
-    }
-
-    let canonical_query = canonicalize_query(&url);
-
-    let canonical_headers = headers
-        .iter()
-        .map(|(name, value)| format!("{name}:{value}\n"))
-        .collect::<Vec<_>>()
-        .concat();
-
-    // For S3 the path is encoded only once, so it is used verbatim.
-    let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        method.as_str(),
-        url.path(),
-        canonical_query,
-        canonical_headers,
-        signed_headers,
-        UNSIGNED_PAYLOAD,
-    );
-
-    let string_to_sign = format!(
-        "{ALGORITHM}\n{amz_date}\n{scope}\n{}",
-        hex_digest(canonical_request.as_bytes()),
-    );
-
-    let signature = sign_string(cred, &string_to_sign, &date_stamp, region);
-    url.query_pairs_mut()
-        .append_pair("X-Amz-Signature", &signature);
-
+    url.query_pairs_mut().extend_pairs(instructions.params());
     url
 }

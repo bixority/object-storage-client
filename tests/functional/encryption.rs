@@ -299,9 +299,9 @@ async fn views_share_one_registry() -> Result<()> {
     let secure = plain.with_encryption(config_in());
     let url = ObjectStorageClient::parse_url(&url_of(&dir, "a"))?;
 
-    let (a, _) = plain.get_backend(&url)?;
-    let (b, _) = secure.get_backend(&url)?;
-    let (c, _) = secure.without_encryption().get_backend(&url)?;
+    let (a, _) = plain.get_store(&url)?;
+    let (b, _) = secure.get_store(&url)?;
+    let (c, _) = secure.without_encryption().get_store(&url)?;
     assert!(Arc::ptr_eq(&a, &b));
     assert!(Arc::ptr_eq(&a, &c));
     Ok(())
@@ -726,8 +726,8 @@ async fn mixed_views_concurrent_one_backend() -> Result<()> {
     // Separate registries would each hold their own backend instance.
     let root = url::Url::parse(&url_of(&dir, "obj0")).expect("url");
     assert!(Arc::ptr_eq(
-        &plain.get_backend(&root)?.0,
-        &secure.get_backend(&root)?.0
+        &plain.get_store(&root)?.0,
+        &secure.get_store(&root)?.0
     ));
     Ok(())
 }
@@ -747,7 +747,7 @@ fn peak_rss_kib() -> u64 {
 /// Needs about 4 GiB of disk under the target directory.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-#[ignore = "writes 4 GiB; run manually or nightly"]
+#[ignore = "writes 4 GiB; run manually"]
 async fn pipe_multi_gb_bounded_memory() -> Result<()> {
     const CHUNK: usize = 1 << 20;
     const TOTAL: usize = 4096;
@@ -803,6 +803,27 @@ async fn move_between_two_names_of_one_origin_keeps_the_encrypted_object() -> Re
     Ok(())
 }
 
+#[tokio::test]
+async fn copy_onto_itself_does_not_rewrite_an_old_key_object() -> Result<()> {
+    let dir = tempdir()?;
+    let today = NaiveDate::from_ymd_opt(2026, 10, 26).expect("date");
+    let first = new_keyring("old", today).expect("keyring");
+    let old = EncryptedObjectStorageClient::new(config_for(&first));
+    let url = url_of(&dir, "x");
+    old.put(&url, &b"data"[..]).await?;
+    let before = std::fs::read(dir.path().join("x"))?;
+    let key_before = old.inspect_encryption(&url).await?.key_names;
+
+    // The new keyring has a different active key and still holds the old one.
+    let both = rotate_keyring(&first, "new", today).expect("rotate");
+    let new = EncryptedObjectStorageClient::new(config_for(&both));
+    new.copy(&url, &url).await?;
+
+    assert_eq!(std::fs::read(dir.path().join("x"))?, before);
+    assert_eq!(new.inspect_encryption(&url).await?.key_names, key_before);
+    Ok(())
+}
+
 /// An old-key source is re-encrypted on a move; through another name of the
 /// same origin the source is kept too.
 #[tokio::test]
@@ -826,5 +847,146 @@ async fn reencrypting_move_between_two_names_of_one_origin_keeps_the_object() ->
         .expect_err("source changed");
     assert!(matches!(err, Error::SourceChanged { .. }), "{err:?}");
     assert!(server.contents("/x").is_some());
+    Ok(())
+}
+
+fn region(value: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([("region".to_owned(), value.to_owned())])
+}
+
+/// Two stores holding the same-named object, written under {region: eu} and
+/// {region: us} by one keyring. The binding is off, as it is when the same
+/// path exists in two buckets; the objects are then swapped.
+async fn swapped_pair() -> Result<(EncryptedObjectStorageClient, TempDir, String)> {
+    let (eu, us) = (tempdir()?, tempdir()?);
+    let client = EncryptedObjectStorageClient::new(config_in().bind_object_key(false));
+    client
+        .put_with_context(&url_of(&eu, "obj"), &b"eu data"[..], &region("eu"))
+        .await?;
+    client
+        .put_with_context(&url_of(&us, "obj"), &b"us data"[..], &region("us"))
+        .await?;
+    // The us bytes replace the eu object.
+    std::fs::copy(us.path().join("obj"), eu.path().join("obj"))?;
+    let url = url_of(&eu, "obj");
+    Ok((client, eu, url))
+}
+
+fn is_context_mismatch(e: &Error, key: &str) -> bool {
+    matches!(e, Error::Decryption(DecryptError::ContextMismatch { key: k }) if k == key)
+}
+
+#[tokio::test]
+async fn a_swapped_object_fails_a_required_context() -> Result<()> {
+    let (client, _dir, url) = swapped_pair().await?;
+    let err = client
+        .get_with_context(&url, &region("eu"))
+        .await
+        .expect_err("swapped object");
+    assert!(is_context_mismatch(&err, "region"), "{err}");
+    // Neither the message nor the Debug output names a value.
+    for text in [err.to_string(), format!("{err:?}")] {
+        assert!(!text.contains("eu") && !text.contains("us"), "{text}");
+    }
+
+    let mut stream = client.get_stream_with_context(&url, &region("eu")).await?;
+    let first = stream.next().await.expect("an item").expect_err("mismatch");
+    assert!(is_context_mismatch(&first, "region"), "{first}");
+    assert!(stream.next().await.is_none());
+
+    // The matching context of the swapped-in object is what it is.
+    assert_eq!(
+        client.get_with_context(&url, &region("us")).await?.as_ref(),
+        b"us data"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn matching_and_subset_contexts_succeed_and_plain_reads_still_work() -> Result<()> {
+    let dir = tempdir()?;
+    let client = secure();
+    let url = url_of(&dir, "obj");
+    let stored = BTreeMap::from([
+        ("region".to_owned(), "eu".to_owned()),
+        ("tenant".to_owned(), "acme".to_owned()),
+    ]);
+    client.put_with_context(&url, &b"data"[..], &stored).await?;
+
+    for required in [stored.clone(), region("eu"), BTreeMap::new()] {
+        assert_eq!(
+            client.get_with_context(&url, &required).await?.as_ref(),
+            b"data"
+        );
+        let stream = client.get_stream_with_context(&url, &required).await?;
+        assert_eq!(drain(stream).await?, b"data");
+    }
+    assert_eq!(client.get(&url).await?.as_ref(), b"data");
+
+    // A pair that is absent, or has another value, fails.
+    for required in [
+        BTreeMap::from([("zone".to_owned(), "a".to_owned())]),
+        BTreeMap::from([("region".to_owned(), "us".to_owned())]),
+    ] {
+        let err = client
+            .get_with_context(&url, &required)
+            .await
+            .expect_err("mismatch");
+        assert!(
+            matches!(err, Error::Decryption(DecryptError::ContextMismatch { .. })),
+            "{err}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_edited_context_value_that_matches_the_requirement_fails_authentication() -> Result<()> {
+    let dir = tempdir()?;
+    let client = secure();
+    let url = url_of(&dir, "obj");
+    client
+        .put_with_context(&url, &b"data"[..], &region("us"))
+        .await?;
+    let path = dir.path().join("obj");
+    let mut stored = std::fs::read(&path)?;
+    let at = stored
+        .windows(2)
+        .position(|w| w == b"us")
+        .expect("context value");
+    stored[at..at + 2].copy_from_slice(b"eu");
+    std::fs::write(&path, &stored)?;
+
+    // The edited header satisfies the requirement, so the check passes and
+    // authentication is what rejects it.
+    let err = client
+        .get_with_context(&url, &region("eu"))
+        .await
+        .expect_err("edited context");
+    assert!(
+        matches!(err, Error::Decryption(ref d) if !matches!(d, DecryptError::ContextMismatch { .. })),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn required_context_rejects_reserved_keys() -> Result<()> {
+    let dir = tempdir()?;
+    let client = secure();
+    let url = url_of(&dir, "missing");
+    for key in ["osc:key", "osc:anything", "aws-crypto-public-key"] {
+        let required = BTreeMap::from([(key.to_owned(), "x".to_owned())]);
+        // The object does not exist: only a check before any I/O gives
+        // InvalidInput rather than NotFound.
+        assert!(matches!(
+            client.get_with_context(&url, &required).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.get_stream_with_context(&url, &required).await,
+            Err(Error::InvalidInput(_))
+        ));
+    }
     Ok(())
 }

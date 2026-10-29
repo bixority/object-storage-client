@@ -1,4 +1,8 @@
 import asyncio
+import os
+import signal
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -175,3 +179,42 @@ def azurite_env():
 
         _wait_until_ready(probe)
         yield
+
+
+@pytest.fixture
+def run_isolated(tmp_path):
+    """Run Python code in a child with a minimal, explicit environment.
+
+    The child sees only PATH, HOME (an empty directory below `tmp_path`),
+    PYTHONPATH (this process's sys.path) and the caller's `env`, so nothing
+    from the developer's environment (AWS_*, proxies, OSC_*) reaches it. On a
+    timeout the whole process group is killed.
+    """
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+
+    def run(code: str, *args: str, env=None, timeout: float = 120):
+        child_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(home),
+            "PYTHONPATH": os.pathsep.join(sys.path),
+            **(env or {}),
+        }
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, *args],
+            env=child_env,
+            cwd=tmp_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            raise
+        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+    return run

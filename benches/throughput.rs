@@ -10,6 +10,10 @@
 //!
 //! Data goes under `BENCH_DIR`, default `target/bench-data`, which is on the
 //! real disk rather than a tmpfs `/tmp`; it is deleted at exit.
+//!
+//! Only a real benchmark run (`cargo bench`, which passes `--bench`) uses
+//! `BENCH_MIB` and `BENCH_RUNS`. `cargo test --benches`, `--all-targets` and
+//! `cargo bench -- --test` run one 8 MiB pass instead.
 
 #![allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 
@@ -225,9 +229,12 @@ fn human(n: usize) -> String {
 }
 
 fn main() {
-    // `cargo test --benches` runs this with no arguments of interest; a
-    // single tiny pass keeps that cheap.
-    let smoke = std::env::args().any(|a| a == "--test");
+    // `cargo bench` passes `--bench`, while `cargo test --bench(es)` and
+    // `--all-targets` pass nothing. So anything but a benchmark run, or
+    // `cargo bench -- --test`, is one cheap 8 MiB pass.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let smoke = has("--test") || !has("--bench");
     let mib = if smoke { 8 } else { env_num("BENCH_MIB", 256) };
     let runs = if smoke { 1 } else { env_num("BENCH_RUNS", 3) };
     let base = std::env::var_os("BENCH_DIR").map_or_else(

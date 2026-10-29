@@ -1,3 +1,9 @@
+//! Object storage client for S3, GCS, Azure Blob, plain HTTP and `file://`
+//! URLs, with optional client-side encryption.
+//!
+//! Items marked `#[doc(hidden)]` are test hooks: they are not part of the
+//! public API and may change in any release, outside semver.
+
 mod backend;
 #[cfg(feature = "cli")]
 #[doc(hidden)]
@@ -12,6 +18,7 @@ pub(crate) mod hex;
 mod python;
 mod registry;
 pub mod sign;
+mod text;
 mod upload;
 
 #[cfg(feature = "encryption")]

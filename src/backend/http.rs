@@ -3,7 +3,7 @@
 //! Supports only generic object operations; bucket management and pre-signing
 //! fall back to the [`Backend`] trait's "unsupported" defaults.
 
-use super::Backend;
+use super::{Backend, BoundedConnector, READ_TIMEOUT};
 use crate::client::Result;
 use object_store::http::HttpBuilder;
 use object_store::{ClientOptions, ObjectStore};
@@ -24,10 +24,16 @@ impl HttpBackend {
     ///
     /// Returns an error if the store fails to build.
     pub fn new(scheme: &str, url: &Url) -> Result<Self> {
-        let options = ClientOptions::new().with_allow_http(url.scheme() == "http");
+        // No total deadline: a download may take as long as it takes. A stalled
+        // request is caught by the read timeout instead.
+        let options = ClientOptions::new()
+            .with_allow_http(url.scheme() == "http")
+            .with_timeout_disabled()
+            .with_read_timeout(READ_TIMEOUT);
         let store = HttpBuilder::new()
             .with_url(base_url(url).as_str())
             .with_client_options(options)
+            .with_http_connector(BoundedConnector::default())
             .build()?;
         Ok(Self {
             store: Arc::new(store),
@@ -36,7 +42,7 @@ impl HttpBackend {
     }
 }
 
-/// The origin of `url` (`scheme://[userinfo@]host[:port]/`): no path, query or
+/// The origin of `url` (`scheme://host[:port]/`): no path, query or
 /// fragment. The store is shared by every URL on that origin, so it must not
 /// carry the first URL's path or query string; object paths are resolved
 /// against this root.
@@ -70,8 +76,8 @@ mod tests {
 
     #[test]
     fn base_url_keeps_only_the_origin() {
-        let url = Url::parse("https://user:pw@Example.com:8443/a/b%20c?token=1#frag").unwrap();
-        assert_eq!(base_url(&url).as_str(), "https://user:pw@example.com:8443/");
+        let url = Url::parse("https://Example.com:8443/a/b%20c?token=1#frag").unwrap();
+        assert_eq!(base_url(&url).as_str(), "https://example.com:8443/");
         let plain = Url::parse("http://h/x/y").unwrap();
         assert_eq!(base_url(&plain).as_str(), "http://h/");
     }
@@ -117,5 +123,47 @@ mod tests {
         let lines = server.await.unwrap();
         assert_eq!(lines[0], "GET /first/a HTTP/1.1");
         assert_eq!(lines[1], "GET /second/b HTTP/1.1");
+    }
+
+    use super::super::stub;
+    use object_store::ObjectStoreExt as _;
+    use object_store::path::Path as ObjectPath;
+    use std::time::Duration;
+
+    async fn get_bytes(base: &str) -> object_store::Result<bytes::Bytes> {
+        let url = Url::parse(&format!("{base}/slow")).unwrap();
+        let backend = HttpBackend::new("http", &url).unwrap();
+        backend
+            .store()
+            .get(&ObjectPath::from("slow"))
+            .await?
+            .bytes()
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_body_is_not_cut_off() {
+        // 120 s of virtual time in all: well past the old 30 s total deadline.
+        let base = stub::serve_slow(6, 6, Duration::from_secs(20)).await;
+        let got = get_bytes(&base).await.unwrap();
+        assert_eq!(got.as_ref(), vec![b'x'; 6 * stub::CHUNK].as_slice());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_fails_within_the_read_timeout() {
+        let base = stub::serve_slow(1, 0, Duration::ZERO).await;
+        let start = tokio::time::Instant::now();
+        let err = get_bytes(&base).await.unwrap_err();
+        let text = format!("{err:?}").to_lowercase();
+        assert!(
+            text.contains("timed out") || text.contains("timeout"),
+            "{text}"
+        );
+        assert!(
+            start.elapsed() <= READ_TIMEOUT + Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(start.elapsed() >= READ_TIMEOUT, "{:?}", start.elapsed());
     }
 }

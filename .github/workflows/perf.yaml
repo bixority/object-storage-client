@@ -2,8 +2,9 @@ name: Performance
 
 # Not part of the PR checks: the deterministic guards in `tests/perf_guards.rs`
 # run with `cargo test` in tests.yaml. This workflow measures the release
-# binary. Peak RSS over budget fails it; throughput only warns, because shared
-# runners are noisy.
+# binary. Peak RSS over budget fails it; throughput is compared with the
+# previous successful run (restored from the cache) and only warns, because
+# shared runners are noisy.
 on:
   workflow_dispatch:
   schedule:
@@ -22,16 +23,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build release osc
-        run: cargo build --release --bin osc
+        run: cargo build --locked --release --bin osc
       - name: Bench (256 MiB, median of 3)
         shell: bash
-        run: cargo bench --bench throughput --no-default-features --features encryption | tee bench.txt
+        run: cargo bench --locked --bench throughput --no-default-features --features encryption | tee bench.txt
         env:
           BENCH_DIR: ${{ github.workspace }}/target/bench-data
+      # The newest earlier perf-baseline.json; a first run finds none, and
+      # perf_smoke.py ignores a missing file.
+      - name: Restore the previous smoke result
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: perf-baseline.json
+          key: perf-smoke-${{ github.run_id }}
+          restore-keys: perf-smoke-
       - name: Smoke (512 MiB file://, plain and encrypted)
         run: |
           mkdir -p target/perf-smoke
@@ -39,8 +52,16 @@ jobs:
             --osc target/release/osc \
             --runs 5 \
             --dir target/perf-smoke \
+            --baseline perf-baseline.json \
             --out perf-smoke.json
-      - uses: actions/upload-artifact@v6
+      - name: Keep this result as the next baseline
+        run: cp perf-smoke.json perf-baseline.json
+      - name: Save the baseline
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: perf-baseline.json
+          key: perf-smoke-${{ github.run_id }}
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: perf-${{ github.sha }}

@@ -130,6 +130,13 @@ pub(crate) fn edk_key_name(edk: &EncryptedDataKey) -> Option<&str> {
     std::str::from_utf8(&edk.provider_info[..len]).ok()
 }
 
+/// The key name an EDK claims, only when it belongs to `namespace`.
+pub(crate) fn key_name_in<'a>(edk: &'a EncryptedDataKey, namespace: &str) -> Option<&'a str> {
+    (edk.provider_id == namespace)
+        .then(|| edk_key_name(edk))
+        .flatten()
+}
+
 /// Opens the first EDK of `namespace` whose named key is in `keys`; an EDK
 /// that fails to open does not stop the search.
 ///
@@ -185,6 +192,20 @@ mod tests {
 
     fn dek() -> DataKey {
         DataKey::from_slice(&[7; 32]).expect("32 bytes")
+    }
+
+    #[test]
+    fn key_name_in_ignores_other_namespaces() {
+        let edk = key().wrap("osc-file", &dek(), b"ctx").expect("wrap");
+        assert_eq!(key_name_in(&edk, "osc-file"), Some("kek-a"));
+        assert_eq!(key_name_in(&edk, "aws-kms"), None);
+        let kms = EncryptedDataKey {
+            provider_id: "aws-kms".to_owned(),
+            ..edk
+        };
+        assert_eq!(key_name_in(&kms, "osc-file"), None);
+        // The layout would still yield a bogus name without the namespace check.
+        assert!(edk_key_name(&kms).is_some());
     }
 
     #[test]

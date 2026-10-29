@@ -12,6 +12,16 @@
 //! the multipart part count and buffering of `upload_stream`; `file://` has
 //! neither. The `src/upload.rs` and `src/encryption/envelope.rs` tests pin
 //! those with instrumented stores.
+//!
+//! Two blind spots to keep in mind:
+//! - The counter sees only the Rust heap. AWS-LC's AEAD contexts come from libc
+//!   malloc (today one per message, built in `suite::derive`), so a per-frame
+//!   key rebuild would not show here, although per-frame HKDF re-derivation
+//!   would.
+//! - `file://` writes never take the multipart path and `file://` reads arrive
+//!   in 512 KiB chunks, not the ~16 KiB HTTP chunks. Multipart bytes in flight
+//!   and small-chunk decoding are guarded by the `src/upload.rs` and
+//!   `src/encryption/frame.rs` unit tests instead.
 
 #[path = "../benches/common/mod.rs"]
 mod common;
@@ -213,12 +223,20 @@ fn reencrypting_copy_streams_in_bounded_memory() {
     let f = fixture(SIZE);
     runtime().block_on(async {
         let (src, dst) = (url(&f.out, "src"), url(&f.out, "dst"));
-        seed(&f, true, &src).await;
+        // A large caller context: a clone of it per stored chunk would add
+        // thousands of allocations to the copy.
+        let ctx: std::collections::BTreeMap<String, String> = (0..64)
+            .map(|i| (format!("key-{i:02}"), format!("{i:02}-{}", "v".repeat(100))))
+            .collect();
+        f.enc
+            .put_stream_with_context(&src, chunked(&f.data, CHUNK), ctx)
+            .await
+            .expect("seed");
 
         // `enc_b` has a different active key, so this is a re-encryption.
         let ((), usage) = measure(async || f.enc_b.copy(&src, &dst).await.expect("copy")).await;
         show("enc copy (re-encrypt) 64 MiB", &usage);
-        // Measured: 2715 allocations.
+        // Measured: 3155 allocations (with a 64-entry caller context).
         at_most("copy allocs", usage.allocs, 4100);
         at_most("copy peak", usage.peak_above_base, 4 * MIB);
 

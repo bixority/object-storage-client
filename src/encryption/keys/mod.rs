@@ -15,7 +15,9 @@ pub mod keyring;
 #[expect(clippy::redundant_pub_crate)]
 pub(crate) mod raw_aes;
 
-pub use keyring::{KeyInfo, Keyring, KeyringStatus, new_keyring, retire_key, rotate_keyring};
+pub use keyring::{
+    KeyInfo, Keyring, KeyringStatus, activate_key, add_key, new_keyring, retire_key, rotate_keyring,
+};
 
 /// A 32-byte data encryption key. Zeroized on drop; deliberately not `Clone`,
 /// `Debug` or `Serialize`.
@@ -67,8 +69,8 @@ pub enum KeyError {
     /// The named key failed to unwrap the data key.
     #[error("unwrapping the data key with key {key_id:?} failed")]
     UnwrapFailed { key_id: String },
-    /// A keyring file is accessible to others.
-    #[error("keyring file {} has mode {mode:o}; access for others must be off", path.display())]
+    /// A keyring file is writable by its group or accessible to others.
+    #[error("keyring file {} has mode {mode:o}; group write and access for others must be off", path.display())]
     Permissions { path: PathBuf, mode: u32 },
     /// A keyring file is owned by someone else.
     #[error("keyring file {} is not owned by the current user or root", path.display())]

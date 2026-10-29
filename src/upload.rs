@@ -3,11 +3,12 @@
 use crate::backend::Backend;
 use crate::client::{Error, Result};
 use crate::codec::ByteStream;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{StreamExt, stream};
 use object_store::{
-    MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, PutResult,
-    UpdateVersion, UploadPart, WriteMultipart, path::Path as ObjectPath,
+    Attributes, MultipartUpload, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions,
+    PutOptions, PutPayload, PutPayloadMut, PutResult, UpdateVersion, UploadPart, WriteMultipart,
+    path::Path as ObjectPath,
 };
 use std::pin::pin;
 use std::sync::Arc;
@@ -19,7 +20,8 @@ use tokio::sync::Notify;
 pub struct UploadOptions {
     /// Bytes buffered before switching to multipart; also the part size.
     pub part_size: usize,
-    /// Maximum part uploads in flight.
+    /// Maximum part uploads in flight; fewer when parts are so large that
+    /// more would exceed the memory budget (32 MiB).
     pub max_concurrency: usize,
     /// The permission bits of the local file a copy or move reads from. A new
     /// `file://` destination takes them (less the umask) instead of
@@ -37,7 +39,31 @@ pub struct UploadOptions {
     /// `put` is also made conditional where the store supports it. A changed
     /// or vanished object aborts the upload with [`Error::Changed`].
     pub if_unchanged: Option<UpdateVersion>,
+    /// Content attributes (type, encoding, cache control, metadata) stored
+    /// with the object. A `file://` destination ignores them. Empty by
+    /// default.
+    pub attributes: Attributes,
+    /// The most a backend without multipart upload may buffer for its single
+    /// `put`. Larger input fails with [`Error::InvalidInput`] before any
+    /// request. Tests lower it.
+    pub max_single_put: usize,
+    /// The memory budget for parts in flight; see [`UPLOAD_BUDGET`].
+    #[cfg(test)]
+    pub byte_budget: usize,
 }
+
+/// The default of [`UploadOptions::max_single_put`] (1 GiB). `object_store`'s
+/// HTTP store cannot stream a body, so the buffer can only be bounded.
+const MAX_SINGLE_PUT: usize = 1 << 30;
+
+/// Part bytes a multipart upload keeps in memory, in flight or filling, apart
+/// from the one part being filled. Uploads in 8 MiB parts keep four parts in
+/// flight; larger parts (a big `size_hint`) get fewer, down to one.
+const UPLOAD_BUDGET: usize = 32 * 1024 * 1024;
+
+/// The largest object the providers store (5 TiB). A larger hint is a
+/// claim by the source, not a fact, and must not inflate the part size.
+const MAX_OBJECT_SIZE: u64 = 5 << 40;
 
 impl Default for UploadOptions {
     fn default() -> Self {
@@ -47,6 +73,10 @@ impl Default for UploadOptions {
             source_mode: None,
             size_hint: None,
             if_unchanged: None,
+            attributes: Attributes::new(),
+            max_single_put: MAX_SINGLE_PUT,
+            #[cfg(test)]
+            byte_budget: UPLOAD_BUDGET,
         }
     }
 }
@@ -60,8 +90,18 @@ impl UploadOptions {
         let Some(size) = self.size_hint else {
             return self.part_size;
         };
-        let wanted = (u128::from(size) * 101).div_ceil(100 * 9000);
+        let wanted = (u128::from(size.min(MAX_OBJECT_SIZE)) * 101).div_ceil(100 * 9000);
         usize::try_from(wanted).map_or(usize::MAX, |n| n.max(self.part_size))
+    }
+
+    /// How many parts of `part_size` bytes may be in flight: `max_concurrency`,
+    /// reduced so that they fit the memory budget (at least one).
+    fn parallelism(&self, part_size: usize) -> usize {
+        #[cfg(test)]
+        let budget = self.byte_budget;
+        #[cfg(not(test))]
+        let budget = UPLOAD_BUDGET;
+        (budget / part_size.max(1)).clamp(1, self.max_concurrency.max(1))
     }
 
     /// Options for a copy or move of `size` bytes whose source is `path` on
@@ -122,12 +162,24 @@ fn changed_or(guard: Option<&Guard>, e: object_store::Error) -> Error {
     }
 }
 
-/// Stores `data` at `path` with a single write. A `file://` destination goes
-/// through the private-staging local writer, anything else through the store.
+/// Stores `data` at `path`. A `file://` destination goes through the
+/// private-staging local writer. Data of at least one part (8 MiB) goes to a
+/// backend with multipart support as a multipart upload, like `put_stream`
+/// input, so it is neither refused for its size nor bound to one request's
+/// timeout; everything else is one `put`.
 pub async fn put_bytes(backend: &dyn Backend, path: &ObjectPath, data: Bytes) -> Result<()> {
     if let Some(dest) = backend.local_path(path)? {
         let chunk: Result<Bytes> = Ok(data);
         return local::write(dest, stream::iter([chunk]).boxed(), None, None).await;
+    }
+    let defaults = UploadOptions::default();
+    if backend.supports_multipart() && data.len() >= defaults.part_size {
+        let opts = UploadOptions {
+            size_hint: Some(data.len() as u64),
+            ..defaults
+        };
+        let chunk: Result<Bytes> = Ok(data);
+        return upload_stream(backend, path, stream::iter([chunk]).boxed(), &opts).await;
     }
     backend.store().put(path, data.into()).await?;
     Ok(())
@@ -212,7 +264,7 @@ impl Drop for PendingAbort {
 /// Waits, for at most `timeout`, for the aborts of uploads that were dropped
 /// mid-way (cancelled commands) to finish, so a pending multipart upload or a
 /// staging file is not left behind when the process exits right after.
-#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cli", feature = "python")), allow(dead_code))]
 #[doc(hidden)]
 pub async fn drain_pending_aborts(timeout: Duration) {
     let drained = async {
@@ -239,16 +291,16 @@ async fn write(
     writer: &mut WriteMultipart,
     mut bytes: Bytes,
     part_size: usize,
-    opts: &UploadOptions,
+    parallel: usize,
 ) -> Result<()> {
     if bytes.len() < COALESCE_BELOW {
-        writer.wait_for_capacity(opts.max_concurrency).await?;
+        writer.wait_for_capacity(parallel).await?;
         writer.write(&bytes);
         return Ok(());
     }
     while !bytes.is_empty() {
         let n = bytes.len().min(part_size);
-        writer.wait_for_capacity(opts.max_concurrency).await?;
+        writer.wait_for_capacity(parallel).await?;
         writer.put(bytes.split_to(n));
     }
     Ok(())
@@ -256,8 +308,14 @@ async fn write(
 
 /// Uploads `data` to `path`, committing only if the input ends cleanly.
 ///
-/// Input shorter than one part, or any input for a backend without multipart
-/// support (which therefore buffers it all), is stored with a single `put`.
+/// Input shorter than one part is stored with a single `put`. So is any input
+/// for a backend without multipart support, which buffers it all and refuses
+/// more than [`UploadOptions::max_single_put`].
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] when a backend without multipart support is given
+/// more than the cap, before anything is sent.
 pub async fn upload_stream(
     backend: &dyn Backend,
     path: &ObjectPath,
@@ -271,41 +329,54 @@ pub async fn upload_stream(
     let store = backend.store();
     let multipart = backend.supports_multipart();
     let part_size = opts.effective_part_size();
-    // Sized for the whole input when it is known to fit in one part, so a
-    // small upload does not regrow the buffer.
-    let mut buf = BytesMut::with_capacity(opts.size_hint.map_or(0, |size| {
-        usize::try_from(size).map_or(part_size, |size| size.min(part_size))
-    }));
+    let too_big = || {
+        Error::InvalidInput(format!(
+            "uploads to {} are buffered in memory and limited to {} bytes",
+            backend.scheme(),
+            opts.max_single_put
+        ))
+    };
+    // The hint comes from the source, but a source that says it is too big is
+    // refused before any of it is read.
+    if !multipart
+        && opts
+            .size_hint
+            .is_some_and(|size| size > opts.max_single_put as u64)
+    {
+        return Err(too_big());
+    }
+    // Nothing is sized by the hint: memory is allocated as data arrives. Small
+    // chunks are copied into blocks of their own, so they cannot pin the
+    // chunks they came in; large ones are kept as they are.
+    let mut payload = PutPayloadMut::new().with_block_size(COALESCE_BELOW);
 
     while let Some(chunk) = data.next().await {
         let chunk = chunk?;
-        if multipart && buf.is_empty() && chunk.len() >= part_size {
-            return upload_multipart(backend, path, vec![chunk], data, part_size, opts).await;
-        }
-        // A large chunk that completes the first part is handed over as it
-        // is, after the small data before it, instead of being copied.
-        if multipart
-            && !buf.is_empty()
-            && chunk.len() >= COALESCE_BELOW
-            && buf.len() + chunk.len() >= part_size
+        if !multipart && payload.content_length().saturating_add(chunk.len()) > opts.max_single_put
         {
-            let head = vec![buf.freeze(), chunk];
-            return upload_multipart(backend, path, head, data, part_size, opts).await;
+            return Err(too_big());
         }
-        buf.extend_from_slice(&chunk);
-        if multipart && buf.len() >= part_size {
-            let head = vec![buf.freeze()];
-            return upload_multipart(backend, path, head, data, part_size, opts).await;
+        if chunk.len() < COALESCE_BELOW {
+            payload.extend_from_slice(&chunk);
+        } else {
+            payload.push(chunk);
+        }
+        if multipart && payload.content_length() >= part_size {
+            return upload_multipart(backend, path, payload.freeze(), data, part_size, opts).await;
         }
     }
 
-    let payload = PutPayload::from(buf.freeze());
+    let payload = payload.freeze();
     match Guard::new(backend, path, opts) {
         None => {
-            store.put(path, payload).await?;
+            let put = PutOptions {
+                attributes: opts.attributes.clone(),
+                ..PutOptions::default()
+            };
+            store.put_opts(path, payload, put).await?;
             Ok(())
         }
-        Some(guard) => put_if_unchanged(&guard, payload).await,
+        Some(guard) => put_if_unchanged(&guard, payload, &opts.attributes).await,
     }
 }
 
@@ -313,12 +384,17 @@ pub async fn upload_stream(
 /// conditional on the version where the store supports that. A store that does
 /// not (or reports no e-tag to match) gets an unconditional put, the check
 /// before it being all there is.
-async fn put_if_unchanged(guard: &Guard, payload: PutPayload) -> Result<()> {
+async fn put_if_unchanged(
+    guard: &Guard,
+    payload: PutPayload,
+    attributes: &Attributes,
+) -> Result<()> {
     let guarded = Some(guard);
     guard.verify().await.map_err(|e| changed_or(guarded, e))?;
     if guard.expect.e_tag.is_some() {
         let opts = PutOptions {
             mode: PutMode::Update(guard.expect.clone()),
+            attributes: attributes.clone(),
             ..PutOptions::default()
         };
         match guard
@@ -330,31 +406,40 @@ async fn put_if_unchanged(guard: &Guard, payload: PutPayload) -> Result<()> {
             result => return result.map(drop).map_err(|e| changed_or(guarded, e)),
         }
     }
-    guard.store.put(&guard.path, payload).await?;
+    let opts = PutOptions {
+        attributes: attributes.clone(),
+        ..PutOptions::default()
+    };
+    guard.store.put_opts(&guard.path, payload, opts).await?;
     Ok(())
 }
 
 async fn upload_multipart(
     backend: &dyn Backend,
     path: &ObjectPath,
-    head: Vec<Bytes>,
+    head: PutPayload,
     mut data: ByteStream,
     part_size: usize,
     opts: &UploadOptions,
 ) -> Result<()> {
-    let upload = backend.store().put_multipart(path).await?;
+    let multipart = PutMultipartOptions {
+        attributes: opts.attributes.clone(),
+        ..PutMultipartOptions::default()
+    };
+    let upload = backend.store().put_multipart_opts(path, multipart).await?;
     let guard = Guard::new(backend, path, opts);
     let mut writer = WriteMultipart::new_with_chunk_size(
         Box::new(AbortOnDrop(Some(upload), guard.clone())),
         part_size,
     );
 
+    let parallel = opts.parallelism(part_size);
     let fed = async {
         for chunk in head {
-            write(&mut writer, chunk, part_size, opts).await?;
+            write(&mut writer, chunk, part_size, parallel).await?;
         }
         while let Some(chunk) = data.next().await {
-            write(&mut writer, chunk?, part_size, opts).await?;
+            write(&mut writer, chunk?, part_size, parallel).await?;
         }
         Ok(())
     }
@@ -365,6 +450,12 @@ async fn upload_multipart(
         // failure (part or `complete`) before returning the error, so no
         // upload is left to the drop guard.
         Ok(()) => {
+            // `finish` queues the last, partial part without waiting, so make
+            // room for it first: no more than `parallel` parts ever run.
+            if let Err(e) = writer.wait_for_capacity(parallel).await {
+                let _ = writer.abort().await;
+                return Err(changed_or(guard.as_ref(), e));
+            }
             writer
                 .finish()
                 .await
@@ -382,11 +473,20 @@ async fn upload_multipart(
 /// staging file with the umask default mode and so exposes the data, and
 /// replaces a private destination with a world-readable file. Here the staging
 /// file is private until it is complete.
+/// Destinations whose next `file://` sync fails, for tests.
+#[cfg(test)]
+pub static SYNC_FAULTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 mod local {
     use super::{Backend, ByteStream, Guard, ObjectPath, Result};
+    #[cfg(unix)]
     use crate::client::Error;
+    #[cfg(unix)]
     use crate::fsmode;
+    #[cfg(unix)]
     use futures::StreamExt;
+    #[cfg(unix)]
     use std::io;
     use std::path::{Path, PathBuf};
 
@@ -429,7 +529,10 @@ mod local {
 
     #[cfg(unix)]
     fn io_err(e: &io::Error, what: &str, path: &Path) -> Error {
-        Error::Generic(format!("Unable to {what} {}: {e}", path.display()))
+        Error::Io(io::Error::new(
+            e.kind(),
+            format!("Unable to {what} {}: {e}", path.display()),
+        ))
     }
 
     /// Creates `{dest}#{n}` exclusively (the name `object_store`'s own staging
@@ -479,13 +582,23 @@ mod local {
         let target = dest.clone();
         // The closure owns the guard, so a dropped future cannot leak the file.
         let (file, mut staging, last) = tokio::task::spawn_blocking(move || {
-            let existing = std::fs::symlink_metadata(&target)
-                .ok()
-                .filter(std::fs::Metadata::is_file)
-                .map(|m| (m.mode(), m.uid()));
+            // A regular file keeps its mode; a symlink is replaced, never
+            // followed, and counts as a new file; nothing else is touched.
+            let existing = match std::fs::symlink_metadata(&target) {
+                Ok(m) if m.is_file() => Some((m.mode(), m.uid())),
+                Ok(m) if m.is_symlink() => None,
+                Ok(_) => {
+                    return Err(Error::InvalidInput(format!(
+                        "{} is not a regular file",
+                        target.display()
+                    )));
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(io_err(&e, "stat", &target)),
+            };
             let euid = rustix::process::geteuid().as_raw();
             let (create, last) =
-                fsmode::modes(existing, euid, source_mode, fsmode::current_umask());
+                fsmode::modes(existing, euid, source_mode, fsmode::umask_near(&target));
             create_staging(&target, create).map(|(f, s)| (f, s, last))
         })
         .await
@@ -506,6 +619,20 @@ mod local {
                 .await
                 .map_err(|e| io_err(&e, "set permissions of", &staged))?;
         }
+        // Only a successful fsync reports a deferred write error (full disk,
+        // quota, I/O error), and `drop` would discard a failing close. A
+        // failure leaves the staging guard to remove the file, so the old
+        // destination stays.
+        #[cfg(test)]
+        if super::SYNC_FAULTS
+            .lock()
+            .is_ok_and(|set| set.contains(&dest))
+        {
+            return Err(io_err(&io::Error::other("injected"), "sync", &staged));
+        }
+        file.sync_all()
+            .await
+            .map_err(|e| io_err(&e, "sync", &staged))?;
         drop(file);
         if let Some(guard) = guard {
             // On a mismatch the staging guard removes the file.
@@ -518,7 +645,19 @@ mod local {
             .await
             .map_err(|e| io_err(&e, "rename onto", &dest))?;
         staging.disarm();
-        Ok(())
+        // Make the rename durable before a move deletes its source.
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(&parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| io_err(&e, "sync directory", &parent))
+        })
+        .await
+        .map_err(|e| Error::Generic(format!("Local write task failed: {e}")))?
     }
 
     #[cfg(not(unix))]
@@ -556,6 +695,10 @@ mod tests {
         abort: AtomicUsize,
         in_flight: AtomicUsize,
         peak: AtomicUsize,
+        /// Bytes handed to `put_part` whose upload has not finished.
+        bytes_in_flight: AtomicUsize,
+        /// Largest value `bytes_in_flight` reached.
+        peak_bytes: AtomicUsize,
         parts: AtomicUsize,
         /// Largest number of payload segments seen in a single part.
         max_segments: AtomicUsize,
@@ -602,6 +745,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(data.iter().map(|b| b.as_ptr() as usize));
+            let len = data.content_length();
+            let held = self.c.bytes_in_flight.fetch_add(len, SeqCst) + len;
+            self.c.peak_bytes.fetch_max(held, SeqCst);
             let fut = self.inner.put_part(data);
             let c = Arc::clone(&self.c);
             Box::pin(async move {
@@ -609,6 +755,7 @@ mod tests {
                 c.peak.fetch_max(now, SeqCst);
                 tokio::time::sleep(Duration::from_millis(5 + c.part_delay_ms)).await;
                 c.in_flight.fetch_sub(1, SeqCst);
+                c.bytes_in_flight.fetch_sub(len, SeqCst);
                 if c.fail_part == Some(idx) || c.fail_from_part.is_some_and(|from| idx >= from) {
                     return Err(object_store::Error::Generic {
                         store: "fault",
@@ -644,6 +791,11 @@ mod tests {
             opts: PutOptions,
         ) -> object_store::Result<PutResult> {
             self.c.put.fetch_add(1, SeqCst);
+            self.c
+                .segment_ptrs
+                .lock()
+                .unwrap()
+                .extend(payload.iter().map(|b| b.as_ptr() as usize));
             self.inner.put_opts(location, payload, opts).await
         }
 
@@ -824,7 +976,7 @@ mod tests {
         assert!(c.abort.load(SeqCst) >= 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dropped_future_aborts() {
         let (b, _store, c) = fixture(true, None);
         let (_, parts) = chunks(10 * 1024 * 1024);
@@ -851,6 +1003,43 @@ mod tests {
             .unwrap();
         let peak = c.peak.load(SeqCst);
         assert_eq!(peak, 4);
+        let opts = UploadOptions::default();
+        let held = c.peak_bytes.load(SeqCst);
+        assert!(
+            held <= opts.max_concurrency * opts.part_size,
+            "{held} bytes were in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn small_chunks_keep_bytes_in_flight_bounded() {
+        let (b, store, c) = fixture_with(
+            true,
+            Counters {
+                part_delay_ms: 20,
+                ..Counters::default()
+            },
+        );
+        let opts = UploadOptions {
+            part_size: 256 * 1024,
+            max_concurrency: 4,
+            ..UploadOptions::default()
+        };
+        let data: Vec<u8> = (0..9 * opts.part_size + 100)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let chunks: Vec<Bytes> = data.chunks(4096).map(Bytes::copy_from_slice).collect();
+        upload_stream(&b, &path(), input(chunks), &opts)
+            .await
+            .unwrap();
+        assert!(c.parts.load(SeqCst) >= 8, "{} parts", c.parts.load(SeqCst));
+        assert_eq!(stored(&store).await.as_ref(), data.as_slice());
+        let (parts, held) = (c.peak.load(SeqCst), c.peak_bytes.load(SeqCst));
+        assert!(parts <= opts.max_concurrency, "{parts} parts in flight");
+        assert!(
+            held <= opts.max_concurrency * opts.part_size,
+            "{held} bytes in flight"
+        );
     }
 
     #[tokio::test]
@@ -958,6 +1147,36 @@ mod tests {
         assert_eq!(stored(&store).await.as_ref(), data.as_slice());
     }
 
+    #[tokio::test]
+    async fn a_huge_size_hint_does_not_preallocate() {
+        // Without multipart the largest hint the cap allows is 1 GiB.
+        for (multipart, hint) in [(true, 1_u64 << 60), (false, 1 << 30)] {
+            let (b, store, _) = fixture(multipart, None);
+            let opts = UploadOptions {
+                size_hint: Some(hint),
+                ..UploadOptions::default()
+            };
+            upload_stream(
+                &b,
+                &path(),
+                input(vec![Bytes::from(vec![7_u8; 1024])]),
+                &opts,
+            )
+            .await
+            .unwrap();
+            assert_eq!(stored(&store).await.as_ref(), vec![7_u8; 1024].as_slice());
+        }
+        let capped = |hint| {
+            UploadOptions {
+                size_hint: Some(hint),
+                ..UploadOptions::default()
+            }
+            .effective_part_size()
+        };
+        assert_eq!(capped(u64::MAX), capped(5 << 40));
+        assert!(capped(5 << 40) > 8 * 1024 * 1024);
+    }
+
     #[test]
     fn the_hinted_part_size_never_drops_below_the_base_size() {
         let opts = |size_hint| UploadOptions {
@@ -1002,7 +1221,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dropped_during_finish_aborts() {
         let (b, store, c) = fixture_with(
             true,
@@ -1019,6 +1238,10 @@ mod tests {
         )
         .await;
         assert!(timed.is_err());
+        // The whole input was consumed and every part queued (20 MiB in 8 MiB
+        // parts), so the drop happened inside `finish`.
+        assert_eq!(c.parts.load(SeqCst), 3);
+        assert_eq!(c.abort.load(SeqCst), 0, "not aborted before the drop");
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(store.head(&path()).await.is_err());
         assert_eq!(
@@ -1107,16 +1330,19 @@ mod tests {
         assert_eq!(done.load(SeqCst), 1, "drain awaited the abort");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_pending_aborts_is_bounded_by_its_timeout() {
         let done = Arc::new(AtomicUsize::new(0));
         drop(AbortOnDrop(
             Some(Box::new(SlowAbort(Arc::clone(&done)))),
             None,
         ));
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         drain_pending_aborts(Duration::from_millis(1)).await;
-        assert!(started.elapsed() < Duration::from_millis(90));
+        // Virtual time: the drain gave up at its timeout, before the 100 ms
+        // abort could finish.
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(done.load(SeqCst), 0, "the abort had not completed");
     }
 
     /// The version of `path` in `store`, as a reencrypt would have read it.
@@ -1126,6 +1352,143 @@ mod tests {
             e_tag: meta.e_tag,
             version: meta.version,
         })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_sync_leaves_the_destination_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("obj");
+        std::fs::write(&file, b"old").unwrap();
+        let url = url::Url::from_file_path(&file).unwrap();
+        let client = crate::Client::<crate::Plain>::default();
+        let (backend, path) = client.get_backend(&url).unwrap();
+        let dest = backend.local_path(&path).unwrap().unwrap();
+
+        SYNC_FAULTS.lock().unwrap().push(dest.clone());
+        let err = put_bytes(backend.as_ref(), &path, Bytes::from_static(b"new")).await;
+        SYNC_FAULTS.lock().unwrap().retain(|p| *p != dest);
+
+        let err = err.unwrap_err();
+        assert!(err.to_string().contains("sync"), "{err}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"old");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["obj"]);
+
+        // Without the fault the same write goes through.
+        put_bytes(backend.as_ref(), &path, Bytes::from_static(b"new"))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+    }
+
+    /// The default creation mode of a new file in `dir`: `0o666` less the
+    /// umask, learned from a file created here.
+    #[cfg(unix)]
+    fn default_mode_in(dir: &std::path::Path) -> u32 {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let path = dir.join("independent-probe");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&path)
+            .unwrap();
+        let mode = file.metadata().unwrap().permissions().mode() & 0o777;
+        std::fs::remove_file(path).unwrap();
+        mode
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn new_file_staging_is_private_without_proc() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("obj");
+        let url = url::Url::from_file_path(&file).unwrap();
+        let client = crate::Client::<crate::Plain>::default();
+        let (backend, path) = client.get_backend(&url).unwrap();
+        let dest = backend.local_path(&path).unwrap().unwrap();
+        let want = default_mode_in(dir.path());
+
+        crate::fsmode::PROBE_ONLY.lock().unwrap().push(dest.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(1);
+        let data = stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed();
+        let task = tokio::spawn(async move {
+            upload_stream(backend.as_ref(), &path, data, &UploadOptions::default()).await
+        });
+        tx.send(Ok(Bytes::from_static(b"secret"))).await.unwrap();
+        let staging = dir.path().join("obj#1");
+        for _ in 0..400 {
+            if std::fs::metadata(&staging).is_ok_and(|m| m.len() == 6) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let private = mode_of(&staging);
+        drop(tx);
+        let done = task.await.unwrap();
+        crate::fsmode::PROBE_ONLY
+            .lock()
+            .unwrap()
+            .retain(|p| *p != dest);
+
+        done.unwrap();
+        assert_eq!(private, 0o600, "staging file while the write is running");
+        assert_eq!(mode_of(&file), want);
+        assert_eq!(std::fs::read(&file).unwrap(), b"secret");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["obj"], "no staging or probe file is left");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_private_source_stays_private_when_the_probe_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("obj");
+        let url = url::Url::from_file_path(&file).unwrap();
+        let client = crate::Client::<crate::Plain>::default();
+        let (backend, path) = client.get_backend(&url).unwrap();
+        let dest = backend.local_path(&path).unwrap().unwrap();
+
+        crate::fsmode::PROBE_ONLY.lock().unwrap().push(dest.clone());
+        crate::fsmode::PROBE_FAULTS
+            .lock()
+            .unwrap()
+            .push(dest.clone());
+        let opts = UploadOptions {
+            source_mode: Some(0o600),
+            ..UploadOptions::default()
+        };
+        let done = upload_stream(
+            backend.as_ref(),
+            &path,
+            input(vec![Bytes::from_static(b"x")]),
+            &opts,
+        )
+        .await;
+        crate::fsmode::PROBE_ONLY
+            .lock()
+            .unwrap()
+            .retain(|p| *p != dest);
+        crate::fsmode::PROBE_FAULTS
+            .lock()
+            .unwrap()
+            .retain(|p| *p != dest);
+
+        done.unwrap();
+        assert_eq!(mode_of(&file), 0o600);
     }
 
     #[tokio::test]
@@ -1153,12 +1516,12 @@ mod tests {
         upload_stream(
             backend.as_ref(),
             &path,
-            input(vec![Bytes::from_static(b"new")]),
+            input(vec![Bytes::from_static(b"newer")]),
             &opts,
         )
         .await
         .unwrap();
-        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(std::fs::read(&file).unwrap(), b"newer");
 
         // The object changed since `version` was taken: nothing is renamed
         // and no staging file stays.
@@ -1170,7 +1533,7 @@ mod tests {
         )
         .await;
         assert!(matches!(err, Err(Error::Changed)), "{err:?}");
-        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        assert_eq!(std::fs::read(&file).unwrap(), b"newer");
         assert_eq!(names(), ["obj"]);
 
         // A vanished object counts as changed too, and is not recreated.
@@ -1225,5 +1588,174 @@ mod tests {
                 .unwrap();
             assert_eq!(stored(&store).await.as_ref(), data.as_slice());
         }
+    }
+
+    // ---- the cap on non-multipart uploads (CORE-HTTPCAP) ----
+
+    fn capped(multipart: bool) -> (TestBackend, Arc<Counters>, UploadOptions) {
+        let (b, _, c) = fixture(multipart, None);
+        let opts = UploadOptions {
+            max_single_put: 1 << 20,
+            ..UploadOptions::default()
+        };
+        (b, c, opts)
+    }
+
+    #[tokio::test]
+    async fn a_non_multipart_upload_over_the_cap_fails_before_any_put() {
+        let (b, c, opts) = capped(false);
+        let chunks = vec![Bytes::from(vec![1_u8; 512 * 1024]); 3];
+        let err = upload_stream(&b, &path(), input(chunks), &opts)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains(&(1 << 20).to_string()), "{err}");
+        assert_eq!(c.put.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_hinted_oversize_upload_fails_without_reading() {
+        let (b, c, mut opts) = capped(false);
+        opts.size_hint = Some(2 << 20);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&polled);
+        let data = stream::poll_fn(move |_| {
+            seen.fetch_add(1, SeqCst);
+            std::task::Poll::Ready(None)
+        })
+        .boxed();
+        let err = upload_stream(&b, &path(), data, &opts).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(polled.load(SeqCst), 0, "the input was read");
+        assert_eq!(c.put.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_upload_at_the_cap_succeeds() {
+        let (b, c, opts) = capped(false);
+        let chunks = vec![Bytes::from(vec![1_u8; 512 * 1024]); 2];
+        upload_stream(&b, &path(), input(chunks), &opts)
+            .await
+            .unwrap();
+        assert_eq!((c.put.load(SeqCst), c.multipart.load(SeqCst)), (1, 0));
+    }
+
+    // ---- large put bodies (CORE-BIGPUT) ----
+
+    #[tokio::test]
+    async fn a_large_put_uses_multipart() {
+        let (b, store, c) = fixture(true, None);
+        let (data, _) = chunks(20 * 1024 * 1024);
+        put_bytes(&b, &path(), Bytes::from(data.clone()))
+            .await
+            .unwrap();
+        assert_eq!((c.put.load(SeqCst), c.multipart.load(SeqCst)), (0, 1));
+        assert_eq!(c.abort.load(SeqCst), 0);
+        assert_eq!(stored(&store).await.as_ref(), data.as_slice());
+    }
+
+    #[tokio::test]
+    async fn a_small_put_stays_single() {
+        let (b, store, c) = fixture(true, None);
+        put_bytes(&b, &path(), Bytes::from(vec![5_u8; 1024]))
+            .await
+            .unwrap();
+        assert_eq!((c.put.load(SeqCst), c.multipart.load(SeqCst)), (1, 0));
+        assert_eq!(stored(&store).await.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn a_large_put_without_multipart_stays_single() {
+        let (b, store, c) = fixture(false, None);
+        put_bytes(&b, &path(), Bytes::from(vec![5_u8; 20 * 1024 * 1024]))
+            .await
+            .unwrap();
+        assert_eq!((c.put.load(SeqCst), c.multipart.load(SeqCst)), (1, 0));
+        assert_eq!(stored(&store).await.len(), 20 * 1024 * 1024);
+    }
+
+    // ---- single-put payload (CORE-PUTPAYLOAD) ----
+
+    #[tokio::test]
+    async fn a_large_single_put_chunk_is_not_copied() {
+        let (b, store, c) = fixture(true, None);
+        let chunk = Bytes::from(vec![3_u8; 1024 * 1024]);
+        let ptr = chunk.as_ptr() as usize;
+        upload_stream(
+            &b,
+            &path(),
+            input(vec![chunk.clone()]),
+            &UploadOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((c.put.load(SeqCst), c.multipart.load(SeqCst)), (1, 0));
+        assert_eq!(
+            *c.segment_ptrs.lock().unwrap(),
+            [ptr],
+            "the chunk was copied"
+        );
+        assert_eq!(stored(&store).await, chunk);
+    }
+
+    #[tokio::test]
+    async fn tiny_chunks_are_coalesced_for_a_single_put() {
+        let (b, store, c) = fixture(true, None);
+        let data: Vec<u8> = (0..1000 * 16)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let tiny: Vec<Bytes> = data.chunks(16).map(Bytes::copy_from_slice).collect();
+        upload_stream(&b, &path(), input(tiny), &UploadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((c.put.load(SeqCst), c.multipart.load(SeqCst)), (1, 0));
+        assert_eq!(stored(&store).await.as_ref(), data.as_slice());
+        // 16 000 bytes fit one block; a segment per chunk would be 1000.
+        let segments = c.segment_ptrs.lock().unwrap().len();
+        assert_eq!(segments, 1, "{segments} segments");
+    }
+
+    // ---- the memory budget (CORE-UPLOAD-BUDGET) ----
+
+    #[tokio::test]
+    async fn parts_in_flight_fit_the_byte_budget() {
+        let (b, store, c) = fixture_with(
+            true,
+            Counters {
+                part_delay_ms: 20,
+                ..Counters::default()
+            },
+        );
+        let mib = 1024 * 1024;
+        // The hint makes parts of 1 000 000 bytes; the budget holds two of them.
+        let opts = UploadOptions {
+            part_size: 64 * 1024,
+            max_concurrency: 4,
+            size_hint: Some(8_910_891_000),
+            byte_budget: 2 * mib,
+            ..UploadOptions::default()
+        };
+        assert_eq!(opts.effective_part_size(), 1_000_000);
+        let (data, parts) = chunks(12 * mib);
+        upload_stream(&b, &path(), input(parts), &opts)
+            .await
+            .unwrap();
+        assert!(c.parts.load(SeqCst) >= 10, "{} parts", c.parts.load(SeqCst));
+        let (in_flight, held) = (c.peak.load(SeqCst), c.peak_bytes.load(SeqCst));
+        assert_eq!(in_flight, 2, "parts in flight");
+        assert!(held <= 2 * mib, "{held} bytes in flight");
+        assert_eq!(c.abort.load(SeqCst), 0);
+        assert_eq!(stored(&store).await.as_ref(), data.as_slice());
+    }
+
+    #[test]
+    fn the_default_budget_keeps_four_parts_up_to_8_mib() {
+        let mib = 1024 * 1024;
+        let opts = UploadOptions::default();
+        assert_eq!(opts.byte_budget, 32 * mib);
+        assert_eq!(opts.parallelism(8 * mib), 4);
+        assert_eq!(opts.parallelism(5 * mib), 4);
+        assert_eq!(opts.parallelism(16 * mib), 2);
+        assert_eq!(opts.parallelism(100 * mib), 1);
     }
 }

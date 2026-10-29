@@ -223,9 +223,11 @@ async def test_cancelled_read_loses_nothing(plain, tmp_url):
 
 
 @pytest.mark.parametrize("method", ["next", "__anext__"])
-async def test_timeout_retry_with_loop_stall_loses_nothing(plain, tmp_url, method):
+async def test_timeout_retry_with_loop_stall_loses_nothing(method):
     # (a) asyncio.timeout + loop stall + retry with fresh reads.
-    data, stream = await _big_stream(plain, tmp_url)
+    data = bytes(i % 251 for i in range(2_000_000))
+    raw = _GatedRaw([data])
+    stream = ByteStream(raw)
     got = b""
     timeouts = 0
 
@@ -241,6 +243,10 @@ async def test_timeout_retry_with_loop_stall_loses_nothing(plain, tmp_url, metho
                 chunk = await getattr(stream, method)()
         except TimeoutError:
             timeouts += 1
+            # The first fill is held until its read has timed out, so the
+            # retry below is the one that delivers the data.
+            if timeouts == 1:
+                raw.release()
             continue
         except StopAsyncIteration:
             break
@@ -424,29 +430,25 @@ def test_loop_closed_with_read_pending_then_drain_on_new_loop(tmp_path):
         loop2.close()
 
 
-def test_superseded_read_on_resumed_loop_raises_and_loses_nothing(tmp_path):
+def test_superseded_read_on_resumed_loop_raises_and_loses_nothing():
     data = bytes(i % 251 for i in range(2_000_000))
-    url = (tmp_path / "big.bin").as_uri()
-    plain = ObjectStorageClient()
+    half = len(data) // 2
+    raw = _GatedRaw([data[:half], data[half:]])
+    stream = ByteStream(raw)
     loop_a = asyncio.new_event_loop()
     loop_b = asyncio.new_event_loop()
     try:
-
-        async def setup():
-            await plain.put_object(url, data)
-            return await plain.get_object_stream(url)
-
-        stream = loop_a.run_until_complete(setup())
         # A read waits in fill() on loop A, which then stops running.
         stale = _start_pending_read(loop_a, stream)
 
-        # Loop B takes over and reads the first chunk.
+        # The first fill completes; loop B takes over and reads that chunk.
+        raw.release()
         first = loop_b.run_until_complete(stream.next())
 
         async def park_a_chunk():
             t = asyncio.ensure_future(stream.next())
             await asyncio.sleep(0)  # awaiting fill()
-            time.sleep(0.3)  # the fill completes while the loop is blocked
+            raw.release()  # the fill completes before the read resumes
             t.cancel()  # the chunk stays parked for the next read
             await asyncio.gather(t, return_exceptions=True)
 
@@ -487,6 +489,33 @@ class _FakeRaw:
         if isinstance(item, BaseException):
             raise item
         return item or None
+
+
+class _GatedRaw(_FakeRaw):
+    """Raw stream whose fills complete only when the test calls `release()`.
+
+    The fill is held in a future rather than racing the event loop, so a read
+    is pending exactly as long as the test wants, on any machine.
+    """
+
+    def __init__(self, items):
+        super().__init__(items)
+        self._waiters = []
+
+    async def fill(self):
+        if self._slot is None and self._items:
+            fut = asyncio.get_running_loop().create_future()
+            self._waiters.append(fut)
+            await fut
+        await super().fill()
+
+    def release(self):
+        if self._slot is None and self._items:
+            self._slot = self._items.pop(0)
+        waiters, self._waiters = self._waiters, []
+        for fut in waiters:
+            if not fut.done():
+                fut.set_result(None)
 
 
 async def test_midstream_error_surfaces_once_and_maps():

@@ -198,8 +198,17 @@ def run_isolated(tmp_path):
             "PATH": os.environ.get("PATH", ""),
             "HOME": str(home),
             "PYTHONPATH": os.pathsep.join(sys.path),
-            **(env or {}),
         }
+        if sys.platform == "win32":
+            # Winsock and the C runtime need these; USERPROFILE is where the
+            # library looks for ~/.aws on Windows, so it points at the empty home.
+            child_env |= {
+                "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+                "TEMP": os.environ.get("TEMP", ""),
+                "TMP": os.environ.get("TMP", ""),
+                "USERPROFILE": str(home),
+            }
+        child_env.update(env or {})
         proc = subprocess.Popen(
             [sys.executable, "-c", code, *args],
             env=child_env,
@@ -212,7 +221,10 @@ def run_isolated(tmp_path):
         try:
             out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
+            if sys.platform == "win32":
+                proc.kill()
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate()
             raise
         return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)

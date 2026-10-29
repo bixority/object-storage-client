@@ -293,7 +293,7 @@ async def test_osc_decrypts_python_esdk(keyring_path, keyring, store, tmp_path, 
     master = _esdk_master_key(keyring_path, keyring)
     secure = EncryptedObjectStorageClient(keyring)
     # bound path: the osc:key an object written next to it would carry
-    key = str(tmp_path / "store" / "p.bin").lstrip("/")
+    key = (tmp_path / "store" / "p.bin").as_posix().lstrip("/")
     ctx = {"osc:fmt": "1", "osc:key": key, "tenant": "acme"}
     (tmp_path / "store" / "p.bin").write_bytes(_esdk_encrypt(master, ctx, data))
     assert await secure.get_object(f"{store}/p.bin") == data
@@ -311,7 +311,7 @@ async def test_osc_rejects_bad_esdk_context(keyring_path, keyring, store, tmp_pa
 
     master = _esdk_master_key(keyring_path, keyring)
     secure = EncryptedObjectStorageClient(keyring)
-    good = str(tmp_path / "store" / "bad.bin").lstrip("/")
+    good = (tmp_path / "store" / "bad.bin").as_posix().lstrip("/")
     cases = {
         "wrongkey": {"osc:fmt": "1", "osc:key": good + "x"},
         "nokey": {"osc:fmt": "1"},

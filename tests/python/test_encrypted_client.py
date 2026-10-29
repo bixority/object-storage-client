@@ -125,7 +125,7 @@ def test_status(keyring, two_keyring_path):
 
 def test_repr_shows_path_and_active_id_only(keyring, keyring_path):
     r = repr(keyring)
-    assert str(keyring_path) in r and keyring.status()["active"] in r
+    assert repr(str(keyring_path))[1:-1] in r and keyring.status()["active"] in r
     # nothing of the file body (material, check values) is shown
     assert "material" not in r and "check" not in r
 

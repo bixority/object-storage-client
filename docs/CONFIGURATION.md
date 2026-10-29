@@ -36,6 +36,12 @@ and `AWS_PROFILE` is never read (see [AWS profiles and SSO](#aws-profiles-and-ss
   `AWS_ENDPOINT` and `AWS_ENDPOINT_URL` that is set and not empty, then, with a
   profile, the profile's S3 `endpoint_url`. Without any, requests go to AWS,
   and bucket calls to `https://s3.<region>.amazonaws.com`, always over https.
+- Addressing: `S3_ADDRESSING_STYLE=path` (the default) puts the bucket in the
+  path, `S3_ADDRESSING_STYLE=virtual` puts it in the host. The value is
+  case-insensitive, and any other value is an error. When it is unset,
+  `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` decides. Object and bucket requests use
+  the same style. With a custom endpoint, `virtual` sends requests to the
+  endpoint as is, so the endpoint must already be scoped to the bucket.
 - An `http://` endpoint enables plain HTTP by itself. Plain HTTP exposes every
   request header to the network, including `x-amz-security-token`, so use it
   only for a local or otherwise trusted store.

@@ -22,7 +22,11 @@ export AWS_SESSION_TOKEN="..."
 export AWS_ENDPOINT_URL_S3="http://localhost:3900"
 
 # Convenience overrides honoured by this client (take precedence when set):
-#   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_ENDPOINT
+#   S3_REGION, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_ENDPOINT, S3_ADDRESSING_STYLE
+# Allow plain HTTP (e.g. a local Garage):
+#   export S3_ALLOW_HTTP=true
+# (It never applies to the AWS default endpoint: bucket operations against
+#  AWS always use https.)
 ```
 
 Without a named profile, `s3://` uses these variables: static keys, then web

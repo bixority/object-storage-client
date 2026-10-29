@@ -10,9 +10,10 @@
 //! staging files (`name#<digits>`). Directories are left in place, as
 //! `LocalFileSystem` without automatic cleanup does.
 
+use crate::backend::fs_path;
 use crate::client::{Error, Result};
 use object_store::path::Path as ObjectPath;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,19 +52,6 @@ fn is_listed_name(name: &str) -> bool {
     }
 }
 
-/// The file system path `object_store`'s local store maps `prefix` to.
-fn prefix_to_fs_path(prefix: &ObjectPath) -> PathBuf {
-    // The same mapping as `object_store`: through a `file:///` URL, which on
-    // Windows yields `C:\data` for a first part `C:` (a plain `push` would
-    // give the drive-relative `C:data`).
-    let mut url = url::Url::parse("file:///").expect("static URL is valid");
-    if let Ok(mut segments) = url.path_segments_mut() {
-        segments.pop_if_empty().extend(prefix.parts());
-    }
-    url.to_file_path()
-        .unwrap_or_else(|()| PathBuf::from(std::path::MAIN_SEPARATOR_STR))
-}
-
 /// Whether a file at `fs_path` is one `object_store` would list. A name it
 /// cannot map to an object path makes its list fail, so this errors too.
 fn is_listed(fs_path: &Path) -> Result<bool> {
@@ -76,7 +64,7 @@ fn is_listed(fs_path: &Path) -> Result<bool> {
 /// following a symlink. A missing prefix, or one that is not a directory, is
 /// not an error.
 pub async fn delete_by_prefix(prefix: ObjectPath) -> Result<()> {
-    let root = prefix_to_fs_path(&prefix);
+    let root = fs_path(&prefix)?;
     let cancel = Arc::new(AtomicBool::new(false));
     let _guard = CancelOnDrop(Arc::clone(&cancel));
     tokio::task::spawn_blocking(move || walk_root(&root, &cancel))
@@ -213,19 +201,6 @@ fn walk_dir(dir: &Path, cancel: &AtomicBool, depth: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::local::LocalFileSystem;
-
-    #[test]
-    fn prefix_mapping_matches_object_store() {
-        let fs = LocalFileSystem::new();
-        for p in ["a", "a/b/c", "with space/x%20y"] {
-            let prefix = ObjectPath::from(p);
-            assert_eq!(
-                prefix_to_fs_path(&prefix),
-                fs.path_to_filesystem(&prefix).expect("maps")
-            );
-        }
-    }
 
     #[test]
     fn deep_tree_is_an_error() {

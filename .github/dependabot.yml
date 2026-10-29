@@ -6,3 +6,13 @@ updates:
     interval: daily
     time: "08:00"
   open-pull-requests-limit: 10
+  # Security updates are not delayed by the cooldown.
+  cooldown:
+    default-days: 7
+# Action bumps are never auto-merged (see dependabot-merge in tests.yaml).
+- package-ecosystem: github-actions
+  directory: "/"
+  schedule:
+    interval: weekly
+  cooldown:
+    default-days: 7

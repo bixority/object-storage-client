@@ -26,3 +26,6 @@ target
 python/object_storage_client/*.so
 __pycache__/
 .venv/
+
+# Local planning notes: kept on disk, not versioned.
+docs/superpowers/

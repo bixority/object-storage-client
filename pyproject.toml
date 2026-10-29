@@ -9,7 +9,8 @@ description = "Unified object storage client API"
 authors = [
     { name = "Olegs Korsaks", email = "bixority@proton.me" }
 ]
-license-files = [ "LICENSE" ]
+license = "GPL-3.0-only"
+license-files = [ "LICENSE", "THIRD_PARTY_LICENSES.html" ]
 readme = "README.md"
 requires-python = ">=3.13.9,<3.16.0"
 classifiers = [

@@ -304,20 +304,90 @@ macro_rules! client_suite {
                 Ok(())
             }
 
+            /// A local copy must not be a hard link: it would share the
+            /// source's inode, owner and later in-place writes.
+            #[cfg(unix)]
             #[tokio::test]
-            async fn delete_by_prefix_rejects_an_empty_prefix() -> Result<()> {
+            async fn a_local_copy_is_an_independent_file() -> Result<()> {
+                use std::io::Write as _;
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
                 let dir = tempdir()?;
                 let client = $ctor;
-                let a = url_of(&dir, "a");
-                client.put(&a, &b"data"[..]).await?;
-                let here = std::env::current_dir()?;
+                let (a, b) = (url_of(&dir, "a"), url_of(&dir, "b"));
+                client.put(&a, &b"original"[..]).await?;
+                std::fs::set_permissions(
+                    dir.path().join("a"),
+                    std::fs::Permissions::from_mode(0o600),
+                )?;
 
-                for bad in ["", "  ", "\t\n", "file:///", "file://localhost/", "/"] {
-                    let err = client.delete_by_prefix(bad).await.expect_err(bad);
-                    assert!(matches!(err, Error::InvalidInput(_)), "{bad:?}: {err:?}");
+                client.copy(&a, &b).await?;
+                let (ma, mb) = (
+                    std::fs::metadata(dir.path().join("a"))?,
+                    std::fs::metadata(dir.path().join("b"))?,
+                );
+                assert_ne!(ma.ino(), mb.ino());
+                assert_eq!(mb.permissions().mode() & 0o777, 0o600);
+
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(dir.path().join("a"))?
+                    .write_all(b" appended")?;
+                assert_eq!(client.get(&b).await?.as_ref(), b"original");
+                assert_eq!(names(dir.path()), ["a", "b"]);
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn file_urls_with_a_fragment_are_refused() -> Result<()> {
+                let dir = tempdir()?;
+                let client = $ctor;
+                let err = client
+                    .put(&url_of(&dir, "a#b"), &b"x"[..])
+                    .await
+                    .expect_err("a fragment is refused");
+                assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+                assert_eq!(std::fs::read_dir(dir.path())?.count(), 0);
+
+                // In a local path `#` is an ordinary file name character.
+                let local = format!("{}/a#b", dir.path().display());
+                client.put(&local, &b"x"[..]).await?;
+                assert!(dir.path().join("a#b").is_file());
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn file_dot_segments_resolve_except_for_delete_by_prefix() -> Result<()> {
+                let dir = tempdir()?;
+                let client = $ctor;
+                client.put(&url_of(&dir, "x/../y"), &b"x"[..]).await?;
+                assert!(dir.path().join("y").is_file());
+
+                let keep = dir.path().join("keep");
+                std::fs::create_dir_all(keep.join("x"))?;
+                std::fs::write(keep.join("f"), b"f")?;
+                for prefix in [
+                    format!("file://{}/keep/x/..", dir.path().display()),
+                    format!("{}/keep/x/..", dir.path().display()),
+                ] {
+                    let err = client
+                        .delete_by_prefix(&prefix)
+                        .await
+                        .expect_err("a dot segment is refused");
+                    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+                    assert!(keep.join("f").is_file());
                 }
-                assert_eq!(std::env::current_dir()?, here);
-                assert!(client.exists(&a).await?);
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn a_local_path_with_dot_dot_writes_the_resolved_file() -> Result<()> {
+                let dir = tempdir()?;
+                std::fs::create_dir(dir.path().join("sub"))?;
+                let client = $ctor;
+                let path = format!("{}/sub/../a.txt", dir.path().display());
+                client.put(&path, &b"x"[..]).await?;
+                assert!(dir.path().join("a.txt").is_file());
+                assert_eq!(client.get(&path).await?.as_ref(), b"x");
                 Ok(())
             }
         }

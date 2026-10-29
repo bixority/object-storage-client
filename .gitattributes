@@ -1,1 +1,2 @@
 tests/vectors/**/*.bin binary
+fuzz/seeds/** binary

@@ -3,6 +3,8 @@ name: Build and publish release
 on:
   release:
     types: [published]
+  # Dry run from a branch: builds and tests, but never publishes.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,53 +16,83 @@ concurrency:
 jobs:
 
   test:
-    name: Test (${{ matrix.toolchain }})
+    # Stable only: a beta or nightly compiler problem must not block a release.
+    name: Test
     runs-on: ubuntu-latest
 
-    strategy:
-      fail-fast: false
-      matrix:
-        toolchain: [stable, beta, nightly]
-
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: stable
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
 
   rustfmt:
     name: Rustfmt + Clippy
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
 
+
+  # The wheels ship the committed THIRD_PARTY_LICENSES.html: build them only if
+  # it is what the locked dependencies need, and no license is unaccepted.
+  licenses:
+    name: Third-party licenses
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-about@0.9.3
+
+      - name: Regenerate the notices
+        run: >
+          cargo about generate --locked --fail --no-default-features
+          --features python,encryption about.hbs
+          --output-file THIRD_PARTY_LICENSES.html
+
+      - name: The committed notices are current
+        run: git diff --exit-code -- THIRD_PARTY_LICENSES.html
 
   build-wheels:
     name: Build wheels (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }} / py${{ matrix.python }})
-    needs: [ test, rustfmt ]
+    needs: [ test, rustfmt, licenses ]
     runs-on: ${{ matrix.runner || matrix.os }}
 
     strategy:
@@ -89,14 +121,16 @@ jobs:
             manylinux: 2_28
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
         if: matrix.arch
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: build
           target: ${{ matrix.target }}
@@ -110,11 +144,122 @@ jobs:
             --interpreter python${{ matrix.python }}
             --out dist
 
+      # PEP 639: the license files are under *.dist-info/licenses/.
+      - name: The wheel carries the license and the third-party notices
+        shell: bash
+        run: |
+          py=$(command -v python3 || command -v python)
+          "$py" - dist/*.whl <<'PY'
+          import sys, zipfile
+          for path in sys.argv[1:]:
+              with zipfile.ZipFile(path) as wheel:
+                  names = wheel.namelist()
+                  for name in ("LICENSE", "THIRD_PARTY_LICENSES.html"):
+                      if not any(n.endswith(f".dist-info/licenses/{name}") for n in names):
+                          sys.exit(f"{path}: no {name} in dist-info/licenses")
+                  notices = next(n for n in names if n.endswith("/licenses/THIRD_PARTY_LICENSES.html"))
+                  if b"Apache Arrow Object Store" not in wheel.read(notices):
+                      sys.exit(f"{path}: the notices lack object_store's NOTICE")
+          PY
+
       - name: Upload wheel artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: wheels-${{ matrix.os }}${{ matrix.target && format('-{0}', matrix.target) || '' }}-py${{ matrix.python }}
           path: dist/*.whl
+
+  # Installs each built wheel into a fresh environment on its own platform and
+  # runs the Python tests that need no containers. Publishing waits for this.
+  test-wheels:
+    name: Test wheel (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }} / py${{ matrix.python }})
+    needs: [ build-wheels ]
+    # The same legs as build-wheels. The aarch64 wheels are built and tested
+    # under QEMU on ubuntu-latest: no arm runner is needed.
+    runs-on: ${{ matrix.runner || matrix.os }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.13", "3.14", "3.15"]
+        include:
+          - os: linux-aarch64
+            python: "3.13"
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - os: linux-aarch64
+            python: "3.14"
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - os: linux-aarch64
+            python: "3.15"
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: '!matrix.arch'
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The artifact name is the one build-wheels uploads this wheel under.
+      - name: Download the wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: wheels-${{ matrix.os }}${{ matrix.target && format('-{0}', matrix.target) || '' }}-py${{ matrix.python }}
+          path: dist
+
+      - name: Set up QEMU
+        if: matrix.arch
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Install the test dependencies
+        if: '!matrix.arch'
+        run: uv sync --group dev --group oracle --locked --no-install-project
+
+      # The project itself is not built here: only the wheel under test is
+      # installed, so a missing or broken wheel fails the job.
+      - name: Install the wheel
+        if: '!matrix.arch'
+        run: uv pip install --no-index --find-links dist object-storage-client
+
+      # pyproject's addopts exclude the container tests.
+      - name: Run the Python tests
+        if: '!matrix.arch'
+        run: uv run --no-sync pytest
+
+      # The aarch64 wheel is tested inside the same manylinux image that built
+      # it, under QEMU. The container installs the test dependencies from the
+      # locked export and the wheel from dist, then runs pytest in /work.
+      - name: Run the Python tests (aarch64, emulated manylinux)
+        if: matrix.arch
+        env:
+          PY_VERSION: ${{ matrix.python }}
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -e PY_VERSION \
+            -v "$PWD:/work" -w /work \
+            quay.io/pypa/manylinux_2_28_aarch64 \
+            bash -euo pipefail -c '
+              tag=$(echo "$PY_VERSION" | tr -d .)
+              /opt/python/cp${tag}-cp${tag}/bin/python -m venv /tmp/venv
+              /tmp/venv/bin/python -m pip install --quiet uv
+              /tmp/venv/bin/uv export --locked --no-hashes --no-emit-project \
+                --group dev --group oracle > /tmp/requirements.txt
+              /tmp/venv/bin/uv pip install --python /tmp/venv/bin/python \
+                -r /tmp/requirements.txt
+              /tmp/venv/bin/uv pip install --python /tmp/venv/bin/python \
+                --no-index --no-deps --find-links dist object-storage-client
+              /tmp/venv/bin/python -m pytest
+            '
 
   build-sdist:
     name: Build source distribution
@@ -122,52 +267,87 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --out dist
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: sdist
           path: dist/*.tar.gz
 
-  publish-crate:
-    name: Publish crate to Codeberg
-    needs: [ build-wheels, build-sdist ]
+  # Verification build for the crate. No secrets are available here, so no
+  # dependency build script or proc macro runs next to a publishing credential.
+  package-crate:
+    name: Package crate
+    needs: [ test, rustfmt ]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install stable --profile minimal && rustup default stable
 
+      - name: Check the tag against the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Package crate
+        run: cargo package --locked
+
+  publish-crate:
+    name: Publish crate to Codeberg
+    needs: [ package-crate, build-wheels, test-wheels, build-sdist ]
+    runs-on: ubuntu-latest
+    environment: release
+    if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      # --no-verify: package-crate already built the package, and nothing
+      # compiles here, so no dependency code runs next to the token.
       - name: Publish crate
-        run: cargo publish --registry bixority-codeberg
+        run: cargo publish --registry bixority-codeberg --locked --no-verify
         env:
           CARGO_REGISTRIES_BIXORITY_CODEBERG_TOKEN: Bearer ${{ secrets.CODEBERG_TOKEN }}
 
   publish-to-pypi:
     name: Publish to PyPI
-    needs: [ build-wheels, build-sdist ]
+    needs: [ package-crate, build-wheels, test-wheels, build-sdist ]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    environment: release
+    if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
 
-      - name: Install uv
-        run: pip install uv
-
+      # Trusted Publishing (OIDC): no stored token. Also uploads PEP 740 attestations.
       - name: Publish to PyPI
-        run: uv publish dist/* --token ${{ secrets.PYPI_API_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

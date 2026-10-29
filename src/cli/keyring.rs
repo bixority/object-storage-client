@@ -2,7 +2,7 @@
 //! helpers.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -12,12 +12,10 @@ use std::time::{Duration, Instant};
 use clap::Subcommand;
 use zeroize::Zeroizing;
 
-use super::{CliError, sanitize};
+use super::CliError;
+use super::output::{sanitize, write_stdout};
 use crate::encryption::keys::keyring::MAX_KEYRING_LEN;
-use crate::encryption::{Keyring, new_keyring, retire_key, rotate_keyring};
-
-/// Environment variable naming the command that prints a keyring.
-const COMMAND_ENV: &str = "OSC_KEYRING_COMMAND";
+use crate::encryption::{Keyring, activate_key, add_key, new_keyring, retire_key, rotate_keyring};
 
 /// How long `OSC_KEYRING_COMMAND` may run.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,7 +35,27 @@ pub(super) enum KeyringCommand {
         force: bool,
     },
     /// Read a keyring from standard input and print it with a fresh key
-    /// added and made active.
+    /// added but not active (step 1 of a rollout; the new ID goes to standard
+    /// error). Publish it, wait until every reader has it, then `activate`.
+    Add {
+        /// Prefix of the key ID.
+        #[arg(long, default_value = "kek")]
+        prefix: String,
+        /// Write to a terminal too.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Read a keyring from standard input and print it with the key ID made
+    /// active (step 2 of a rollout).
+    Activate {
+        id: String,
+        /// Write to a terminal too.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Read a keyring from standard input and print it with a fresh key
+    /// added and made active at once: only for a keyring that a single
+    /// process reads, else use `add` then `activate`.
     Rotate {
         /// Prefix of the key ID.
         #[arg(long, default_value = "kek")]
@@ -53,24 +71,38 @@ pub(super) enum KeyringCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Validate a keyring and list its keys: the configured one (`--keyring`
-    /// or `OSC_KEYRING_COMMAND`), otherwise standard input. Exits with 3 when
+    /// Read a keyring from standard input, validate it and list its keys.
+    /// With `--configured`, check the configured key source (`--keyring`,
+    /// `OSC_KEYRING_FILE` or `OSC_KEYRING_COMMAND`) instead. Exits with 3 when
     /// the active key is too old.
     Status {
         /// Age in days from which the active key counts as overdue.
         #[arg(long, default_value_t = 365)]
         max_age_days: i64,
+        /// Check the configured key source instead of standard input.
+        #[arg(long)]
+        configured: bool,
     },
 }
 
+/// The configured key sources: `--keyring` (`OSC_KEYRING_FILE`) and the
+/// command of `OSC_KEYRING_COMMAND`. The binary reads the environment; this
+/// code never does.
+pub(super) struct KeySources {
+    pub(super) file: Option<PathBuf>,
+    pub(super) command: Option<OsString>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum Source {
     File(PathBuf),
     Command(OsString),
 }
 
-/// The one configured key source, if any.
-fn source(file: Option<PathBuf>) -> Result<Option<Source>, CliError> {
-    let command = std::env::var_os(COMMAND_ENV).filter(|c| !c.is_empty());
+/// The one configured key source, if any. An empty command counts as unset.
+fn source(sources: KeySources) -> Result<Option<Source>, CliError> {
+    let KeySources { file, command } = sources;
+    let command = command.filter(|c| !c.is_empty());
     match (file, command) {
         (Some(_), Some(_)) => Err(CliError::KeyringSourcesConflict),
         (Some(file), None) => Ok(Some(Source::File(file))),
@@ -80,20 +112,20 @@ fn source(file: Option<PathBuf>) -> Result<Option<Source>, CliError> {
 }
 
 /// Whether a key source is configured (which enables encryption).
-pub(super) fn is_configured(file: Option<PathBuf>) -> Result<bool, CliError> {
-    source(file).map(|s| s.is_some())
+pub(super) fn is_configured(sources: KeySources) -> Result<bool, CliError> {
+    source(sources).map(|s| s.is_some())
 }
 
 /// The configured keyring, or `None` for plain operation.
-pub(super) async fn open(file: Option<PathBuf>) -> Result<Option<Arc<Keyring>>, CliError> {
-    let ring = match source(file)? {
+pub(super) async fn open(sources: KeySources) -> Result<Option<Arc<Keyring>>, CliError> {
+    let ring = match source(sources)? {
         None => return Ok(None),
         Some(Source::File(path)) => Keyring::from_file(path)?,
         Some(Source::Command(command)) => {
             // Blocking, so off the thread that waits for signals.
             tokio::task::spawn_blocking(move || run_command(&command, COMMAND_TIMEOUT))
                 .await
-                .map_err(|e| CliError::Output(std::io::Error::other(e)))??
+                .map_err(CliError::Task)??
         }
     };
     Ok(Some(Arc::new(ring)))
@@ -195,7 +227,7 @@ async fn read_stdin() -> Result<Zeroizing<Vec<u8>>, CliError> {
         Ok(raw)
     })
     .await
-    .map_err(|e| CliError::Output(std::io::Error::other(e)))?
+    .map_err(CliError::Task)?
 }
 
 async fn read_stdin_text() -> Result<Zeroizing<String>, CliError> {
@@ -216,23 +248,36 @@ fn check_terminal(force: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-fn write_stdout(text: &str) -> Result<(), CliError> {
-    let mut out = std::io::stdout().lock();
-    out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .map_err(CliError::Output)
-}
-
 fn today() -> chrono::NaiveDate {
     chrono::Utc::now().date_naive()
 }
 
 /// `osc keyring ...`.
-pub(super) async fn run(cmd: KeyringCommand, file: Option<PathBuf>) -> Result<(), CliError> {
+pub(super) async fn run(cmd: KeyringCommand, sources: KeySources) -> Result<(), CliError> {
     match cmd {
         KeyringCommand::New { prefix, force } => {
             check_terminal(force)?;
             write_stdout(&new_keyring(&prefix, today())?)
+        }
+        KeyringCommand::Add { prefix, force } => {
+            check_terminal(force)?;
+            let input = read_stdin_text().await?;
+            let added = add_key(&input, &prefix, today())?;
+            // The new key is the last one; only its ID is reported.
+            let id = Keyring::parse(&added)?
+                .status()
+                .keys
+                .pop()
+                .map(|k| k.id)
+                .unwrap_or_default();
+            write_stdout(&added)?;
+            errln!("added inactive key {id}");
+            Ok(())
+        }
+        KeyringCommand::Activate { id, force } => {
+            check_terminal(force)?;
+            let input = read_stdin_text().await?;
+            write_stdout(&activate_key(&input, &id)?)
         }
         KeyringCommand::Rotate { prefix, force } => {
             check_terminal(force)?;
@@ -244,16 +289,37 @@ pub(super) async fn run(cmd: KeyringCommand, file: Option<PathBuf>) -> Result<()
             let input = read_stdin_text().await?;
             write_stdout(&retire_key(&input, &id)?)
         }
-        KeyringCommand::Status { max_age_days } => status(file, max_age_days).await,
+        KeyringCommand::Status {
+            max_age_days,
+            configured,
+        } => status(sources, max_age_days, configured).await,
     }
 }
 
-async fn status(file: Option<PathBuf>, max_age_days: i64) -> Result<(), CliError> {
-    let ring = if let Some(ring) = open(file).await? {
-        ring
+/// Where `keyring status` reads the keyring from.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusInput {
+    Configured,
+    Stdin,
+}
+
+/// Standard input unless `configured`, and never a terminal: a person who
+/// typed the command with nothing piped in would wait for input that never
+/// comes, or check a keyring other than the one they meant.
+const fn status_input(configured: bool, stdin_is_terminal: bool) -> Result<StatusInput, CliError> {
+    if configured {
+        Ok(StatusInput::Configured)
+    } else if stdin_is_terminal {
+        Err(CliError::KeyringStatusTerminal)
     } else {
-        let input = read_stdin_text().await?;
-        Arc::new(Keyring::parse(&input)?)
+        Ok(StatusInput::Stdin)
+    }
+}
+
+async fn status(sources: KeySources, max_age_days: i64, configured: bool) -> Result<(), CliError> {
+    let ring = match status_input(configured, std::io::stdin().is_terminal())? {
+        StatusInput::Configured => open(sources).await?.ok_or(CliError::KeyringNotConfigured)?,
+        StatusInput::Stdin => Arc::new(Keyring::parse(&read_stdin_text().await?)?),
     };
     let today = today();
     let status = ring.status_on(today);
@@ -279,7 +345,7 @@ async fn status(file: Option<PathBuf>, max_age_days: i64) -> Result<(), CliError
         table.push_str(line.trim_end());
         table.push('\n');
     }
-    print!("{table}");
+    write_stdout(&table)?;
     if status.active_age_days > max_age_days {
         return Err(CliError::KeyOverdue {
             id: sanitize(&status.active),
@@ -288,4 +354,76 @@ async fn status(file: Option<PathBuf>, max_age_days: i64) -> Result<(), CliError
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sources(file: Option<&str>, command: Option<&str>) -> KeySources {
+        KeySources {
+            file: file.map(PathBuf::from),
+            command: command.map(OsString::from),
+        }
+    }
+
+    #[test]
+    fn status_reads_standard_input_unless_configured_and_refuses_a_terminal() {
+        assert_eq!(
+            status_input(false, false).expect("stdin"),
+            StatusInput::Stdin
+        );
+        assert_eq!(
+            status_input(true, false).expect("configured"),
+            StatusInput::Configured
+        );
+        // `--configured` does not read standard input, so a terminal is fine.
+        assert_eq!(
+            status_input(true, true).expect("configured"),
+            StatusInput::Configured
+        );
+        assert!(matches!(
+            status_input(false, true),
+            Err(CliError::KeyringStatusTerminal)
+        ));
+    }
+
+    #[test]
+    fn no_source_is_plain_operation() {
+        assert_eq!(source(sources(None, None)).expect("source"), None);
+    }
+
+    #[test]
+    fn a_file_is_a_file_source() {
+        assert_eq!(
+            source(sources(Some("ring"), None)).expect("source"),
+            Some(Source::File("ring".into()))
+        );
+    }
+
+    #[test]
+    fn a_command_is_a_command_source() {
+        assert_eq!(
+            source(sources(None, Some("cat ring"))).expect("source"),
+            Some(Source::Command("cat ring".into()))
+        );
+    }
+
+    #[test]
+    fn an_empty_command_counts_as_unset() {
+        assert_eq!(source(sources(None, Some(""))).expect("source"), None);
+        // It does not conflict with a file either.
+        assert_eq!(
+            source(sources(Some("ring"), Some(""))).expect("source"),
+            Some(Source::File("ring".into()))
+        );
+    }
+
+    #[test]
+    fn both_sources_conflict() {
+        assert!(matches!(
+            source(sources(Some("ring"), Some("cat ring"))),
+            Err(CliError::KeyringSourcesConflict)
+        ));
+    }
 }

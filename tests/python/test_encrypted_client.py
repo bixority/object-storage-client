@@ -35,6 +35,26 @@ def test_construction_routes(plain, keyring):
     assert isinstance(plain.with_encryption(keyring).without_encryption(), ObjectStorageClient)
 
 
+async def test_encrypted_constructor_accepts_profile(keyring, store):
+    secure = EncryptedObjectStorageClient(keyring, profile="x")
+    await secure.put_object(f"{store}/a", b"payload")
+    assert await secure.get_object(f"{store}/a") == b"payload"
+    # The object really is encrypted.
+    assert (await secure.inspect_encryption(f"{store}/a"))["key_names"]
+    with pytest.raises(TypeError):
+        EncryptedObjectStorageClient(keyring, profile=1)
+    with pytest.raises(TypeError):  # profile is keyword-only
+        EncryptedObjectStorageClient(keyring, True, 65536, "x")
+
+
+@pytest.mark.parametrize("frame_length", [-1, 2**32])
+def test_out_of_range_frame_length_is_value_error(plain, keyring, frame_length):
+    with pytest.raises(ValueError, match="frame_length"):
+        plain.with_encryption(keyring, frame_length=frame_length)
+    with pytest.raises(ValueError, match="frame_length"):
+        EncryptedObjectStorageClient(keyring, frame_length=frame_length)
+
+
 def test_bad_frame_length_raises(plain, keyring):
     with pytest.raises(ValueError):
         plain.with_encryption(keyring, frame_length=1)
@@ -424,6 +444,22 @@ async def test_reencrypt_cutoff_and_plain(plain, keyring_path, two_keyring_path,
     assert await secure.reencrypt(f"{store}/p", first) == "not-encrypted"
 
 
+async def test_reencrypt_before_accepts_any_aware_offset(
+    plain, keyring_path, two_keyring_path, store
+):
+    first = Keyring.from_file(keyring_path).status()["active"]
+    secure = plain.with_encryption(Keyring.from_file(two_keyring_path))
+    await plain.with_encryption(Keyring.from_file(keyring_path)).put_object(f"{store}/c", b"x")
+    # A sub-minute offset used to be rejected as "not timezone-aware".
+    odd = datetime.timezone(datetime.timedelta(hours=5, seconds=30))
+    before = datetime.datetime(2020, 1, 1, tzinfo=odd)
+    assert (
+        await secure.reencrypt(f"{store}/c", first, before=before, dry_run=True) == "after-cutoff"
+    )
+    with pytest.raises(TypeError):
+        await secure.reencrypt(f"{store}/c", first, before="2020-01-01", dry_run=True)
+
+
 async def test_reencrypt_argument_errors(plain, two_keyring_path, store):
     keyring = Keyring.from_file(two_keyring_path)
     secure = plain.with_encryption(keyring)
@@ -431,3 +467,38 @@ async def test_reencrypt_argument_errors(plain, two_keyring_path, store):
         await secure.reencrypt(f"{store}/x", keyring.status()["active"])
     with pytest.raises(ValueError):
         await secure.reencrypt(f"{store}/x", "other", before=datetime.datetime(2000, 1, 1))
+
+
+async def test_required_context_detects_a_swapped_object(plain, keyring, tmp_path):
+    # The same name in two stores, written under different contexts. The
+    # binding is off, as when two buckets hold the same path.
+    secure = plain.with_encryption(keyring, bind_object_key=False)
+    stores = []
+    for name in ("eu", "us"):
+        (tmp_path / name).mkdir()
+        stores.append((tmp_path / name).as_uri())
+    eu, us = (f"{s}/obj" for s in stores)
+    await secure.put_object(eu, b"eu data", context={"region": "eu"})
+    await secure.put_object(us, b"us data", context={"region": "us"})
+
+    # Matching, subset (here: nothing required) and an unchecked read succeed.
+    assert await secure.get_object(eu, context={"region": "eu"}) == b"eu data"
+    assert await collect(await secure.get_object_stream(eu, context={"region": "eu"})) == b"eu data"
+    assert await secure.get_object(eu) == b"eu data"
+
+    # Swap: the us bytes now sit where the eu object was.
+    await plain.put_object(eu, await plain.get_object(us))
+    assert await secure.get_object(eu) == b"us data"
+    with pytest.raises(DecryptionError, match="region"):
+        await secure.get_object(eu, context={"region": "eu"})
+    with pytest.raises(DecryptionError, match="region"):
+        await collect(await secure.get_object_stream(eu, context={"region": "eu"}))
+    assert await secure.get_object(eu, context={"region": "us"}) == b"us data"
+
+
+async def test_required_context_rejects_reserved_keys(secure, store):
+    for bad in ("osc:key", "aws-crypto-public-key"):
+        with pytest.raises(ValueError, match="reserved context key"):
+            await secure.get_object(f"{store}/none.bin", context={bad: "v"})
+        with pytest.raises(ValueError, match="reserved context key"):
+            await secure.get_object_stream(f"{store}/none.bin", context={bad: "v"})

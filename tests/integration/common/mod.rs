@@ -14,9 +14,16 @@
 //! containers carry well-known test keys. testcontainers-rs has no Ryuk
 //! reaper here (and reusable containers are exempt from removal anyway), so
 //! the containers outlive the test process; CI runners are discarded.
-//! A changed image tag gets a new container name; after changing anything else
-//! about the container setup (for example `.docker/garage.toml`), start from a
-//! fresh state by removing the containers by label:
+//!
+//! Garage is pinned, and its container name carries the image tag
+//! (`osc-it-garage-v2.5.0`). Azurite and fake-gcs-server follow `latest` on
+//! purpose, under the fixed names `osc-it-azurite` and `osc-it-gcs`.
+//! testcontainers reuses a container by name whatever image it was created
+//! from, and only pulls an image that is missing. A reused local container
+//! therefore keeps the image it was created from, while a fresh CI runner
+//! pulls the newest. To test against the newest `latest` (or after changing
+//! anything else about the container setup, for example `.docker/garage.toml`),
+//! pull the image and remove the containers by label:
 //! `podman rm -f $(podman ps -aq --filter label=org.bixority.object-storage-client)`
 //! (use `docker` instead of `podman` where applicable; the label values are
 //! `it-garage`, `it-azurite` and `it-gcs`).
@@ -230,10 +237,57 @@ pub fn unique_gcs_bucket() -> String {
     format!("gs://it-{}/", uuid_like())
 }
 
+/// A name part that is unique per call, per process and per run: the start
+/// time and the process id (both in hex) plus a counter, so back-to-back calls
+/// never collide whatever the clock resolution.
 fn uuid_like() -> String {
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!("{nanos:x}")
+
+    static RUN: LazyLock<String> = LazyLock::new(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("{nanos:x}-{:x}", std::process::id())
+    });
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    format!("{}-{}", *RUN, COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn unique_names_never_repeat() {
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            for name in [unique_bucket(), unique_container(), unique_gcs_bucket()] {
+                assert!(seen.insert(name.clone()), "repeated name {name}");
+            }
+        }
+        assert_eq!(seen.len(), 30_000);
+    }
+
+    #[test]
+    fn container_names_are_valid_for_azure() {
+        for _ in 0..1_000 {
+            let url = unique_container();
+            let name = url
+                .strip_prefix("az://")
+                .and_then(|n| n.strip_suffix('/'))
+                .expect("az://<name>/");
+            assert!((3..=63).contains(&name.len()), "{name}");
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{name}"
+            );
+            assert!(!name.contains("--"), "{name}");
+            assert!(!name.starts_with('-') && !name.ends_with('-'), "{name}");
+        }
+    }
 }

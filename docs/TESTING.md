@@ -7,16 +7,30 @@ No containers or network needed:
 ```bash
 cargo test --all-features
 
-uv sync --group dev --no-install-project
+uv sync --group dev --group oracle --no-install-project
 uv run --no-sync maturin develop
 uv run --no-sync pytest
 ```
+
+The `oracle` group installs the AWS Encryption SDK. Without it the Python
+interop tests skip silently (`pytest.importorskip`).
 
 `cargo test` runs the library's unit tests, `tests/unit.rs`,
 `tests/functional.rs` (the client, encryption and `osc` on `file://` in
 temporary directories, plus the golden ciphertexts in `tests/vectors/golden/`)
 and `tests/perf_guards.rs`. A plain `pytest` runs `tests/python/` without the
 container tests.
+
+Behind a proxy: set `NO_PROXY=127.0.0.1,localhost` when `HTTP_PROXY`,
+`HTTPS_PROXY` or `ALL_PROXY` is exported. The loopback stubs are reached
+through `object_store`'s clients, which always honour system proxies and cannot
+turn them off. The clients the crate builds itself ignore proxies in tests
+(injected variables).
+
+To check that the tests do not depend on your machine, run
+`scripts/hostile-env.sh`: it runs the library, unit and functional suites
+with a poisoned HOME and `~/.aws`, poisoned `AWS_*`, `S3_*` and `OSC_*`
+variables, a dead proxy and a dead IMDS endpoint. It is not run in CI.
 
 ## Integration tests
 
@@ -56,11 +70,17 @@ export TESTCONTAINERS_RYUK_DISABLED=true
 ```
 
 The Rust tests' containers are not removed when the tests end. They are reusable: one
-Garage and one Azurite container (named `osc-it-garage-v2.5.0` and
-`osc-it-azurite`) are started by the first run and reused by later runs, which
-is safe because every test uses unique prefixes and bucket names. Their ports
-are published on 127.0.0.1 only, since the long-lived containers carry
-well-known test keys. For a fresh state, remove them by label:
+Garage, one Azurite and one fake-gcs-server container (named
+`osc-it-garage-v2.5.0`, `osc-it-azurite` and `osc-it-gcs`) are started by the
+first run and reused by later runs, which is safe because every test uses
+unique prefixes and bucket names. Garage is pinned and its name carries the
+image tag. Azurite and fake-gcs-server follow `latest` on purpose, under fixed
+names. testcontainers reuses a container by name whatever image it was created
+from and only pulls an image that is missing, so a reused local container keeps
+its old image while CI pulls the newest. To test against the newest `latest`,
+pull the image and remove the containers by label. Their ports are published
+on 127.0.0.1 only, since the long-lived containers carry well-known test keys.
+For a fresh state, remove them by label:
 
 ```bash
 podman rm -f $(podman ps -aq --filter label=org.bixority.object-storage-client)
@@ -97,19 +117,22 @@ UV_NO_SYNC=1 cargo test --all-features -- --ignored oracle
 ```
 
 `tests/vectors/esdk/` holds reference ciphertexts made by the SDK and
-`tests/vectors/golden/` objects written by this client; their READMEs explain
-how to regenerate them. Every key in `tests/vectors/` is test-only.
+`tests/vectors/golden/` objects written by this client. The ESDK vectors are
+regenerated as their README explains; the golden v1 files are frozen and never
+regenerated. Every key in `tests/vectors/` is test-only.
 
 ## Performance
 
 `cargo bench --bench throughput --no-default-features --features encryption`
 prints a table of get, get_stream, put_stream (several chunk sizes), a
-re-encrypting copy and 1000 small objects, plain and encrypted, on `file://`
-and in memory. `tests/perf_guards.rs` (part of `cargo test`) pins allocation
+re-encrypting copy and 1000 small objects, plain and encrypted, on `file://`.
+`tests/perf_guards.rs` (part of `cargo test`) pins allocation
 counts and peak heap with a counting allocator, so regressions fail
 deterministically. The `perf` workflow runs the bench and a 512 MiB `osc`
-smoke test (`scripts/perf_smoke.py`) nightly or on demand: peak-RSS budgets
-fail the job, throughput only warns.
+smoke test (`scripts/perf_smoke.py`) nightly or on demand. It compares the
+smoke test's throughput with the previous successful run's, kept in the Actions
+cache, and only warns when it drops by more than 25%; peak-RSS budgets fail the job. The
+first run, or one after the cache expired, has nothing to compare with.
 
 ## Fuzzing
 

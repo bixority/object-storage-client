@@ -1,0 +1,41 @@
+{{!-- cargo-about template for THIRD_PARTY_LICENSES.html. The object_store
+NOTICE below is static (Apache-2.0 section 4(d)); keep it equal to the
+NOTICE.txt of the locked object_store version. --}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Third-party licenses</title>
+</head>
+<body>
+<h1>Third-party licenses</h1>
+<p>object-storage-client is licensed under GPL-3.0-only (see LICENSE). The Python extension module statically links the crates below, which are used under these licenses and notices.</p>
+<h2>Declared licenses</h2>
+<ul>
+{{#each overview}}
+<li><a href="#{{id}}">{{name}}</a></li>
+{{/each}}
+</ul>
+<h2>Notices</h2>
+<h3 id="notice-object_store">object_store</h3>
+<pre>Apache Arrow Object Store
+Copyright 2020-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+</pre>
+<h2>License texts</h2>
+{{#each licenses}}
+<section id="{{id}}">
+<h3>{{name}}</h3>
+<p>Used by:</p>
+<ul>
+{{#each used_by}}
+<li>{{crate.name}}</li>
+{{/each}}
+</ul>
+<pre>{{text}}</pre>
+</section>
+{{/each}}
+</body>
+</html>

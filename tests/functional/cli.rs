@@ -1,5 +1,6 @@
 //! Functional tests of the `osc` CLI over `file://` stores.
 
+use crate::support::Osc;
 use chrono::NaiveDate;
 use clap::{CommandFactory, FromArgMatches};
 use object_storage_client::Error;
@@ -9,41 +10,36 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::{TempDir, tempdir};
 
-const OSC: &str = env!("CARGO_BIN_EXE_osc");
-
 /// Runs the CLI in-process.
 async fn osc(args: &[&str]) -> Result<(), CliError> {
     let full = std::iter::once("osc").chain(args.iter().copied());
-    // Without the env binding, so an exported OSC_KEYRING_FILE cannot leak in.
+    // Without the env bindings, so an exported OSC_KEYRING_FILE or
+    // OSC_REQUIRE_ENCRYPTION cannot leak in.
     let m = Cli::command()
         .mut_arg("keyring", |a| a.env(None))
+        .mut_arg("require_encryption", |a| a.env(None))
         .try_get_matches_from(full)
         .expect("arguments parse");
     Cli::from_arg_matches(&m).expect("arguments").run().await
 }
 
-/// Runs the binary, with the key source variables cleared unless `env` sets
-/// them.
+/// Runs the binary in a cleared environment plus `env`.
 fn osc_bin(args: &[&str], env: &[(&str, &Path)]) -> Output {
-    let mut cmd = Command::new(OSC);
-    cmd.args(args)
-        .env_remove("OSC_KEYRING_FILE")
-        .env_remove("OSC_KEYRING_COMMAND");
+    let mut cmd = Osc::new();
+    cmd.args(args);
     for (k, v) in env {
         cmd.env(k, v);
     }
     cmd.output().expect("run osc")
 }
 
-/// Runs the binary with `stdin` (the null device when `None`), the key source
-/// variables cleared unless `env` sets them.
+/// Runs the binary with `stdin` (the null device when `None`), in a cleared
+/// environment plus `env`.
 fn osc_run(args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Output {
     use std::io::Write;
     use std::process::Stdio;
-    let mut cmd = Command::new(OSC);
+    let mut cmd = Osc::new();
     cmd.args(args)
-        .env_remove("OSC_KEYRING_FILE")
-        .env_remove("OSC_KEYRING_COMMAND")
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -353,6 +349,16 @@ async fn encrypted_put_refuses_bad_sources_before_storing() {
     assert_eq!(names(store.path()), Vec::<String>::new());
 }
 
+#[test]
+fn sign_refuses_an_expiry_outside_the_range() {
+    for expires in ["0", "604801"] {
+        let out = osc_bin(&["sign", "--expires-in", expires, "s3://b/k"], &[]);
+        assert!(!out.status.success(), "{expires}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("7 days"), "{expires}: {stderr}");
+    }
+}
+
 #[tokio::test]
 async fn sign_with_a_keyring_errors() {
     let Setup { ring, .. } = setup();
@@ -368,17 +374,20 @@ async fn an_unreadable_keyring_fails_before_any_work() {
     let Setup { work, ring, .. } = setup();
     let dir = ring.parent().expect("dir").to_path_buf();
     let url = format!("file://{}/x", work.path().display());
-    let err = osc(&["--keyring", s(&dir.join("missing")), "exists", &url])
+    let dst = work.path().join("dst");
+    // `get` needs the keys; `exists` would not read the keyring at all.
+    let err = osc(&["--keyring", s(&dir.join("missing")), "get", &url, s(&dst)])
         .await
         .expect_err("missing keyring");
     assert!(matches!(err, CliError::Key(_)), "{err:?}");
 
     let bad = dir.join("bad");
     write_ring(&bad, "not a keyring\n");
-    let err = osc(&["--keyring", s(&bad), "exists", &url])
+    let err = osc(&["--keyring", s(&bad), "get", &url, s(&dst)])
         .await
         .expect_err("bad keyring");
     assert!(err.to_string().contains("line 1"), "{err}");
+    assert!(!dst.exists());
 }
 
 #[test]
@@ -405,6 +414,215 @@ fn env_keyring_file_enables_encryption() {
 }
 
 #[test]
+fn the_profile_flag_is_global_and_listed_in_help() {
+    let cmd = Cli::command();
+    let parse = |args: &[&str]| {
+        cmd.clone()
+            .try_get_matches_from(std::iter::once("osc").chain(args.iter().copied()))
+    };
+    for args in [
+        &["--profile", "dev", "exists", "s3://b/k"][..],
+        &["exists", "--profile", "dev", "s3://b/k"][..],
+    ] {
+        let m = parse(args).expect("parses");
+        assert_eq!(
+            m.get_one::<String>("profile").map(String::as_str),
+            Some("dev")
+        );
+    }
+    assert!(parse(&["--profile"]).is_err());
+
+    // Rendered here, not by a child: the child's help is coloured when
+    // CLICOLOR_FORCE is set.
+    let help = Cli::command().render_long_help().to_string();
+    assert!(help.contains("--profile <NAME>"), "{help}");
+}
+
+#[test]
+fn the_version_flag_prints_the_package_version() {
+    let out = osc_run(&["--version"], None, &[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        concat!("osc ", env!("CARGO_PKG_VERSION"), "\n")
+    );
+    assert_eq!(
+        Cli::command().render_version().trim_end(),
+        concat!("osc ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn every_subcommand_has_a_description() {
+    fn check(cmd: &clap::Command, path: &str, seen: &mut usize) {
+        for sub in cmd.get_subcommands() {
+            let name = format!("{path} {}", sub.get_name());
+            assert!(sub.get_about().is_some(), "{name} has no description");
+            *seen += 1;
+            check(sub, &name, seen);
+        }
+    }
+    let mut seen = 0;
+    check(&Cli::command(), "osc", &mut seen);
+    // The object commands are among those checked, not an empty loop.
+    assert!(seen >= 10, "{seen}");
+}
+
+#[test]
+fn get_stream_help_states_the_exit_status_rule() {
+    let cmd = Cli::command();
+    let sub = cmd.find_subcommand("get-stream").expect("get-stream");
+    let help = sub.clone().render_long_help().to_string();
+    assert!(help.contains("only if osc exits 0"), "{help}");
+    assert!(help.contains("pipefail"), "{help}");
+}
+
+#[test]
+fn sign_method_is_validated_by_the_parser() {
+    let parse = |method: &str| {
+        Cli::command().try_get_matches_from(["osc", "sign", "--method", method, "s3://b/k"])
+    };
+    let err = parse("FOO").expect_err("bad method");
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    assert!(err.to_string().contains("DELETE"), "{err}");
+    let m = parse("put").expect("a lower-case method parses");
+    let (_, sign) = m.subcommand().expect("sign");
+    assert_eq!(
+        sign.get_one::<String>("method").map(String::as_str),
+        Some("put")
+    );
+
+    // The binary reports it as a usage error.
+    let out = osc_run(&["sign", "--method", "FOO", "s3://b/k"], None, &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+}
+
+#[test]
+fn an_empty_profile_name_exits_1_before_any_backend() {
+    for profile in ["", "  "] {
+        let out = osc_run(&["--profile", profile, "exists", "s3://b/k"], None, &[]);
+        assert_eq!(out.status.code(), Some(1), "{profile:?}");
+        assert!(
+            stderr(&out).contains("profile name is empty"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn require_encryption_without_a_key_source_fails() {
+    let Setup { work, .. } = setup();
+    let src = work.path().join("src");
+    std::fs::write(&src, b"plain").expect("write");
+    let dst = work.path().join("dst");
+    let url = format!("file://{}/obj", work.path().display());
+    std::fs::write(work.path().join("obj"), b"x").expect("obj");
+    let env = [("OSC_REQUIRE_ENCRYPTION", "1")];
+
+    let put_url = format!("file://{}/new", work.path().display());
+    for args in [
+        vec!["put", s(&src), &put_url],
+        vec!["get", &url, s(&dst)],
+        vec!["get-stream", &url],
+        vec!["cp", &url, &put_url],
+        vec!["mv", &url, &put_url],
+        vec!["sign", "s3://b/k"],
+    ] {
+        let out = osc_run(&args, None, &env);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            stderr(&out).contains("--require-encryption is set"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+    // Nothing was created or removed; the flag does the same as the variable.
+    assert_eq!(names(work.path()), ["obj", "src"]);
+    let out = osc_run(
+        &["--require-encryption", "put", s(&src), &put_url],
+        None,
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!work.path().join("new").exists());
+}
+
+#[test]
+fn require_encryption_with_a_keyring_stores_ciphertext() {
+    let Setup { work, ring, .. } = setup();
+    let src = work.path().join("src");
+    std::fs::write(&src, b"plain").expect("write");
+    let url = format!("file://{}/obj", work.path().display());
+    let out = osc_run(
+        &["put", s(&src), &url],
+        None,
+        &[
+            ("OSC_REQUIRE_ENCRYPTION", "1"),
+            ("OSC_KEYRING_FILE", s(&ring)),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(work.path().join("obj")).expect("stored")[..3],
+        [2, 4, 0x78]
+    );
+}
+
+#[test]
+fn require_encryption_zero_means_unset() {
+    let Setup { work, .. } = setup();
+    let src = work.path().join("src");
+    std::fs::write(&src, b"plain").expect("write");
+    let url = format!("file://{}/obj", work.path().display());
+    let out = osc_run(
+        &["put", s(&src), &url],
+        None,
+        &[("OSC_REQUIRE_ENCRYPTION", "0")],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(work.path().join("obj")).expect("stored"),
+        b"plain"
+    );
+}
+
+#[test]
+fn listing_ignores_require_encryption() {
+    let Setup { work, .. } = setup();
+    std::fs::write(work.path().join("obj"), b"x").expect("obj");
+    let dir = format!("file://{}/", work.path().display());
+    let obj = format!("file://{}/obj", work.path().display());
+    let env = [("OSC_REQUIRE_ENCRYPTION", "1")];
+    for args in [
+        vec!["ls", &dir],
+        vec!["exists", &obj],
+        vec!["bucket-exists", &dir],
+    ] {
+        let out = osc_run(&args, None, &env);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    }
+    let out = osc_run(&["ls", &dir], None, &env);
+    assert_eq!(stdout(&out), "obj\n");
+}
+
+#[test]
+fn the_require_encryption_flag_is_global_and_listed_in_help() {
+    let help = Cli::command().render_long_help().to_string();
+    assert!(help.contains("--require-encryption"), "{help}");
+    let parse = |args: &[&str]| {
+        Cli::command().try_get_matches_from(std::iter::once("osc").chain(args.iter().copied()))
+    };
+    for args in [
+        &["--require-encryption", "ls", "s3://b/"][..],
+        &["ls", "--require-encryption", "s3://b/"][..],
+    ] {
+        let m = parse(args).expect("parses");
+        assert!(m.get_flag("require_encryption"));
+    }
+}
+
+#[test]
 fn both_key_sources_are_a_usage_error() {
     let Setup { work, ring, .. } = setup();
     let url = format!("file://{}/x", work.path().display());
@@ -428,7 +646,7 @@ fn both_key_sources_are_a_usage_error() {
     assert_eq!(out.status.code(), Some(1));
     // Every command that needs the source refuses, including `status`.
     let out = osc_run(
-        &["keyring", "status", "--keyring", s(&ring)],
+        &["keyring", "status", "--configured", "--keyring", s(&ring)],
         None,
         &[("OSC_KEYRING_COMMAND", "true")],
     );
@@ -467,10 +685,55 @@ fn keyring_command_supplies_the_keys() {
 
 #[cfg(unix)]
 #[test]
+fn the_core_limit_is_zero_before_keys_are_loaded() {
+    let Setup { work, ring, .. } = setup();
+    let src = work.path().join("src");
+    std::fs::write(&src, b"payload").expect("write");
+    let url = format!("file://{}/obj", work.path().display());
+    // The command runs while the keys load and inherits osc's limits.
+    let command = "echo core=$(ulimit -H -c) >&2; cat \"$KR\"";
+    let ring = ring.display().to_string();
+    let env = [("OSC_KEYRING_COMMAND", command), ("KR", ring.as_str())];
+
+    let out = osc_run(&["put", s(&src), &url], None, &env);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("core=0"), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(work.path().join("obj")).expect("stored")[..3],
+        [2, 4, 0x78]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_binary_download_still_gets_the_umask_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = tempdir().expect("work");
+    let store = tempdir().expect("store");
+    std::fs::write(store.path().join("obj"), b"payload").expect("obj");
+    let url = format!("file://{}/obj", store.path().display());
+    let dst = w.path().join("dst");
+    let witness = w.path().join("witness");
+    std::fs::write(&witness, b"w").expect("witness");
+
+    let out = osc_run(&["get", &url, s(&dst)], None, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode();
+    assert_eq!(mode(&dst), mode(&witness));
+    assert_eq!(std::fs::read(&dst).expect("dst"), b"payload");
+}
+
+#[cfg(unix)]
+#[test]
 fn keyring_command_failures_are_errors_that_do_not_echo_the_output() {
     let url = "file:///nonexistent/x";
+    // `get` needs the keys; `exists` would not run the command at all.
     let run = |command: &str| {
-        let out = osc_run(&["exists", url], None, &[("OSC_KEYRING_COMMAND", command)]);
+        let out = osc_run(
+            &["get", url, "/nonexistent/dst"],
+            None,
+            &[("OSC_KEYRING_COMMAND", command)],
+        );
         assert_eq!(out.status.code(), Some(1), "{command}");
         String::from_utf8_lossy(&out.stderr).into_owned()
     };
@@ -492,6 +755,46 @@ fn keyring_command_failures_are_errors_that_do_not_echo_the_output() {
 
     let err = run("printf '\\377'");
     assert!(err.contains("not valid UTF-8"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn keyless_commands_never_run_the_key_command() {
+    let Setup { work, ring, .. } = setup();
+    let mark = work.path().join("mark");
+    let (mark_s, ring_s) = (mark.display().to_string(), ring.display().to_string());
+    let command = "touch \"$MARK\"; cat \"$KR\"";
+    let env = [
+        ("OSC_KEYRING_COMMAND", command),
+        ("MARK", mark_s.as_str()),
+        ("KR", ring_s.as_str()),
+    ];
+    let run = |args: &[&str]| {
+        let out = osc_run(args, None, &env);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    };
+
+    let bucket = work.path().join("bucket");
+    let url = format!("file://{}/obj", work.path().display());
+    let bucket_url = format!("file://{}/", bucket.display());
+    std::fs::write(work.path().join("obj"), b"x").expect("obj");
+    run(&["ls", &format!("file://{}/", work.path().display())]);
+    run(&["exists", &url]);
+    run(&["rm", &url]);
+    run(&["mb", &bucket_url]);
+    run(&["bucket-exists", &bucket_url]);
+    assert!(!mark.exists(), "a keyless command ran the key command");
+
+    // Positive control: the commands that need keys do run it.
+    let src = work.path().join("src");
+    std::fs::write(&src, b"payload").expect("src");
+    run(&["put", s(&src), &url]);
+    assert!(mark.exists());
+    std::fs::remove_file(&mark).expect("reset");
+    let dst = work.path().join("dst");
+    run(&["get", &url, s(&dst)]);
+    assert!(mark.exists());
+    assert_eq!(std::fs::read(&dst).expect("dst"), b"payload");
 }
 
 #[tokio::test]
@@ -641,6 +944,40 @@ fn keyring_retire_removes_a_key_and_refuses_the_active_and_unknown_ones() {
 }
 
 #[test]
+fn keyring_add_and_activate_round_trip() {
+    let first = osc_run(&["keyring", "new"], None, &[]);
+    let old = keyring_of(&first).status().active;
+
+    let added = osc_run(
+        &["keyring", "add", "--prefix", "next"],
+        Some(&first.stdout),
+        &[],
+    );
+    let status = keyring_of(&added).status();
+    assert_eq!(status.active, old, "add keeps the old key active");
+    assert_eq!(status.keys.len(), 2);
+    let new = status.keys.last().expect("new key").id.clone();
+    assert!(new.starts_with("next-"), "{new}");
+    let note = stderr(&added);
+    assert_eq!(note, format!("added inactive key {new}\n"));
+    assert!(!note.contains("material="), "{note}");
+
+    let activated = osc_run(&["keyring", "activate", &new], Some(&added.stdout), &[]);
+    let status = keyring_of(&activated).status();
+    assert_eq!(status.active, new);
+    assert_eq!(status.keys.len(), 2);
+
+    let out = osc_run(
+        &["keyring", "activate", "nope", "--force"],
+        Some(&added.stdout),
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("nope"), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+#[test]
 fn keyring_helpers_refuse_oversized_input() {
     let big = vec![b'\n'; 64 * 1024 + 1];
     let out = osc_run(&["keyring", "rotate"], Some(&big), &[]);
@@ -658,7 +995,11 @@ fn keyring_helpers_refuse_oversized_input() {
 #[test]
 fn keyring_status_lists_keys_and_flags_an_old_active_key() {
     let (fresh, fresh_id) = new_ring("kek");
-    let out = osc_run(&["keyring", "status"], Some(fresh.as_bytes()), &[]);
+    let out = osc_run(
+        &["keyring", "status", "--max-age-days", "100000"],
+        Some(fresh.as_bytes()),
+        &[],
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     let rows: Vec<Vec<&str>> = text
@@ -677,8 +1018,12 @@ fn keyring_status_lists_keys_and_flags_an_old_active_key() {
     assert!(!text.contains(material));
 
     // Rotated: the older key is listed without the marker, newest first.
-    let rotated = osc_run(&["keyring", "rotate"], Some(fresh.as_bytes()), &[]);
-    let out = osc_run(&["keyring", "status"], Some(&rotated.stdout), &[]);
+    let rotated = rotate_keyring(&fresh, "kek", day(2026, 10, 27)).expect("rotate");
+    let out = osc_run(
+        &["keyring", "status", "--max-age-days", "100000"],
+        Some(rotated.as_bytes()),
+        &[],
+    );
     let text = stdout(&out);
     let rows: Vec<Vec<&str>> = text
         .lines()
@@ -708,31 +1053,99 @@ fn keyring_status_lists_keys_and_flags_an_old_active_key() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+/// The limit is relative to today. The one-day margin absorbs a UTC midnight
+/// between the test and the child.
 #[test]
-fn keyring_status_reads_the_configured_source() {
-    let Setup { ring, id, .. } = setup();
-    // The null device as stdin: the file is used, not standard input.
-    let out = osc_run(&["keyring", "status", "--keyring", s(&ring)], None, &[]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stdout(&out).contains(&id));
+fn keyring_status_age_limit_is_relative_to_today() {
+    let created = chrono::Utc::now().date_naive() - chrono::Days::new(10);
+    let ring = new_keyring("kek", created).expect("keyring");
+    let status = |limit: &str| {
+        osc_run(
+            &["keyring", "status", "--max-age-days", limit],
+            Some(ring.as_bytes()),
+            &[],
+        )
+    };
+    let out = status("11");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = status("9");
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("days old"), "{}", stderr(&out));
+}
 
+#[test]
+fn status_reads_the_piped_keyring() {
+    let Setup { ring, id, .. } = setup();
+    let (piped, piped_id) = new_ring("piped");
+    assert_ne!(id, piped_id);
+    // A source is configured, but standard input wins.
+    let out = osc_run(
+        &["keyring", "status", "--max-age-days", "100000"],
+        Some(piped.as_bytes()),
+        &[("OSC_KEYRING_FILE", s(&ring))],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains(&piped_id), "{}", stdout(&out));
+    assert!(!stdout(&out).contains(&id), "{}", stdout(&out));
+
+    // Nothing piped in (the null device) is an empty keyring, not the
+    // configured one.
     let out = osc_run(
         &["keyring", "status"],
         None,
         &[("OSC_KEYRING_FILE", s(&ring))],
     );
-    assert!(stdout(&out).contains(&id));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("empty keyring"), "{}", stderr(&out));
+}
+
+#[test]
+fn status_configured_checks_the_configured_source() {
+    let Setup { ring, id, .. } = setup();
+    let (piped, piped_id) = new_ring("piped");
+    let args = [
+        "keyring",
+        "status",
+        "--configured",
+        "--max-age-days",
+        "100000",
+    ];
+    let listed = |out: &Output| {
+        assert!(out.status.success(), "{}", stderr(out));
+        let text = stdout(out);
+        assert!(text.contains(&id), "{text}");
+        assert!(!text.contains(&piped_id), "{text}");
+    };
+
+    // The piped keyring is ignored.
+    listed(&osc_run(
+        &args,
+        Some(piped.as_bytes()),
+        &[("OSC_KEYRING_FILE", s(&ring))],
+    ));
+    let mut with_flag = args.to_vec();
+    with_flag.extend(["--keyring", s(&ring)]);
+    listed(&osc_run(&with_flag, Some(piped.as_bytes()), &[]));
 
     #[cfg(unix)]
     {
         let command = format!("cat '{}'", ring.display());
-        let out = osc_run(
-            &["keyring", "status"],
-            None,
+        listed(&osc_run(
+            &args,
+            Some(piped.as_bytes()),
             &[("OSC_KEYRING_COMMAND", command.as_str())],
-        );
-        assert!(stdout(&out).contains(&id), "{}", stderr(&out));
+        ));
     }
+
+    // Without a source it is an error, not a fall back to standard input.
+    let out = osc_run(&args, Some(piped.as_bytes()), &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("needs a key source"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains(&piped_id));
 }
 
 #[cfg(unix)]
@@ -741,13 +1154,37 @@ fn keyring_files_with_open_permissions_are_refused() {
     use std::os::unix::fs::PermissionsExt;
     let Setup { ring, id, .. } = setup();
     std::fs::set_permissions(&*ring, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-    let out = osc_run(&["keyring", "status", "--keyring", s(&ring)], None, &[]);
+    let out = osc_run(
+        &[
+            "keyring",
+            "status",
+            "--configured",
+            "--keyring",
+            s(&ring),
+            "--max-age-days",
+            "100000",
+        ],
+        None,
+        &[],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("has mode 644"), "{}", stderr(&out));
     assert!(!stdout(&out).contains(&id));
     // Group read is fine.
     std::fs::set_permissions(&*ring, std::fs::Permissions::from_mode(0o640)).expect("chmod");
-    let out = osc_run(&["keyring", "status", "--keyring", s(&ring)], None, &[]);
+    let out = osc_run(
+        &[
+            "keyring",
+            "status",
+            "--configured",
+            "--keyring",
+            s(&ring),
+            "--max-age-days",
+            "100000",
+        ],
+        None,
+        &[],
+    );
     assert!(out.status.success(), "{}", stderr(&out));
 }
 
@@ -902,12 +1339,11 @@ async fn recursive_put_keeps_hostile_file_names_inside_the_destination() {
     let dst = w.path().join("t/dst/inner");
     let url = format!("file://{}", dst.display());
 
-    let res = osc(&["put", "-r", s(&src), &url]).await;
-    if let Err(e) = &res {
-        assert!(matches!(e, CliError::UnsafePath { .. }), "{e}");
-    }
+    osc(&["put", "-r", s(&src), &url])
+        .await
+        .expect("put -r stores the names inside the destination");
 
-    // Nothing outside the destination directory, whatever the outcome.
+    // Nothing outside the destination directory.
     assert!(!w.path().join("pwned").exists());
     assert!(!w.path().join("t/pwned").exists());
     assert!(!w.path().join("t/dst/pwned").exists());
@@ -915,63 +1351,45 @@ async fn recursive_put_keeps_hostile_file_names_inside_the_destination() {
     for entry in std::fs::read_dir(w.path().join("t")).expect("t") {
         assert_eq!(entry.expect("e").file_name(), "dst");
     }
-    if res.is_ok() {
-        assert_eq!(std::fs::read(dst.join("sub/ok.txt")).expect("ok"), b"ok");
-        assert_eq!(
-            std::fs::read(dst.join("..\\..\\pwned")).expect("evil"),
-            b"evil"
-        );
-        assert_eq!(std::fs::read(dst.join("%2e%2e")).expect("pct"), b"pct");
+    assert_eq!(std::fs::read(dst.join("sub/ok.txt")).expect("ok"), b"ok");
+    assert_eq!(
+        std::fs::read(dst.join("..\\..\\pwned")).expect("evil"),
+        b"evil"
+    );
+    assert_eq!(std::fs::read(dst.join("%2e%2e")).expect("pct"), b"pct");
+}
+
+/// How long a signal test waits for the child to reach the state it signals.
+#[cfg(unix)]
+const IN_FLIGHT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Polls until `reached()` holds. Panics, rather than skipping, when the child
+/// exits first or the deadline passes: the in-flight state is what the test is
+/// about.
+#[cfg(unix)]
+fn wait_in_flight(child: &mut std::process::Child, what: &str, reached: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + IN_FLIGHT_DEADLINE;
+    loop {
+        if reached() {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            panic!("osc exited ({status:?}) before {what}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} not reached within {IN_FLIGHT_DEADLINE:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
-/// Starts `osc get` of a large sparse object, sends `signal` once a temp file
-/// holds data and checks the clean-up. Returns the exit code, or `None` when
-/// the download ended before the signal could be sent.
+/// Sends `signal` (`-INT`, `-TERM`) to the child and returns its exit code,
+/// after checking that it handled the signal instead of dying on it.
 #[cfg(unix)]
-fn interrupt_get(signal: &str, size: u64) -> Option<i32> {
+fn signal_and_wait(child: &mut std::process::Child, signal: &str) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    use std::time::{Duration, Instant};
-
-    let store = tempdir().expect("store");
-    let out = tempdir().expect("out");
-    let obj = std::fs::File::create(store.path().join("big")).expect("obj");
-    obj.set_len(size).expect("sparse");
-    let url = format!("file://{}/big", store.path().display());
-    let dst = out.path().join("plain.bin");
-
-    let mut child = Command::new(OSC)
-        .args(["get", &url, s(&dst)])
-        .env_remove("OSC_KEYRING_FILE")
-        .env_remove("OSC_KEYRING_COMMAND")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn osc");
-
-    let tmp_with_data = || {
-        std::fs::read_dir(out.path())
-            .expect("read dir")
-            .flatten()
-            .any(|e| {
-                e.file_name().to_string_lossy().contains(".osc-tmp-")
-                    && e.metadata().is_ok_and(|m| m.len() > 0)
-            })
-    };
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut seen = false;
-    while Instant::now() < deadline && child.try_wait().expect("wait").is_none() {
-        if tmp_with_data() {
-            seen = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    if !seen || child.try_wait().expect("wait").is_some() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    }
     let status = Command::new("kill")
         .args([signal, &child.id().to_string()])
         .status()
@@ -979,33 +1397,85 @@ fn interrupt_get(signal: &str, size: u64) -> Option<i32> {
     assert!(status.success());
     let exit = child.wait().expect("wait");
     assert!(exit.signal().is_none(), "died on the signal: {exit:?}");
-    assert!(!dst.exists(), "destination must not exist");
-    assert_eq!(names(out.path()), Vec::<String>::new(), "temp file left");
-    Some(exit.code().expect("exit code"))
+    exit.code().expect("exit code")
 }
 
+/// A loopback server for one request: it reads the request head, answers 200
+/// with a `Content-Length` of 4 MiB and 1 MiB of body, then keeps the
+/// connection open until the client closes it.
 #[cfg(unix)]
-fn assert_signal_cleans_up(signal: &str, code: i32) {
-    for size in [512u64 << 20, 4 << 30] {
-        if let Some(exit) = interrupt_get(signal, size) {
-            assert_eq!(exit, code);
+fn serve_stalled_object() -> (u16, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    const SENT: usize = 1 << 20;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+        }
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\nConnection: close\r\n\r\n";
+        if stream.write_all(header.as_bytes()).is_err()
+            || stream.write_all(&vec![7u8; SENT]).is_err()
+        {
             return;
         }
-        eprintln!("download finished before the signal at {size} bytes; retrying bigger");
-    }
-    eprintln!("skipped: could not interrupt the download in flight");
+        // Until the client closes the connection (or dies).
+        while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+    });
+    (port, thread)
+}
+
+/// Starts `osc get` of an object whose server stalls after 1 MiB, sends
+/// `signal` once the temp file holds data, and checks the clean-up. Returns
+/// the exit code.
+#[cfg(unix)]
+fn interrupt_get(signal: &str) -> i32 {
+    let out = tempdir().expect("out");
+    let (port, server) = serve_stalled_object();
+    let url = format!("http://127.0.0.1:{port}/obj");
+    let dst = out.path().join("plain.bin");
+
+    let mut osc = Osc::new();
+    let mut child = osc
+        .args(["get", &url, s(&dst)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn osc");
+
+    wait_in_flight(&mut child, "a temp file holding data", || {
+        std::fs::read_dir(out.path())
+            .expect("read dir")
+            .flatten()
+            .any(|e| {
+                e.file_name().to_string_lossy().contains(".osc-tmp-")
+                    && e.metadata().is_ok_and(|m| m.len() > 0)
+            })
+    });
+    let code = signal_and_wait(&mut child, signal);
+    assert!(!dst.exists(), "destination must not exist");
+    assert_eq!(names(out.path()), Vec::<String>::new(), "temp file left");
+    // The child closed the connection, so the server thread ends.
+    server.join().expect("server");
+    code
 }
 
 #[cfg(unix)]
 #[test]
 fn interrupted_get_removes_the_temp_file_on_sigint() {
-    assert_signal_cleans_up("-INT", 130);
+    assert_eq!(interrupt_get("-INT"), 130);
 }
 
 #[cfg(unix)]
 #[test]
 fn interrupted_get_removes_the_temp_file_on_sigterm() {
-    assert_signal_cleans_up("-TERM", 143);
+    assert_eq!(interrupt_get("-TERM"), 143);
 }
 
 #[cfg(unix)]
@@ -1176,13 +1646,21 @@ fn status_lines_and_errors_do_not_pass_terminal_escapes() {
 
 #[test]
 fn status_lines_redact_url_credentials_and_tokens() {
-    let out = osc_bin(
+    // A closed loopback port: the request fails at once and nothing leaves the
+    // machine. (`file://` URLs cannot carry credentials, so this uses `s3://`.)
+    let out = osc_run(
         &[
             "get",
-            "file://user:s3cret@localhost/nonexistent?token=TOK#frag",
+            "s3://u5erTOKEN:s3cret@bucket/nonexistent?token=TOK#FRAGX9",
             "/nonexistent-dir/x",
         ],
-        &[],
+        None,
+        &[
+            ("S3_ENDPOINT", "http://127.0.0.1:1"),
+            ("S3_ACCESS_KEY_ID", "AKIDTEST"),
+            ("S3_SECRET_ACCESS_KEY", "SECRETTEST"),
+            ("S3_REGION", "us-east-1"),
+        ],
     );
     let all = format!(
         "{}{}",
@@ -1190,38 +1668,47 @@ fn status_lines_redact_url_credentials_and_tokens() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(all.contains("Download "), "{all}");
-    for secret in ["s3cret", "TOK", "frag"] {
+    for secret in ["u5erTOKEN", "s3cret", "TOK", "FRAGX9"] {
         assert!(!all.contains(secret), "{secret} leaked: {all}");
     }
 }
 
-/// Starts `osc put` of a large sparse file to a `file://` store, sends SIGINT
-/// once a staging file (`path#N`) holds data and checks the clean-up. Returns
-/// `None` when the upload ended before the signal could be sent.
+/// Starts `osc put` of a FIFO to a `file://` store, feeds it 1 MiB and keeps
+/// the writer open, sends SIGINT once a staging file (`path#N`) holds data and
+/// checks the clean-up.
 #[cfg(unix)]
-fn interrupt_put(size: u64) -> Option<i32> {
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::{Duration, Instant};
-
+#[test]
+fn interrupted_put_removes_the_staging_file_on_sigint() {
+    use std::io::Write;
     let src_dir = tempdir().expect("src");
     let store = tempdir().expect("store");
-    let src = src_dir.path().join("big");
-    std::fs::File::create(&src)
-        .expect("src")
-        .set_len(size)
-        .expect("sparse");
+    let fifo = src_dir.path().join("big");
+    let status = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+    assert!(status.success());
     let url = format!("file://{}/big", store.path().display());
 
-    let mut child = Command::new(OSC)
-        .args(["put", s(&src), &url])
-        .env_remove("OSC_KEYRING_FILE")
-        .env_remove("OSC_KEYRING_COMMAND")
+    let mut osc = Osc::new();
+    let mut child = osc
+        .args(["put", s(&fifo), &url])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn osc");
 
-    let staging_with_data = || {
+    // Opened for writing on a thread, so that an osc that never opens the FIFO
+    // cannot hang the test. The writer stays open until `release` is dropped.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        let mut pipe = std::fs::OpenOptions::new()
+            .write(true)
+            .open(fifo)
+            .expect("open fifo");
+        // An error means osc is gone; the test reports that.
+        let _ = pipe.write_all(&vec![7u8; 1 << 20]);
+        let _ = held.recv();
+    });
+
+    wait_in_flight(&mut child, "a staging file holding data", || {
         std::fs::read_dir(store.path())
             .expect("read dir")
             .flatten()
@@ -1229,43 +1716,11 @@ fn interrupt_put(size: u64) -> Option<i32> {
                 e.file_name().to_string_lossy().contains('#')
                     && e.metadata().is_ok_and(|m| m.len() > 0)
             })
-    };
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut seen = false;
-    while Instant::now() < deadline && child.try_wait().expect("wait").is_none() {
-        if staging_with_data() {
-            seen = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    if !seen || child.try_wait().expect("wait").is_some() {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    }
-    let status = Command::new("kill")
-        .args(["-INT", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(status.success());
-    let exit = child.wait().expect("wait");
-    assert!(exit.signal().is_none(), "died on the signal: {exit:?}");
+    });
+    assert_eq!(signal_and_wait(&mut child, "-INT"), 130);
     assert_eq!(names(store.path()), Vec::<String>::new(), "staging left");
-    Some(exit.code().expect("exit code"))
-}
-
-#[cfg(unix)]
-#[test]
-fn interrupted_put_removes_the_staging_file_on_sigint() {
-    for size in [512u64 << 20, 4 << 30] {
-        if let Some(exit) = interrupt_put(size) {
-            assert_eq!(exit, 130);
-            return;
-        }
-        eprintln!("upload finished before the signal at {size} bytes; retrying bigger");
-    }
-    eprintln!("skipped: could not interrupt the upload in flight");
+    drop(release);
+    writer.join().expect("writer");
 }
 
 #[cfg(unix)]
@@ -1282,10 +1737,9 @@ fn sigint_interrupts_a_get_blocked_opening_a_fifo() {
     assert!(status.success());
     let url = format!("file://{}/obj", store.path().display());
 
-    let mut child = Command::new(OSC)
+    let mut osc = Osc::new();
+    let mut child = osc
         .args(["get", &url, s(&fifo)])
-        .env_remove("OSC_KEYRING_FILE")
-        .env_remove("OSC_KEYRING_COMMAND")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -1318,7 +1772,6 @@ fn sigint_interrupts_a_get_blocked_opening_a_fifo() {
 #[cfg(unix)]
 #[test]
 fn recursive_put_fails_fast_and_leaves_no_staging_files() {
-    use std::os::unix::fs::PermissionsExt;
     let w = tempdir().expect("work");
     let src = w.path().join("src");
     std::fs::create_dir_all(&src).expect("src");
@@ -1326,14 +1779,12 @@ fn recursive_put_fails_fast_and_leaves_no_staging_files() {
     for i in 0..16 {
         std::fs::write(src.join(format!("f{i:02}.bin")), &data).expect("file");
     }
-    let bad = src.join("f07.bin");
-    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-    if std::fs::File::open(&bad).is_ok() {
-        // Running as a user that ignores permissions (root): nothing to test.
-        return;
-    }
     let dst = w.path().join("dst");
     let url = format!("file://{}", dst.display());
+    // A directory where f07.bin must go: the local write stages f07.bin#1 and
+    // the final rename onto a directory fails with EISDIR for every uid
+    // (unlike an unreadable source, which root can read).
+    std::fs::create_dir_all(dst.join("f07.bin")).expect("blocking directory");
 
     let out = osc_bin(&["put", "-r", s(&src), &url], &[]);
     assert!(!out.status.success(), "put -r must fail");
@@ -1342,9 +1793,16 @@ fn recursive_put_fails_fast_and_leaves_no_staging_files() {
         "stderr names the unreadable file"
     );
     // Whatever was stored is complete; nothing partial or staged remains.
-    let stored = if dst.exists() { names(&dst) } else { vec![] };
-    assert!(!stored.iter().any(|n| n == "f07.bin"));
-    for name in &stored {
+    let stored = names(&dst);
+    assert!(
+        !stored.iter().any(|n| n.contains('#')),
+        "staging file left: {stored:?}"
+    );
+    assert!(
+        dst.join("f07.bin").is_dir(),
+        "the blocking directory is intact"
+    );
+    for name in stored.iter().filter(|n| *n != "f07.bin") {
         assert!(
             name.starts_with('f') && name.len() == "f00.bin".len(),
             "unexpected leftover {name}"
@@ -1421,7 +1879,8 @@ fn enc_scan_counts_objects_per_key() {
         ],
         &[],
     );
-    assert!(out.status.success(), "{}", stderr(&out));
+    // The unreadable object makes the scan incomplete.
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let text = stdout(&out);
     let rows: Vec<Vec<&str>> = text
         .lines()
@@ -1433,9 +1892,14 @@ fn enc_scan_counts_objects_per_key() {
     assert_eq!(rows[2], [t.old_id.as_str(), "2"]);
     assert_eq!(rows[3], ["(not", "encrypted)", "1"]);
     assert_eq!(rows[4], ["(unreadable)", "1"]);
+    assert_eq!(rows.len(), 5, "no listing-errors row without one: {text}");
     let err = stderr(&out);
     assert!(
-        err.contains("unreadable: ") && err.contains("/bad"),
+        err.contains("unreadable: ") && err.contains("/bad: "),
+        "{err}"
+    );
+    assert!(
+        err.contains("scan incomplete: 1 objects could not be read"),
         "{err}"
     );
 }
@@ -1443,6 +1907,12 @@ fn enc_scan_counts_objects_per_key() {
 #[test]
 fn enc_scan_key_prints_the_urls_of_that_key() {
     let t = scanned();
+    // With the unreadable object present the scan is incomplete.
+    let out = osc_bin(&["enc", "scan", &t.url, "--key", &t.old_id], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(stderr(&out).contains("unreadable: "), "{}", stderr(&out));
+
+    std::fs::remove_file(t.store.path().join("bad")).expect("rm");
     let out = osc_bin(&["enc", "scan", &t.url, "--key", &t.old_id], &[]);
     assert!(out.status.success(), "{}", stderr(&out));
     let mut urls: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
@@ -1460,22 +1930,27 @@ fn enc_scan_key_prints_the_urls_of_that_key() {
 fn enc_scan_json_has_a_line_per_object_and_a_summary() {
     let t = scanned();
     let out = osc_bin(&["enc", "scan", &t.url, "--json"], &[]);
-    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let mut lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
     let summary = lines.pop().expect("summary");
     assert_eq!(
         summary,
         format!(
-            "{{\"summary\":{{\"{}\":1,\"{}\":2,\"no-key\":0,\"not-encrypted\":1,\"unreadable\":1}}}}",
+            "{{\"summary\":{{\"{}\":1,\"{}\":2,\"no-key\":0,\"not-encrypted\":1,\"unreadable\":1,\"listing-errors\":0}}}}",
             t.new_id, t.old_id
         )
     );
     lines.sort();
     let u = &t.url;
     let old = &t.old_id;
+    // The unreadable line carries the reason.
+    let bad_at = lines.iter().position(|l| l.contains("/bad")).expect("bad");
+    let bad = lines.remove(bad_at);
+    let bad_head =
+        format!("{{\"url\":\"{u}/bad\",\"key_ids\":[],\"status\":\"unreadable\",\"error\":\"");
+    assert!(bad.starts_with(&bad_head) && bad.ends_with("\"}"), "{bad}");
     let want = [
         format!("{{\"url\":\"{u}/a\",\"key_ids\":[\"{old}\"],\"status\":\"encrypted\"}}"),
-        format!("{{\"url\":\"{u}/bad\",\"key_ids\":[],\"status\":\"unreadable\"}}"),
         format!("{{\"url\":\"{u}/dir/b\",\"key_ids\":[\"{old}\"],\"status\":\"encrypted\"}}"),
         format!(
             "{{\"url\":\"{u}/new\",\"key_ids\":[\"{}\"],\"status\":\"encrypted\"}}",
@@ -1641,4 +2116,589 @@ fn enc_reencrypt_needs_a_keyring_and_refuses_the_active_key() {
         "{}",
         stderr(&out)
     );
+}
+
+/// Every file under `dir` with its bytes, by path relative to `dir`.
+fn tree_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path.strip_prefix(root).expect("under root");
+                out.insert(
+                    rel.to_string_lossy().into_owned(),
+                    std::fs::read(&path).expect("read"),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+#[test]
+fn enc_reencrypt_refuses_an_unknown_from_key() {
+    let t = scanned();
+    let before = tree_bytes(t.store.path());
+
+    // A mistyped ID.
+    let out = osc_bin(
+        &[
+            "--keyring",
+            s(&t.new_ring),
+            "enc",
+            "reencrypt",
+            &t.url,
+            "--from",
+            "nope",
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains("no key \"nope\" in the keyring"),
+        "{}",
+        stderr(&out)
+    );
+
+    // A keyring that lacks the old key.
+    let other = tempdir().expect("other");
+    let (text, _) = new_ring("other");
+    let other_ring = other.path().join("ring");
+    write_ring(&other_ring, &text);
+    let out = osc_bin(
+        &[
+            "--keyring",
+            s(&other_ring),
+            "enc",
+            "reencrypt",
+            &t.url,
+            "--from",
+            &t.old_id,
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains(&format!("no key \"{}\" in the keyring", t.old_id)),
+        "{}",
+        stderr(&out)
+    );
+
+    assert_eq!(tree_bytes(t.store.path()), before, "nothing was rewritten");
+}
+
+/// The local store cannot list a name with a control character: the listing
+/// fails, and the walk must say so and exit 1 instead of ending quietly.
+#[cfg(unix)]
+#[test]
+fn enc_walks_report_a_listing_error() {
+    let t = scanned();
+    std::fs::remove_file(t.store.path().join("bad")).expect("rm");
+    std::fs::write(t.store.path().join("odd\x1bname"), b"x").expect("write");
+
+    let out = osc_bin(&["enc", "scan", &t.url, "--json"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let summary = stdout(&out).lines().last().expect("summary").to_owned();
+    assert!(summary.contains("\"listing-errors\":1"), "{summary}");
+    assert!(stderr(&out).contains("\\u{1b}"), "{}", stderr(&out));
+    assert!(!stderr(&out).contains('\x1b'), "{:?}", stderr(&out));
+
+    let table = osc_bin(&["enc", "scan", &t.url], &[]);
+    assert_eq!(table.status.code(), Some(1), "{}", stderr(&table));
+    assert!(
+        stdout(&table).contains("(listing errors)"),
+        "{}",
+        stdout(&table)
+    );
+
+    let out = osc_bin(
+        &[
+            "--keyring",
+            s(&t.new_ring),
+            "enc",
+            "reencrypt",
+            &t.url,
+            "--from",
+            &t.old_id,
+        ],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let summary = stdout(&out).lines().last().expect("summary").to_owned();
+    assert!(summary.contains("\"listing-errors\":1"), "{summary}");
+    assert!(stderr(&out).contains("\\u{1b}"), "{}", stderr(&out));
+}
+
+/// Starts `osc` with a minimal environment of its own and both output streams
+/// piped, so the test can close the reader of standard output.
+#[cfg(unix)]
+fn spawn_piped(args: &[&str], home: &Path) -> std::process::Child {
+    use std::process::Stdio;
+    Osc::new()
+        .args(args)
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn osc")
+}
+
+/// Reads `lines` lines from the child's standard output, closes it, and
+/// returns the exit status with what the child wrote to standard error.
+#[cfg(unix)]
+fn close_stdout_after(
+    mut child: std::process::Child,
+    lines: usize,
+) -> (std::process::ExitStatus, String) {
+    use std::io::{BufRead, BufReader, Read};
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    for _ in 0..lines {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).expect("read line"), 0, "output");
+    }
+    drop(reader);
+    let status = child.wait().expect("wait");
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut err)
+        .expect("stderr text");
+    (status, err)
+}
+
+#[cfg(unix)]
+#[test]
+fn ls_into_a_closed_pipe_exits_141() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempdir().expect("dir");
+    let home = tempdir().expect("home");
+    // Far more output than a 64 KiB pipe holds.
+    for i in 0..2000 {
+        let name = format!("{i:04}-{}", "n".repeat(145));
+        std::fs::write(dir.path().join(name), b"").expect("write");
+    }
+
+    let (status, err) = close_stdout_after(spawn_piped(&["ls", s(dir.path())], home.path()), 1);
+    assert_eq!(status.signal(), None, "{status:?}");
+    assert_eq!(status.code(), Some(141), "{err}");
+    assert_eq!(err, "", "no panic message or error line");
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_put_into_a_closed_pipe_cleans_up() {
+    let src = tempdir().expect("src");
+    let dst = tempdir().expect("dst");
+    let home = tempdir().expect("home");
+    for i in 0..16u8 {
+        let file = std::fs::File::create(src.path().join(format!("f{i:02}"))).expect("create");
+        file.set_len(9 * 1024 * 1024).expect("size");
+        std::os::unix::fs::FileExt::write_at(&file, &[i + 1; 16], 0).expect("head");
+    }
+    let url = format!("file://{}", dst.path().display());
+
+    let child = spawn_piped(&["put", "-r", s(src.path()), &url], home.path());
+    let (status, err) = close_stdout_after(child, 3);
+    assert_eq!(status.code(), Some(141), "{err}");
+
+    let stored = tree_bytes(dst.path());
+    for (name, bytes) in &stored {
+        assert!(!name.contains('#'), "staging file left behind: {name}");
+        let source = std::fs::read(src.path().join(name)).expect("source");
+        assert!(*bytes == source, "{name} differs from its source");
+    }
+}
+
+/// A URL or path that names a prefix (it ends in `/`) is refused by the
+/// commands that address one object, instead of being rewritten to `dir`.
+#[tokio::test]
+async fn object_commands_refuse_a_url_naming_a_prefix() {
+    fn refused(result: Result<(), CliError>, what: &str) {
+        let err = result.expect_err(what);
+        assert!(
+            matches!(err, CliError::Storage(Error::InvalidInput(_))),
+            "{what}: {err:?}"
+        );
+    }
+    let work = tempdir().expect("work");
+    let store = work.path().join("store");
+    std::fs::create_dir_all(store.join("obj")).expect("store");
+    std::fs::write(store.join("a"), b"alpha").expect("a");
+    std::fs::write(store.join("obj/inner"), b"inner").expect("inner");
+    let src = work.path().join("src.txt");
+    std::fs::write(&src, b"payload").expect("src");
+    let dst = work.path().join("dst");
+    let before = tree_bytes(&store);
+    let root = format!("file://{}", store.display());
+
+    for target in [format!("{root}/dir/"), format!("{}/dir/", s(&store))] {
+        refused(osc(&["put", s(&src), &target]).await, &target);
+    }
+    assert!(!store.join("dir").exists(), "nothing was created");
+    refused(osc(&["rm", &format!("{root}/")]).await, "rm");
+    refused(osc(&["get", &format!("{root}/obj/"), s(&dst)]).await, "get");
+    refused(
+        osc(&["cp", &format!("{root}/a"), &format!("{root}/b/")]).await,
+        "cp",
+    );
+    assert!(!dst.exists());
+    assert_eq!(tree_bytes(&store), before, "the store is intact");
+
+    // A recursive upload still treats its destination as a prefix.
+    let tree = work.path().join("tree");
+    std::fs::create_dir_all(&tree).expect("tree");
+    std::fs::write(tree.join("x"), b"x").expect("x");
+    osc(&["put", "-r", s(&tree), &format!("{root}/pfx/")])
+        .await
+        .expect("recursive put");
+    assert_eq!(std::fs::read(store.join("pfx/x")).expect("x"), b"x");
+}
+
+/// A loopback server that answers every request with an empty 403 and counts
+/// the connections it accepted, so an unsigned request fails fast and visibly.
+struct DenyingServer {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DenyingServer {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (stop_flag, count) = (stop.clone(), seen.clone());
+        let thread = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                if stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        Self {
+            port,
+            stop,
+            seen,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stops the server and returns how many connections it accepted.
+    fn finish(mut self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::SeqCst);
+        // Wakes the blocked accept so the thread sees the flag.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        self.thread.take().expect("thread").join().expect("join");
+        self.seen.load(Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn every_s3_command_uses_the_profile() {
+    let home = tempdir().expect("home");
+    std::fs::write(home.path().join("config"), "").expect("config");
+    std::fs::write(home.path().join("credentials"), "").expect("credentials");
+
+    let keys = tempdir().expect("keys");
+    let (text, inactive) = new_ring("old");
+    let rotated = rotate_keyring(&text, "new", day(2026, 10, 27)).expect("rotate");
+    let ring = keys.path().join("ring");
+    write_ring(&ring, &rotated);
+    let ring = s(&ring);
+    let out_file = keys.path().join("out");
+    let out_file = s(&out_file);
+
+    let server = DenyingServer::start();
+    let endpoint = format!("http://127.0.0.1:{}", server.port);
+    let runs: [Vec<&str>; 6] = [
+        vec!["exists", "s3://bkt/k"],
+        vec!["--keyring", ring, "get", "s3://bkt/k", out_file],
+        vec!["sign", "s3://bkt/k"],
+        vec!["enc", "inspect", "s3://bkt/k"],
+        vec!["enc", "scan", "s3://bkt/p/"],
+        vec![
+            "--keyring",
+            ring,
+            "enc",
+            "reencrypt",
+            "s3://bkt/p/",
+            "--from",
+            &inactive,
+        ],
+    ];
+    for run in &runs {
+        let out = Osc::new()
+            .env("HOME", home.path())
+            .env("AWS_CONFIG_FILE", home.path().join("config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                home.path().join("credentials"),
+            )
+            .env("S3_ENDPOINT", &endpoint)
+            .args(["--profile", "nope"])
+            .args(run)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run osc");
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(1), "{run:?}: {err}");
+        assert!(err.contains("AWS profile `nope`"), "{run:?}: {err}");
+        assert!(!err.contains("169.254.169.254"), "{run:?}: {err}");
+    }
+    assert_eq!(server.finish(), 0, "a request was sent unsigned");
+}
+
+/// Runs `osc <flags> sign s3://bkt/k` against a home with two profiles, the
+/// way a user would: `env` is everything the child sees besides `HOME` and the
+/// AWS file locations. Fails, instead of hanging, if the child does not finish
+/// (an IMDS lookup) within 30 s.
+fn sign_in(home: &Path, flags: &[&str], env: &[(&str, &str)]) -> Output {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut osc = Osc::new();
+    osc.args(flags)
+        .args(["sign", "s3://bkt/k"])
+        .env("HOME", home)
+        .env("AWS_CONFIG_FILE", home.join("config"))
+        .env("AWS_SHARED_CREDENTIALS_FILE", home.join("credentials"))
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = osc.spawn().expect("spawn osc");
+    // Drained on threads so a full pipe cannot stall the child.
+    let mut out_pipe = child.stdout.take().expect("stdout");
+    let mut err_pipe = child.stderr.take().expect("stderr");
+    let out_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v);
+        v
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("osc sign did not finish within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: out_reader.join().expect("stdout reader"),
+        stderr: err_reader.join().expect("stderr reader"),
+    }
+}
+
+#[test]
+fn profile_flag_signs_with_the_profile_keys_and_region() {
+    let home = tempdir().expect("home");
+    std::fs::write(
+        home.path().join("config"),
+        "[profile dev]\naws_access_key_id = AKIDPROFILEDEV\n\
+         aws_secret_access_key = SECRETPROFILEDEV\nregion = eu-west-3\n\
+         [profile other]\naws_access_key_id = AKIDOTHER\n\
+         aws_secret_access_key = SECRETOTHER\n",
+    )
+    .expect("config");
+    std::fs::write(home.path().join("credentials"), "").expect("credentials");
+
+    let signs_with = |env: &[(&str, &str)], key: &str, region: &str| {
+        let out = sign_in(home.path(), &["--profile", "dev"], env);
+        let (so, se) = (stdout(&out), stderr(&out));
+        assert_eq!(out.status.code(), Some(0), "{env:?}: {se}");
+        assert!(
+            so.contains(&format!("X-Amz-Credential={key}%2F")),
+            "{env:?}: {so}"
+        );
+        assert!(
+            so.contains(&format!("%2F{region}%2Fs3%2Faws4_request")),
+            "{env:?}: {so}"
+        );
+        for secret in ["SECRETPROFILEDEV", "SECRETOTHER", "SECRETSTATIC"] {
+            assert!(!so.contains(secret) && !se.contains(secret), "{env:?}");
+        }
+    };
+
+    signs_with(&[], "AKIDPROFILEDEV", "eu-west-3");
+    // AWS_PROFILE never overrides the flag.
+    signs_with(&[("AWS_PROFILE", "other")], "AKIDPROFILEDEV", "eu-west-3");
+    // The flag's profile is the only credential source (D2): static keys do not
+    // take over.
+    signs_with(
+        &[
+            ("AWS_ACCESS_KEY_ID", "AKIDSTATIC"),
+            ("AWS_SECRET_ACCESS_KEY", "SECRETSTATIC"),
+        ],
+        "AKIDPROFILEDEV",
+        "eu-west-3",
+    );
+    signs_with(
+        &[
+            ("S3_ACCESS_KEY_ID", "AKIDSTATIC"),
+            ("S3_SECRET_ACCESS_KEY", "SECRETSTATIC"),
+        ],
+        "AKIDPROFILEDEV",
+        "eu-west-3",
+    );
+    // A region variable wins over the profile's region, which is the fallback.
+    signs_with(
+        &[("AWS_REGION", "us-west-2")],
+        "AKIDPROFILEDEV",
+        "us-west-2",
+    );
+}
+
+#[test]
+fn without_the_profile_flag_aws_profile_is_never_read() {
+    let home = tempdir().expect("home");
+    std::fs::write(
+        home.path().join("config"),
+        "[profile dev]\naws_access_key_id = AKIDPROFILEDEV\n\
+         aws_secret_access_key = SECRETPROFILEDEV\nregion = eu-west-3\n",
+    )
+    .expect("config");
+    std::fs::write(home.path().join("credentials"), "").expect("credentials");
+
+    let out = sign_in(
+        home.path(),
+        &[],
+        &[
+            ("AWS_PROFILE", "dev"),
+            ("AWS_ACCESS_KEY_ID", "AKIDSTATIC"),
+            ("AWS_SECRET_ACCESS_KEY", "SECRETSTATIC"),
+            ("AWS_REGION", "us-west-2"),
+        ],
+    );
+    let (so, se) = (stdout(&out), stderr(&out));
+    assert_eq!(out.status.code(), Some(0), "{se}");
+    assert!(so.contains("X-Amz-Credential=AKIDSTATIC%2F"), "{so}");
+    assert!(so.contains("%2Fus-west-2%2Fs3%2Faws4_request"), "{so}");
+    assert!(!so.contains("AKIDPROFILEDEV"), "{so}");
+}
+
+#[test]
+fn errors_print_each_cause_once() {
+    let dir = tempdir().expect("dir");
+    let base = dir.path().display();
+
+    // A library error embeds its source: one line, no repeated cause.
+    let out = osc_run(
+        &[
+            "get",
+            &format!("file://{base}/nope"),
+            &format!("{base}/out"),
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let text = stderr(&out);
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.starts_with("Error: "), "{text}");
+
+    // A cause that adds information is kept.
+    let out = osc_run(
+        &[
+            "put",
+            &format!("{base}/missing"),
+            &format!("file://{base}/x"),
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let text = stderr(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].starts_with("Error: failed to read ") && lines[0].ends_with("/missing"),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("  caused by: ") && lines[1].contains("(os error 2)"),
+        "{text}"
+    );
+}
+
+/// Runs `osc put src <dst>` in `cwd` with the child's `HOME` as given.
+fn put_from(cwd: &Path, home: &Path, src: &Path, dst: &str) -> Output {
+    let mut cmd = Osc::new();
+    cmd.env("HOME", home)
+        .current_dir(cwd)
+        .args(["put", s(src), dst]);
+    cmd.output().expect("run osc")
+}
+
+#[test]
+fn operands_resolve_as_in_the_library() {
+    let cwd = tempdir().expect("cwd");
+    let home = tempdir().expect("home");
+    let src = cwd.path().join("src");
+    std::fs::write(&src, b"data").expect("write");
+
+    std::fs::create_dir(cwd.path().join("rel")).expect("dir");
+    let out = put_from(cwd.path(), home.path(), &src, "rel/obj");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(cwd.path().join("rel/obj")).expect("obj"),
+        b"data"
+    );
+
+    // A scheme the library does not know is refused, not taken as a file name.
+    let out = put_from(cwd.path(), home.path(), &src, "ab:c");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("ab"), "{}", stderr(&out));
+    assert!(!cwd.path().join("ab:c").exists());
+    assert_eq!(names(cwd.path()), ["rel", "src"]);
+
+    let out = put_from(cwd.path(), home.path(), &src, "./ab:c");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read(cwd.path().join("ab:c")).expect("obj"),
+        b"data"
+    );
+
+    // The literal `~/x` (no shell) is under the home directory.
+    let out = put_from(cwd.path(), home.path(), &src, "~/x");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read(home.path().join("x")).expect("obj"), b"data");
+    assert!(!cwd.path().join("~").exists());
 }

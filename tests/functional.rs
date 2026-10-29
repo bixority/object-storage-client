@@ -5,6 +5,9 @@ mod support;
 #[macro_use]
 #[path = "functional/suite.rs"]
 mod suite;
+#[cfg(feature = "cli")]
+#[path = "functional/aws_profile.rs"]
+mod aws_profile;
 #[cfg(all(feature = "encryption", feature = "cli"))]
 #[path = "functional/cli.rs"]
 mod cli;

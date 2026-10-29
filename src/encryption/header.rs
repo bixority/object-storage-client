@@ -32,7 +32,7 @@ pub fn short_debug_tail(s: &str) -> String {
 }
 
 /// Header format errors. Never carries key material.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FormatError {
     /// Not an OSC/ESDK message (first byte is not `0x01` or `0x02`).
@@ -71,6 +71,34 @@ pub enum FormatError {
     /// Structurally invalid header.
     #[error("malformed header: {0}")]
     Malformed(&'static str),
+}
+
+// Manual so that untrusted header strings are truncated in `{:?}` too.
+impl std::fmt::Debug for FormatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotOsc => f.write_str("NotOsc"),
+            Self::UnsupportedVersion => f.write_str("UnsupportedVersion"),
+            Self::UnsupportedSuite(v) => f.debug_tuple("UnsupportedSuite").field(v).finish(),
+            Self::NotFramed => f.write_str("NotFramed"),
+            Self::TooManyEdks(n) => f.debug_tuple("TooManyEdks").field(n).finish(),
+            Self::FrameLengthOutOfRange(n) => {
+                f.debug_tuple("FrameLengthOutOfRange").field(n).finish()
+            }
+            Self::HeaderTooLong => f.write_str("HeaderTooLong"),
+            Self::MissingFormatMarker => f.write_str("MissingFormatMarker"),
+            Self::UnknownFormat(v) => f
+                .debug_tuple("UnknownFormat")
+                .field(&format_args!("{}", short_debug(v)))
+                .finish(),
+            Self::ReservedContextKey(k) => f
+                .debug_tuple("ReservedContextKey")
+                .field(&format_args!("{}", short_debug(k)))
+                .finish(),
+            Self::Truncated => f.write_str("Truncated"),
+            Self::Malformed(m) => f.debug_tuple("Malformed").field(m).finish(),
+        }
+    }
 }
 
 /// Limits applied while parsing untrusted headers.
@@ -373,6 +401,42 @@ mod tests {
     use crate::hex;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn unknown_format_is_truncated_in_debug_too() {
+        let d = format!("{:?}", FormatError::UnknownFormat("x".repeat(10_000)));
+        assert!(d.len() < 300, "{}", d.len());
+        assert!(d.starts_with("UnknownFormat"), "{d}");
+        let d = format!("{:?}", FormatError::ReservedContextKey("k".repeat(10_000)));
+        assert!(d.len() < 300, "{}", d.len());
+    }
+
+    #[test]
+    fn debug_of_every_format_variant_names_it() {
+        let all = [
+            (FormatError::NotOsc, "NotOsc"),
+            (FormatError::UnsupportedVersion, "UnsupportedVersion"),
+            (FormatError::UnsupportedSuite(1), "UnsupportedSuite"),
+            (FormatError::NotFramed, "NotFramed"),
+            (FormatError::TooManyEdks(9), "TooManyEdks"),
+            (
+                FormatError::FrameLengthOutOfRange(3),
+                "FrameLengthOutOfRange",
+            ),
+            (FormatError::HeaderTooLong, "HeaderTooLong"),
+            (FormatError::MissingFormatMarker, "MissingFormatMarker"),
+            (FormatError::UnknownFormat("v".into()), "UnknownFormat"),
+            (
+                FormatError::ReservedContextKey("k".into()),
+                "ReservedContextKey",
+            ),
+            (FormatError::Truncated, "Truncated"),
+            (FormatError::Malformed("why"), "Malformed"),
+        ];
+        for (e, name) in all {
+            assert!(format!("{e:?}").starts_with(name), "{e:?} vs {name}");
+        }
+    }
+
     fn sample() -> Header {
         Header {
             message_id: [7; 32],
@@ -613,14 +677,17 @@ mod tests {
     }
 
     #[test]
-    fn truncated_and_malformed_context() {
+    fn overrunning_and_unsorted_context_are_malformed() {
         let mut b = vec![VERSION_2];
         b.extend_from_slice(&SUITE_0478.to_be_bytes());
         b.extend_from_slice(&[0; 32]);
         // aad_len 5: count 1, key length 5 but only one byte left
         b.extend_from_slice(&5u16.to_be_bytes());
         b.extend_from_slice(&[0, 1, 0, 5, b'a']);
-        assert_eq!(parse_err(&b), FormatError::Truncated);
+        assert_eq!(
+            parse_err(&b),
+            FormatError::Malformed("context field overruns the context")
+        );
 
         let mut h = sample();
         h.context.0.insert("a".into(), "x".into());

@@ -18,7 +18,10 @@
 //! A file-backed keyring ([`Keyring::from_file`]) follows symbolic links
 //! (Kubernetes mounts every Secret key as one), opens the file without
 //! blocking, and requires a regular file owned by the effective user or root
-//! with no access for others (Unix). It notices a changed file on use: at
+//! that its group cannot write and others cannot access (Unix; group read
+//! stays allowed). Other platforms check neither the owner nor the
+//! permissions. It notices a changed file on use, including
+//! [`Keyring::status`]: at
 //! most every 5 seconds, and at once when an unwrap meets an unknown key (at
 //! most once a second). An invalid replacement keeps the
 //! previous keys and is reported by [`KeyringStatus::last_reload_error`].
@@ -48,7 +51,7 @@ use crate::encryption::context::EncryptionContext;
 use crate::encryption::header::EncryptedDataKey;
 
 /// Provider ID written into EDKs.
-const NAMESPACE: &str = "osc-file";
+pub(crate) const NAMESPACE: &str = "osc-file";
 const MAGIC: &str = "osc-keyring-v1";
 const CHECK_LABEL: &[u8] = b"osc-key-check-v1";
 const MAX_ID_LEN: usize = 128;
@@ -74,8 +77,8 @@ pub struct Keyring {
 struct Snapshot {
     active: String,
     keys: BTreeMap<String, Arc<RawAesKey>>,
-    /// Kept to recognize an unchanged key on reload.
-    materials: BTreeMap<String, Material>,
+    /// Full check tag of each key, to recognize an unchanged key on reload.
+    tags: BTreeMap<String, [u8; 32]>,
     /// Newest first, ties by ID.
     info: Vec<KeyInfo>,
 }
@@ -123,6 +126,7 @@ impl Identity {
 
 /// The state of a [`Keyring`] for health checks. Never carries key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyringStatus {
     /// ID of the key new objects are wrapped with.
     pub active: String,
@@ -136,6 +140,7 @@ pub struct KeyringStatus {
 
 /// One key of a [`KeyringStatus`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KeyInfo {
     pub id: String,
     pub created: NaiveDate,
@@ -169,7 +174,11 @@ impl Keyring {
         interval: Duration,
         forced_interval: Duration,
     ) -> Result<Self, KeyError> {
-        let path = path.into();
+        let given: PathBuf = path.into();
+        // Resolved once, so a later `chdir` of the process cannot point the
+        // reloads at another file. Not canonicalized: that would pin the
+        // target of a Kubernetes `..data` symlink and miss Secret updates.
+        let path = std::path::absolute(&given).map_err(KeyError::io(&given))?;
         let (raw, identity) = read_file(&path)?;
         let snapshot = Snapshot::build(parse_bytes(&raw)?, None);
         Ok(Self {
@@ -223,8 +232,12 @@ impl Keyring {
     }
 
     /// The keys, the active key's age today (UTC) and the last reload error.
+    /// Like a wrap or unwrap, it first checks the file when the reload
+    /// interval has passed, so a readiness probe on an idle process sees a
+    /// broken or repaired file.
     #[must_use]
     pub fn status(&self) -> KeyringStatus {
+        self.check(Check::Due);
         self.status_on(chrono::Utc::now().date_naive())
     }
 
@@ -380,14 +393,13 @@ impl Snapshot {
     /// `RawAesKey` (and so their wrap counter).
     fn build(doc: Document, previous: Option<&Self>) -> Self {
         let mut keys = BTreeMap::new();
-        let mut materials = BTreeMap::new();
+        let mut tags = BTreeMap::new();
         let mut info = Vec::with_capacity(doc.keys.len());
         for entry in doc.keys {
+            let tag = check_tag(&entry.material);
             let reused = previous.and_then(|p| {
-                let same =
-                    verify_slices_are_equal(&p.materials.get(&entry.id)?[..], &entry.material[..])
-                        .is_ok();
-                same.then(|| p.keys.get(&entry.id).map(Arc::clone))
+                (p.tags.get(&entry.id) == Some(&tag))
+                    .then(|| p.keys.get(&entry.id).map(Arc::clone))
                     .flatten()
             });
             let key = reused
@@ -397,13 +409,13 @@ impl Snapshot {
                 created: entry.created,
             });
             keys.insert(entry.id.clone(), key);
-            materials.insert(entry.id, entry.material);
+            tags.insert(entry.id, tag);
         }
         info.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
         Self {
             active: doc.active,
             keys,
-            materials,
+            tags,
             info,
         }
     }
@@ -426,11 +438,17 @@ const fn malformed(line: usize, reason: &'static str) -> KeyError {
     KeyError::Malformed { line, reason }
 }
 
-fn check_value(material: &[u8; 32]) -> [u8; 8] {
+/// `HMAC-SHA256(material, CHECK_LABEL)`.
+fn check_tag(material: &[u8; 32]) -> [u8; 32] {
     let key = hmac::Key::new(hmac::HMAC_SHA256, material);
-    let tag = hmac::sign(&key, CHECK_LABEL);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hmac::sign(&key, CHECK_LABEL).as_ref());
+    out
+}
+
+fn check_value(material: &[u8; 32]) -> [u8; 8] {
     let mut out = [0u8; 8];
-    out.copy_from_slice(&tag.as_ref()[..8]);
+    out.copy_from_slice(&check_tag(material)[..8]);
     out
 }
 
@@ -612,7 +630,25 @@ pub fn new_keyring(prefix: &str, today: NaiveDate) -> Result<Zeroizing<String>, 
     })
 }
 
+/// Appends a fresh key to `doc` and returns its ID. The active key stays.
+fn push_fresh(doc: &mut Document, prefix: &str, today: NaiveDate) -> Result<String, KeyError> {
+    if doc.keys.len() >= MAX_KEYS {
+        return Err(KeyError::TooManyKeys { max: MAX_KEYS });
+    }
+    let entry = fresh_entry(prefix, today)?;
+    if doc.keys.iter().any(|k| k.id == entry.id) {
+        return Err(KeyError::DuplicateId { id: entry.id });
+    }
+    let id = entry.id.clone();
+    doc.keys.push(entry);
+    Ok(id)
+}
+
 /// `text` with a fresh key appended and made active; the other keys stay.
+///
+/// Readers that do not have the new key yet fail every object written under
+/// it: use [`add_key`] then [`activate_key`] when more than one process reads
+/// the keyring.
 ///
 /// # Errors
 /// Any error of parsing `text`, [`KeyError::TooManyKeys`] at 256 keys,
@@ -624,15 +660,36 @@ pub fn rotate_keyring(
     today: NaiveDate,
 ) -> Result<Zeroizing<String>, KeyError> {
     let mut doc = parse_document(text)?;
-    if doc.keys.len() >= MAX_KEYS {
-        return Err(KeyError::TooManyKeys { max: MAX_KEYS });
+    doc.active = push_fresh(&mut doc, prefix, today)?;
+    serialize(&doc)
+}
+
+/// `text` with a fresh key appended but not active: first step of a rollout.
+///
+/// Publish the result, wait until every reader has it, then [`activate_key`].
+/// The new ID is `{prefix}-{YYYY}-{MM}-{check[0..8]}` and the last key of the
+/// result.
+///
+/// # Errors
+/// The errors of [`rotate_keyring`].
+pub fn add_key(text: &str, prefix: &str, today: NaiveDate) -> Result<Zeroizing<String>, KeyError> {
+    let mut doc = parse_document(text)?;
+    push_fresh(&mut doc, prefix, today)?;
+    serialize(&doc)
+}
+
+/// `text` with the key `id` made active: second step of a rollout. Activating
+/// the key that is already active only normalizes the text.
+///
+/// # Errors
+/// Any error of parsing `text`, [`KeyError::UnknownId`] for an ID the keyring
+/// does not hold.
+pub fn activate_key(text: &str, id: &str) -> Result<Zeroizing<String>, KeyError> {
+    let mut doc = parse_document(text)?;
+    if !doc.keys.iter().any(|k| k.id == id) {
+        return Err(KeyError::UnknownId { id: id.to_owned() });
     }
-    let entry = fresh_entry(prefix, today)?;
-    if doc.keys.iter().any(|k| k.id == entry.id) {
-        return Err(KeyError::DuplicateId { id: entry.id });
-    }
-    doc.active.clone_from(&entry.id);
-    doc.keys.push(entry);
+    id.clone_into(&mut doc.active);
     serialize(&doc)
 }
 
@@ -716,11 +773,11 @@ fn check_access(_path: &Path, _meta: &std::fs::Metadata) -> Result<(), KeyError>
     Ok(())
 }
 
-/// No access for others; owned by the effective user or root. Group access
-/// is allowed (Kubernetes `fsGroup`).
+/// No group write and no access for others; owned by the effective user or
+/// root. Group read stays allowed (Kubernetes `fsGroup`).
 #[cfg(unix)]
 fn check_owner_and_mode(path: &Path, mode: u32, uid: u32, euid: u32) -> Result<(), KeyError> {
-    if mode & 0o007 != 0 {
+    if mode & 0o027 != 0 {
         return Err(KeyError::Permissions {
             path: path.to_path_buf(),
             mode,

@@ -6,13 +6,13 @@ use aws_lc_rs::constant_time::verify_slices_are_equal;
 use aws_lc_rs::hkdf::{HKDF_SHA512, KeyType, Salt};
 use aws_lc_rs::rand;
 
-use super::header::{FormatError, short_debug_tail};
+use super::header::{FormatError, short_debug, short_debug_tail};
 use super::keys::{DataKey, KeyError};
 
 const SUITE_ID: [u8; 2] = 0x0478_u16.to_be_bytes();
 
 /// Errors raised while decrypting a message.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum DecryptError {
     #[error("key commitment mismatch")]
@@ -39,6 +39,11 @@ pub enum DecryptError {
         short_debug_tail(.found)
     )]
     BindingMismatch { expected: String, found: String },
+    /// A context entry required by the reader is missing from the (still
+    /// unauthenticated) header or has another value. Names only the key,
+    /// never a value.
+    #[error("required encryption context entry {} is missing or differs", short_debug(.key))]
+    ContextMismatch { key: String },
     /// Input arrived while the decryptor waits for its data key.
     #[error("the data key must be supplied before more input is fed")]
     KeyRequired,
@@ -53,6 +58,41 @@ pub enum DecryptError {
     InvalidState(&'static str),
     #[error(transparent)]
     Key(#[from] super::keys::KeyError),
+}
+
+// Manual so that the untrusted header strings in `BindingMismatch` and
+// `Format` are truncated in `{:?}` too.
+impl std::fmt::Debug for DecryptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CommitmentMismatch => f.write_str("CommitmentMismatch"),
+            Self::HeaderAuth => f.write_str("HeaderAuth"),
+            Self::FrameAuth { seq } => f.debug_struct("FrameAuth").field("seq", seq).finish(),
+            Self::BadSequence { expected, got } => f
+                .debug_struct("BadSequence")
+                .field("expected", expected)
+                .field("got", got)
+                .finish(),
+            Self::BadIv { seq } => f.debug_struct("BadIv").field("seq", seq).finish(),
+            Self::FinalFrameTooLong => f.write_str("FinalFrameTooLong"),
+            Self::MissingFinalFrame => f.write_str("MissingFinalFrame"),
+            Self::TrailingBytes => f.write_str("TrailingBytes"),
+            Self::BindingMismatch { expected, found } => f
+                .debug_struct("BindingMismatch")
+                .field("expected", &format_args!("{}", short_debug_tail(expected)))
+                .field("found", &format_args!("{}", short_debug_tail(found)))
+                .finish(),
+            Self::ContextMismatch { key } => f
+                .debug_struct("ContextMismatch")
+                .field("key", &format_args!("{}", short_debug(key)))
+                .finish(),
+            Self::KeyRequired => f.write_str("KeyRequired"),
+            Self::Failed => f.write_str("Failed"),
+            Self::Format(e) => f.debug_tuple("Format").field(e).finish(),
+            Self::InvalidState(m) => f.debug_tuple("InvalidState").field(m).finish(),
+            Self::Key(k) => f.debug_tuple("Key").field(k).finish(),
+        }
+    }
 }
 
 /// Keys derived from a data key and message ID.
@@ -170,6 +210,70 @@ mod tests {
 
     use super::*;
     use crate::encryption::fixtures::{ESDK, dek, esdk_provider};
+
+    fn long_binding_mismatch() -> DecryptError {
+        DecryptError::BindingMismatch {
+            expected: format!("{}real/x", "p/".repeat(50)),
+            found: format!("{}link/x", "y".repeat(10_000)),
+        }
+    }
+
+    #[test]
+    fn binding_mismatch_is_truncated_in_debug_and_keeps_the_tail() {
+        let d = format!("{:?}", long_binding_mismatch());
+        assert!(d.len() < 300, "{}", d.len());
+        assert!(d.contains("link/x"), "{d}");
+        let long = || FormatError::UnknownFormat("x".repeat(10_000));
+        let d = format!("{:?}", DecryptError::Format(long()));
+        assert!(d.len() < 300, "{}", d.len());
+        let d = format!(
+            "{:?}",
+            crate::client::Error::Decryption(long_binding_mismatch())
+        );
+        assert!(d.len() < 300, "{}", d.len());
+    }
+
+    #[test]
+    fn context_mismatch_is_bounded_in_display_and_debug() {
+        let e = DecryptError::ContextMismatch {
+            key: "k".repeat(10_000),
+        };
+        assert!(e.to_string().len() < 300, "{}", e.to_string().len());
+        assert!(format!("{e:?}").len() < 300);
+    }
+
+    #[test]
+    fn debug_of_every_variant_names_it() {
+        let all = [
+            (DecryptError::CommitmentMismatch, "CommitmentMismatch"),
+            (DecryptError::HeaderAuth, "HeaderAuth"),
+            (DecryptError::FrameAuth { seq: 1 }, "FrameAuth"),
+            (
+                DecryptError::BadSequence {
+                    expected: 1,
+                    got: 2,
+                },
+                "BadSequence",
+            ),
+            (DecryptError::BadIv { seq: 1 }, "BadIv"),
+            (DecryptError::FinalFrameTooLong, "FinalFrameTooLong"),
+            (DecryptError::MissingFinalFrame, "MissingFinalFrame"),
+            (DecryptError::TrailingBytes, "TrailingBytes"),
+            (long_binding_mismatch(), "BindingMismatch"),
+            (
+                DecryptError::ContextMismatch { key: "k".into() },
+                "ContextMismatch",
+            ),
+            (DecryptError::KeyRequired, "KeyRequired"),
+            (DecryptError::Failed, "Failed"),
+            (DecryptError::Format(FormatError::NotOsc), "Format(NotOsc)"),
+            (DecryptError::InvalidState("why"), "InvalidState"),
+            (DecryptError::Key(KeyError::Rng), "Key(Rng)"),
+        ];
+        for (e, name) in all {
+            assert!(format!("{e:?}").starts_with(name), "{e:?} vs {name}");
+        }
+    }
 
     #[test]
     fn derive_is_deterministic_and_id_dependent() {

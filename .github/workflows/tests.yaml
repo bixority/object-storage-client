@@ -10,41 +10,85 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a run on main: quick successive merges would stay untested.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  cargo-test:
-    name: cargo test
+  # Operators run osc on laptops, so the Rust suite runs on macOS. Windows runs
+  # the library tests (the cfg(windows) path tests) and compiles every target.
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            commands: cargo test --locked --all-features
+          - os: macos-latest
+            commands: cargo test --locked --all-features
+          - os: windows-latest
+            commands: cargo test --locked --lib && cargo check --locked --all-features --all-targets
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Test
+        shell: bash
+        run: ${{ matrix.commands }}
+
+  # The MSRV promised in Cargo.toml (rust-version) must build all targets.
+  msrv:
+    name: MSRV (1.99)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: "1.99"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --locked --all-features --all-targets
 
   integration:
     name: integration (Garage, Azurite, fake-gcs-server)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The 4 GiB round trips are local only (see docs/TESTING.md, "Checksum round trips").
-      - run: cargo test --all-features --test integration -- --ignored --skip _4gib
+      - run: cargo test --locked --all-features --test integration -- --ignored --skip _4gib
 
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: No code-generation settings in the committed cargo config
+        run: '! grep -nE "^\[build\]|^\[target\.|rustflags" .cargo/config.toml'
+      - name: Every action is pinned to a full commit SHA
+        run: '! grep -rnP "^\s*(-\s*)?uses:\s+(?!\./)(?![^@\s]+@[0-9a-f]{40}(\s|$))" .github/workflows'
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
-      - run: cargo doc --no-deps --all-features
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
@@ -52,14 +96,17 @@ jobs:
     name: feature builds + fuzz crate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --no-default-features -- -D warnings -W clippy::pedantic
-      - run: cargo check --no-default-features --features python
-      - run: cargo check --features fuzzing
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings -W clippy::pedantic
+      - run: cargo check --locked --no-default-features --features python
+      - run: cargo check --locked --features fuzzing
       # Keeps `encryption::fuzzing` and the fuzz targets compiling.
       - run: cargo check --manifest-path fuzz/Cargo.toml
 
@@ -71,14 +118,18 @@ jobs:
       matrix:
         python: ["3.13", "3.14", "3.15"]
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python }}
       - run: uv sync --group dev --group oracle --locked --no-install-project
-      - run: uv run --no-sync maturin develop
+      - run: uv run --no-sync maturin develop --locked
       - run: uv run --no-sync pytest
       # Container tests (Garage, Azurite) without the local-only 4 GiB tier.
       - run: uv run --no-sync pytest -m "integration and not large"
@@ -87,13 +138,110 @@ jobs:
     name: ESDK interop
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.14"
       - run: uv sync --group oracle --locked --no-install-project
-      - run: cargo test --all-features -- --ignored oracle
+      # `shell: bash` runs with pipefail. The step fails unless exactly one
+      # oracle test passed, so renaming the test cannot silently drop the check.
+      - name: ESDK interop (exactly one oracle test)
+        shell: bash
+        run: |
+          cargo test --locked --all-features --lib -- --ignored oracle 2>&1 | tee oracle.log
+          grep -q 'test result: ok. 1 passed' oracle.log
         env:
           UV_NO_SYNC: "1"
+
+  deny:
+    name: cargo deny (advisories, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources
+          arguments: --all-features
+
+  # Fails on a dependency license that about.toml does not accept, and when
+  # the committed notices (shipped in the wheels) differ from the locked
+  # dependencies. Regenerate as docs/DEVELOPMENT.md explains.
+  licenses:
+    name: third-party licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+        with:
+          tool: cargo-about@0.9.3
+      - name: Generate the notices
+        run: >
+          cargo about generate --locked --fail --no-default-features
+          --features python,encryption about.hbs
+          --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+      - name: The committed notices are current
+        run: diff -u THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+
+  # Merges a Dependabot PR only after every other job above has succeeded.
+  #
+  # `pull_request` (not `pull_request_target`): the PR's code runs with a
+  # read-only token and no repository secrets, and its build cache is scoped to
+  # the PR, so it cannot poison the cache used by the release workflow. A fork PR
+  # never gets a write token here, so this job cannot act on one.
+  dependabot-merge:
+    name: Approve and merge (Dependabot)
+    needs: [tests, msrv, integration, lint, features, python, esdk-interop, deny, licenses]
+    # The PR author, not only `github.actor` (whoever triggered the latest event).
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.actor == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+      # Only cargo patch updates of crates outside the reviewed list are merged.
+      # Everything else stays open for human review.
+      - name: Approve and merge
+        if: >-
+          steps.metadata.outputs.package-ecosystem == 'cargo'
+          && steps.metadata.outputs.update-type == 'version-update:semver-patch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
+          REVIEWED: aws-lc-rs aws-config aws-credential-types object_store reqwest pyo3 pyo3-async-runtimes zeroize rustix
+        run: |
+          IFS=', ' read -ra deps <<< "$DEPENDENCIES"
+          for dep in "${deps[@]}"; do
+            for reviewed in $REVIEWED; do
+              if [ "$dep" = "$reviewed" ]; then
+                echo "$dep is on the reviewed list; leaving the PR open."
+                exit 0
+              fi
+            done
+          done
+          gh pr review "$PR_NUMBER" --approve --body "Automated approval: the full test suite passed for this patch update."
+          # Merge exactly the commit that was tested.
+          gh pr merge "$PR_NUMBER" --merge --match-head-commit "$PR_HEAD_SHA"

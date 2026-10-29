@@ -22,5 +22,8 @@ mod tamper_tests;
 pub use context::{CallerContext, EncryptionContext};
 pub use envelope::{EncryptionConfig, Envelope};
 pub use header::{DecodeLimits, EncryptedDataKey, FormatError};
-pub use keys::{DataKey, KeyInfo, Keyring, KeyringStatus, new_keyring, retire_key, rotate_keyring};
+pub use keys::{
+    DataKey, KeyInfo, Keyring, KeyringStatus, activate_key, add_key, new_keyring, retire_key,
+    rotate_keyring,
+};
 pub use suite::DecryptError;

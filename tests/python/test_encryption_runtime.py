@@ -1,8 +1,6 @@
 import asyncio
 import json
 import os
-import signal
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -87,22 +85,11 @@ FORK_SCRIPT = textwrap.dedent(
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_fork_no_repeated_message_ids(keyring_path, tmp_path, store):
+def test_fork_no_repeated_message_ids(keyring_path, tmp_path, store, run_isolated):
     out = tmp_path / "out"
     out.mkdir()
-    # Own session: on a timeout the whole group is killed, so a forked child
-    # cannot outlive the test.
-    proc = subprocess.Popen(
-        [sys.executable, "-c", FORK_SCRIPT, str(keyring_path), store, str(out)],
-        start_new_session=True,
-    )
-    try:
-        proc.wait(timeout=120)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
-        raise
-    assert proc.returncode == 0
+    proc = run_isolated(FORK_SCRIPT, str(keyring_path), store, str(out))
+    assert proc.returncode == 0, proc.stderr
     parent = json.loads((out / "parent.json").read_text())
     child = json.loads((out / "child.json").read_text())
     assert len(parent) == len(child) == 1000
@@ -136,8 +123,11 @@ FORK_AFTER_SCRIPT = textwrap.dedent(
             ("inspect", lambda: secure.inspect_encryption(f"{store}/before")),
             ("stream", lambda: secure.get_object_stream(f"{store}/before")),
         ):
+            async def attempt():
+                await call()  # inside the loop, so the fork check is reached
+
             try:
-                asyncio.run(call())
+                asyncio.run(attempt())
                 result[name] = "ok"
             except BaseException as e:
                 result[name] = f"{type(e).__name__}: {e}"
@@ -153,20 +143,13 @@ FORK_AFTER_SCRIPT = textwrap.dedent(
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-def test_fork_after_runtime_started(keyring_path, tmp_path, store):
+def test_fork_after_runtime_started(keyring_path, tmp_path, store, run_isolated):
     out = tmp_path / "out"
     out.mkdir()
-    proc = subprocess.Popen(
-        [sys.executable, "-c", FORK_AFTER_SCRIPT, str(keyring_path), store, str(out)],
-        start_new_session=True,
+    proc = run_isolated(
+        FORK_AFTER_SCRIPT, str(keyring_path), store, str(out), timeout=90
     )
-    try:
-        proc.wait(timeout=90)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
-        raise
-    assert proc.returncode == 0
+    assert proc.returncode == 0, proc.stderr
     # The parent keeps working after the fork, with fresh message IDs.
     parent = json.loads((out / "parent.json").read_text())
     assert parent["before"] != parent["after"]
@@ -176,6 +159,43 @@ def test_fork_after_runtime_started(keyring_path, tmp_path, store):
     assert set(child) == {"put", "get", "inspect", "stream"}
     for name, outcome in child.items():
         assert outcome.startswith("RuntimeError: ") and "forked" in outcome, (name, outcome)
+
+
+FORK_AFTER_FAILED_CALL_SCRIPT = textwrap.dedent(
+    """
+    import asyncio, os, sys
+    from object_storage_client import ObjectStorageClient
+
+    url = sys.argv[1]
+    client = ObjectStorageClient()
+    # A call outside a running loop fails before any runtime thread exists.
+    try:
+        client.object_exists(url)
+    except RuntimeError as e:
+        assert "no running event loop" in str(e), str(e)
+    else:
+        raise SystemExit("expected RuntimeError")
+
+    pid = os.fork()
+    if pid == 0:
+        async def check():
+            return await client.object_exists(url)
+        try:
+            ok = asyncio.run(check()) is True
+        except BaseException:
+            ok = False
+        os._exit(0 if ok else 1)
+    _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    """
+)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_failed_call_outside_a_loop_does_not_block_a_later_fork(store, run_isolated):
+    (Path(store.removeprefix("file://")) / "present").write_bytes(b"x")
+    proc = run_isolated(FORK_AFTER_FAILED_CALL_SCRIPT, f"{store}/present", timeout=60)
+    assert proc.returncode == 0, proc.stderr
 
 
 # Interop with the Python AWS Encryption SDK (oracle dependency group).

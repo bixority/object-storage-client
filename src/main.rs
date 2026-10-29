@@ -7,6 +7,15 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+/// Writes a line to standard error, ignoring a failure: a status or error line
+/// must never abort the process (`eprintln!` panics on a closed pipe).
+macro_rules! errln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 /// Resolves with the conventional exit code (128 + signal number) and a name
 /// when the process is asked to stop.
 ///
@@ -45,7 +54,31 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// on a FIFO, a write to a full pipe) before the process exits regardless.
 const BLOCKING_SHUTDOWN: Duration = Duration::from_millis(200);
 
+/// Keeps key material out of core dumps and away from same-user debuggers.
+///
+/// A release build aborts on panic and the abort signal dumps core by
+/// default, which would write every loaded key and credential to disk. Both
+/// calls are best effort: a limit that cannot be set is not worth refusing to
+/// run for. The process keeps access to its own `/proc/self`, and children
+/// (the keyring command) inherit the zero core limit.
+#[cfg(unix)]
+fn harden_process() {
+    use rustix::process::{Resource, Rlimit, setrlimit};
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+    let _ = setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    );
+}
+
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    harden_process();
     // Built by hand so that after a signal the runtime can be shut down
     // without waiting for blocking threads, which cannot be cancelled.
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -62,7 +95,7 @@ fn main() -> ExitCode {
     let runtime = match builder.build() {
         Ok(runtime) => runtime,
         Err(err) => {
-            eprintln!("Error: failed to start the async runtime: {err}");
+            errln!("Error: failed to start the async runtime: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -91,18 +124,20 @@ async fn run() -> Exit {
     // drop guards of a cancelled command (temp files, in-flight uploads) run
     // before the process exits.
     let outcome = tokio::select! {
-        result = Cli::parse().run() => Ok(result),
+        result = Cli::parse()
+            .with_keyring_command(env::var_os("OSC_KEYRING_COMMAND"))
+            .run() => Ok(result),
         signal = shutdown_signal() => Err(signal),
     };
     let result = match outcome {
         Ok(result) => result,
         Err((code, name)) => {
-            eprintln!("Interrupted by {name}");
+            errln!("Interrupted by {name}");
             // An aborted upload cleans up in a background task; give it time to
             // finish. A second signal skips the wait.
             tokio::select! {
                 () = drain_pending_aborts(DRAIN_TIMEOUT) => {}
-                _ = shutdown_signal() => eprintln!("Interrupted again; exiting at once"),
+                _ = shutdown_signal() => errln!("Interrupted again; exiting at once"),
             }
             return Exit::Interrupted(ExitCode::from(code));
         }
@@ -117,16 +152,47 @@ async fn run() -> Exit {
     // process does not exit first. Ctrl-C skips the wait.
     tokio::select! {
         () = drain_pending_aborts(DRAIN_TIMEOUT) => {}
-        _ = shutdown_signal() => eprintln!("Interrupted; exiting at once"),
+        _ = shutdown_signal() => errln!("Interrupted; exiting at once"),
     }
 
-    // Messages can carry names taken from files and stores.
-    eprintln!("Error: {}", sanitize(&err.to_string()));
+    // A closed output pipe is the reader's choice, not a failure to explain.
+    if !err.is_broken_pipe() {
+        // Messages can carry names taken from files and stores.
+        let mut previous = err.to_string();
+        errln!("Error: {}", sanitize(&previous));
 
-    // Print the full source chain so wrapped I/O / storage causes are visible.
-    for cause in iter::successors(err.source(), |&e| e.source()) {
-        eprintln!("  caused by: {}", sanitize(&cause.to_string()));
+        // Print the source chain so wrapped I/O / storage causes are visible.
+        // Library errors embed their source in their own text; a cause that
+        // text already contains adds nothing and is skipped.
+        for cause in iter::successors(err.source(), |&e| e.source()) {
+            let text = cause.to_string();
+            if !previous.contains(&text) {
+                errln!("  caused by: {}", sanitize(&text));
+            }
+            previous = text;
+        }
     }
 
     Exit::Done(ExitCode::from(err.exit_code()))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod tests {
+    use super::harden_process;
+    use rustix::process::{DumpableBehavior, Resource, Rlimit, dumpable_behavior, getrlimit};
+
+    /// Irreversible for this test process, which no other test shares.
+    #[test]
+    fn hardening_disables_core_dumps() {
+        assert_eq!(dumpable_behavior(), Ok(DumpableBehavior::Dumpable));
+        harden_process();
+        assert_eq!(dumpable_behavior(), Ok(DumpableBehavior::NotDumpable));
+        assert_eq!(
+            getrlimit(Resource::Core),
+            Rlimit {
+                current: Some(0),
+                maximum: Some(0)
+            }
+        );
+    }
 }

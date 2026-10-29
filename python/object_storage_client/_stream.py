@@ -47,20 +47,14 @@ async def _anext_batch(it: Any, limit: int) -> tuple[list[Any], bool]:
     return items, False
 
 
-class ByteStream:
-    """Async byte-stream returned by ``ObjectStorageClient.get_object_stream``.
-
-    Use it directly in ``async for``::
-
-        stream = await client.get_object_stream("s3://bucket/key")
-        async for chunk in stream:
-            process(chunk)
+class _Stream:
+    """Reading rules shared by ``ByteStream`` and ``ListStream``.
 
     Reads follow the same rules as ``asyncio.Queue.get()``:
 
     * Reads must not overlap: starting a read while another is pending raises
       ``RuntimeError``.
-    * A cancelled or timed-out read never loses data: the chunk stays parked
+    * A cancelled or timed-out read never loses data: the item stays parked
       and is returned by the next read.
     * Each call returns a fresh coroutine that can be awaited once. To time out
       a read without cancelling it, wrap it in a Task first
@@ -83,19 +77,85 @@ class ByteStream:
     # A copy would share the native stream under its own owner token and so
     # defeat the overlapping-read check.
     def __copy__(self) -> Any:
-        raise TypeError("ByteStream cannot be copied")
+        raise TypeError(f"{type(self).__name__} cannot be copied")
 
     def __deepcopy__(self, memo: Any) -> Any:
-        raise TypeError("ByteStream cannot be copied")
+        raise TypeError(f"{type(self).__name__} cannot be copied")
 
     def __reduce__(self) -> Any:
-        raise TypeError("ByteStream cannot be copied or pickled")
+        raise TypeError(f"{type(self).__name__} cannot be copied or pickled")
 
     def __reduce_ex__(self, protocol: Any) -> Any:
-        raise TypeError("ByteStream cannot be copied or pickled")
+        raise TypeError(f"{type(self).__name__} cannot be copied or pickled")
 
-    def __aiter__(self) -> ByteStream:
+    def __aiter__(self) -> Any:
         return self
+
+    async def _read(self) -> Any:
+        token = self._acquire()
+        try:
+            # The fill future only signals that a chunk is parked; the chunk
+            # is popped synchronously here, so cancellation cannot lose it.
+            if not self._raw.ready():
+                await self._raw.fill()
+                if self._owner is not token:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: read superseded by a read on "
+                        "another event loop"
+                    )
+            return self._raw.take()
+        finally:
+            # An abandoned read that finalizes late must not release a newer
+            # read's ownership.
+            if self._owner is token:
+                self._owner = None
+
+    async def aclose(self) -> None:
+        """Release the connection, file or listing now; later reads raise
+        ``RuntimeError``.
+
+        Idempotent. Raises ``RuntimeError`` while a read is pending.
+        """
+        self._check_idle()
+        self._owner = None
+        self._raw = None
+
+    def _check_idle(self) -> None:
+        if self._owner is not None:
+            loop = self._owner[0]()
+            # A pending read whose loop is gone, closed or not running is
+            # treated as abandoned, and the new read takes over. If that loop
+            # runs again, the superseded read raises instead of taking data.
+            if loop is not None and loop.is_running() and not loop.is_closed():
+                raise RuntimeError(
+                    f"{type(self).__name__}: concurrent reads are not supported; "
+                    "await the previous read first"
+                )
+
+    def _acquire(self) -> list[Any]:
+        # A closed stream must raise, never report end-of-stream: a clean end
+        # tells an encrypted reader that the object was complete.
+        if self._raw is None:
+            raise RuntimeError(f"{type(self).__name__} is closed")
+        self._check_idle()
+        token = [weakref.ref(asyncio.get_running_loop())]
+        self._owner = token
+        return token
+
+
+class ByteStream(_Stream):
+    """Async byte-stream returned by ``ObjectStorageClient.get_object_stream``.
+
+    Use it directly in ``async for``::
+
+        stream = await client.get_object_stream("s3://bucket/key")
+        async for chunk in stream:
+            process(chunk)
+
+    Reads follow the rules of ``_Stream`` (see the type stub).
+    """
+
+    __slots__ = ()
 
     async def __anext__(self) -> bytes:
         chunk = await self._read()
@@ -108,30 +168,21 @@ class ByteStream:
         chunk = await self._read()
         return b"" if chunk is None else chunk
 
-    async def _read(self) -> bytes | None:
-        token = self._acquire()
-        try:
-            # The fill future only signals that a chunk is parked; the chunk
-            # is popped synchronously here, so cancellation cannot lose it.
-            if not self._raw.ready():
-                await self._raw.fill()
-            return self._raw.take()
-        finally:
-            # An abandoned read that finalizes late must not release a newer
-            # read's ownership.
-            if self._owner is token:
-                self._owner = None
 
-    def _acquire(self) -> list[Any]:
-        if self._owner is not None:
-            loop = self._owner[0]()
-            # A pending read whose loop is gone, closed or no longer running
-            # was abandoned and can never complete; the new read takes over.
-            if loop is not None and loop.is_running() and not loop.is_closed():
-                raise RuntimeError(
-                    "ByteStream: concurrent reads are not supported; "
-                    "await the previous read first"
-                )
-        token = [weakref.ref(asyncio.get_running_loop())]
-        self._owner = token
-        return token
+class ListStream(_Stream):
+    """Async iterator of ``list[str]`` batches of names, returned by
+    ``list_objects_stream``. Each batch holds at most 1024 names or 256 KiB of
+    names, so memory stays bounded; it follows the same reading rules as
+    ``ByteStream``::
+
+        async for names in await client.list_objects_stream("s3://bucket/p/"):
+            process(names)
+    """
+
+    __slots__ = ()
+
+    async def __anext__(self) -> list[str]:
+        names = await self._read()
+        if names is None:
+            raise StopAsyncIteration
+        return names

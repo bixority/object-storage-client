@@ -1,4 +1,5 @@
 use object_storage_client::{Error, ObjectStorageClient, Result, SignMethod, SignOptions};
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +66,7 @@ async fn test_get_pre_signed_url_unsupported_for_local() {
 
 #[tokio::test]
 async fn test_get_pre_signed_urls_rejects_mixed_backends() {
-    let client = ObjectStorageClient::new();
+    let client = ObjectStorageClient::with_vars(HashMap::new());
     let err = client
         .get_pre_signed_urls(
             &["file:///tmp/a.txt", "s3://bucket/b.txt"],
@@ -78,88 +79,40 @@ async fn test_get_pre_signed_urls_rejects_mixed_backends() {
 
     // The URLs resolve to different backends (file vs s3), which is
     // detected before any signing is attempted.
-    assert!(matches!(err, Error::Generic(msg) if msg.contains("same backend")));
+    assert!(matches!(err, Error::InvalidInput(msg) if msg.contains("same backend")));
 }
 
 #[tokio::test]
 async fn test_get_pre_signed_urls_rejects_a_different_port_or_userinfo() {
-    let client = ObjectStorageClient::new();
-    for urls in [
-        ["http://h:1/a", "http://h:2/b"],
-        ["http://u@h/a", "http://h/b"],
-        ["http://u:p@h/a", "http://u:q@h/b"],
-        ["http://h/a", "https://h/b"],
-    ] {
-        let err = client
+    async fn sign(urls: &[&str]) -> Error {
+        ObjectStorageClient::new()
             .get_pre_signed_urls(
-                &urls,
+                urls,
                 SignMethod::Get,
                 Duration::from_mins(1),
                 &SignOptions::default(),
             )
             .await
-            .expect_err("a different origin must be rejected");
+            .expect_err("must be rejected")
+    }
+    for urls in [
+        ["http://h:1/a", "http://h:2/b"],
+        ["http://h/a", "https://h/b"],
+    ] {
+        let err = sign(&urls).await;
         assert!(
-            matches!(&err, Error::Generic(msg) if msg.contains("same backend")),
+            matches!(&err, Error::InvalidInput(msg) if msg.contains("same backend")),
             "{urls:?}: {err:?}"
         );
     }
-}
-
-#[tokio::test]
-async fn test_get_backend_s3_bucket_only() -> Result<()> {
-    // A bucket-only S3 URL has an empty path; this used to panic on
-    // `&url.path()[1..]`. It must resolve to the s3 backend with an empty
-    // object key.
-    let client = ObjectStorageClient::new();
-    let url = Url::parse("s3://bucket")?;
-
-    let (backend, path) = client.get_backend(&url)?;
-    assert_eq!(backend.scheme(), "s3");
-    assert_eq!(path.to_string(), "");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_get_backend_s3_bucket_and_path() -> Result<()> {
-    // The host is the bucket and the leading `/` is stripped from the key.
-    let client = ObjectStorageClient::new();
-    let url = Url::parse("s3://bucket/path")?;
-
-    let (backend, path) = client.get_backend(&url)?;
-    assert_eq!(backend.scheme(), "s3");
-    assert_eq!(path.to_string(), "path");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_get_backend_file_with_host_and_path() -> Result<()> {
-    // For `file://tmp/path` the URL authority ("tmp") is parsed as the host
-    // and "/path" as the path. The file backend keeps `url.path()` verbatim,
-    // and `ObjectPath` normalises away the leading slash.
-    let client = ObjectStorageClient::new();
-    let url = Url::parse("file://tmp/path")?;
-
-    let (backend, path) = client.get_backend(&url)?;
-    assert_eq!(backend.scheme(), "file");
-    assert_eq!(path.to_string(), "path");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_get_backend_s3_caches_by_bucket_host() -> Result<()> {
-    // Bucket-only and keyed URLs share the (scheme, host) cache entry, so
-    // the same backend instance is reused.
-    let client = ObjectStorageClient::new();
-
-    let (b1, _) = client.get_backend(&Url::parse("s3://bucket")?)?;
-    let (b2, _) = client.get_backend(&Url::parse("s3://bucket/path")?)?;
-    assert!(Arc::ptr_eq(&b1, &b2));
-
-    Ok(())
+    // Userinfo is refused outright, before the origins are compared.
+    for urls in [
+        ["http://u@h/a", "http://h/b"],
+        ["http://u:p@h/a", "http://u:q@h/b"],
+    ] {
+        let err = sign(&urls).await;
+        assert!(matches!(err, Error::InvalidInput(_)), "{urls:?}: {err:?}");
+    }
 }
 
 #[tokio::test]
@@ -177,29 +130,6 @@ async fn test_clone_client() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_tilde_expansion() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let home = std::env::home_dir().ok_or("should be able to get home directory")?;
-
-    // Test ~
-    let url = ObjectStorageClient::parse_url("~")?;
-    assert_eq!(url.scheme(), "file");
-    assert_eq!(
-        url,
-        Url::from_file_path(&home).map_err(|()| "invalid home path")?
-    );
-
-    // Test ~/path
-    let url = ObjectStorageClient::parse_url("~/test.txt")?;
-    assert_eq!(url.scheme(), "file");
-    assert_eq!(
-        url,
-        Url::from_file_path(home.join("test.txt")).map_err(|()| "invalid path")?
-    );
-
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_concurrent_first_use_builds_one_backend() -> Result<()> {
     let url = Url::parse("file:///tmp")?;
@@ -212,17 +142,17 @@ async fn test_concurrent_first_use_builds_one_backend() -> Result<()> {
             let client = client.clone();
             let url = url.clone();
             handles.push(tokio::spawn(async move {
-                let (backend, _path) = client.get_backend(&url)?;
-                Ok::<_, Error>(backend)
+                let (store, _path) = client.get_store(&url)?;
+                Ok::<_, Error>(store)
             }));
         }
 
         let mut first = None;
         for handle in handles {
-            let backend = handle.await.map_err(|e| Error::Generic(e.to_string()))??;
+            let store = handle.await.map_err(|e| Error::Generic(e.to_string()))??;
             match &first {
-                None => first = Some(backend),
-                Some(f) => assert!(Arc::ptr_eq(f, &backend)),
+                None => first = Some(store),
+                Some(f) => assert!(Arc::ptr_eq(f, &store)),
             }
         }
     }
@@ -525,6 +455,176 @@ mod delete_by_prefix_local {
     }
 }
 
+mod url_input {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// An S3 client whose endpoint refuses connections: a request that escapes
+    /// the input check fails to connect and can never yield `InvalidInput`.
+    fn client() -> ObjectStorageClient {
+        ObjectStorageClient::with_vars(HashMap::from([
+            ("S3_ENDPOINT".into(), "http://127.0.0.1:1".into()),
+            ("S3_REGION".into(), "us-east-1".into()),
+            ("S3_ACCESS_KEY_ID".into(), "AKIDEXAMPLE".into()),
+            ("S3_SECRET_ACCESS_KEY".into(), "secret".into()),
+            ("S3_ALLOW_HTTP".into(), "true".into()),
+        ]))
+    }
+
+    fn assert_invalid<T: std::fmt::Debug>(what: &str, result: Result<T>) {
+        let err = result.expect_err(what);
+        assert!(matches!(err, Error::InvalidInput(_)), "{what}: {err:?}");
+    }
+
+    /// Runs every object operation on `url`.
+    async fn object_calls(
+        client: &ObjectStorageClient,
+        url: &str,
+    ) -> Vec<(&'static str, Result<()>)> {
+        vec![
+            ("put", client.put(url, &b"x"[..]).await),
+            ("get", client.get(url).await.map(drop)),
+            ("delete", client.delete(url).await),
+            ("exists", client.exists(url).await.map(drop)),
+            (
+                "get_object_metadata",
+                client.get_object_metadata(url).await.map(drop),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn queries_and_fragments_are_refused_everywhere() {
+        let client = client();
+        for url in ["s3://b/a#b", "s3://b/a?x", "s3://b/a?"] {
+            for (what, result) in object_calls(&client, url).await {
+                assert_invalid(&format!("{what} {url}"), result);
+            }
+        }
+        assert_invalid("copy from", client.copy("s3://b/a#1", "s3://b/z").await);
+        assert_invalid("copy to", client.copy("s3://b/a", "s3://b/z#1").await);
+        assert_invalid(
+            "move from",
+            client.move_object("s3://b/a#1", "s3://b/z").await,
+        );
+        assert_invalid(
+            "move to",
+            client.move_object("s3://b/a", "s3://b/z#1").await,
+        );
+        let prefix = "s3://b/p?x";
+        assert_invalid("list", client.list(prefix).await);
+        assert_invalid("delete_by_prefix", client.delete_by_prefix(prefix).await);
+        assert_invalid("create_bucket", client.create_bucket(prefix).await);
+        assert_invalid("bucket_exists", client.bucket_exists(prefix).await);
+    }
+
+    #[tokio::test]
+    async fn dot_segments_are_refused_off_file() {
+        let client = client();
+        assert_invalid(
+            "delete_by_prefix",
+            client.delete_by_prefix("s3://b/t/x/../..").await,
+        );
+        assert_invalid(
+            "delete_by_prefix encoded",
+            client.delete_by_prefix("s3://b/t/%2e%2e").await,
+        );
+        assert_invalid("get", client.get("s3://b/t/%2e%2e/u/k").await);
+        assert_invalid("put", client.put("s3://b/a/./b", &b"x"[..]).await);
+        assert_invalid("get http", client.get("http://127.0.0.1:1/a/../b").await);
+        assert_invalid("copy", client.copy("s3://b/a", "s3://b/x/../y").await);
+    }
+
+    #[tokio::test]
+    async fn bucket_only_urls_are_refused_for_object_calls() {
+        let client = client();
+        for url in ["s3://b", "s3://b/"] {
+            for (what, result) in object_calls(&client, url).await {
+                assert_invalid(&format!("{what} {url}"), result);
+            }
+            assert_invalid("copy from", client.copy(url, "s3://b/z").await);
+            assert_invalid("copy to", client.copy("s3://b/a", url).await);
+            assert_invalid("move from", client.move_object(url, "s3://b/z").await);
+            assert_invalid("move to", client.move_object("s3://b/a", url).await);
+            // Listing a bucket is not an object call: it reaches the endpoint.
+            let err = client.list(url).await.expect_err("nothing listens");
+            assert!(!matches!(err, Error::InvalidInput(_)), "{err:?}");
+        }
+    }
+
+    /// A bucket or a prefix is not an object: the trailing `/` would be dropped
+    /// from the key, so the call would address another object. The URL is
+    /// refused before a backend is built, so no variables are needed.
+    #[tokio::test]
+    async fn urls_naming_a_bucket_or_prefix_are_refused_before_a_backend_is_built() {
+        let client = ObjectStorageClient::with_vars(HashMap::new());
+        for url in ["s3://b", "s3://b/", "s3://b/k/", "file:///tmp/dir/"] {
+            for (what, result) in object_calls(&client, url).await {
+                assert_invalid(&format!("{what} {url}"), result);
+            }
+            assert_invalid("copy from", client.copy(url, "s3://b/z").await);
+            assert_invalid("copy to", client.copy("s3://b/a", url).await);
+            assert_invalid("move from", client.move_object(url, "s3://b/z").await);
+            assert_invalid("move to", client.move_object("s3://b/a", url).await);
+            assert_invalid(
+                "get_pre_signed_url",
+                client
+                    .get_pre_signed_url(
+                        url,
+                        SignMethod::Get,
+                        Duration::from_mins(1),
+                        &SignOptions::default(),
+                    )
+                    .await,
+            );
+        }
+        assert_eq!(client.backend_count(), 0, "refused before any backend");
+
+        // Prefix operations keep accepting the URL.
+        let listing = client.list_stream("s3://b/");
+        assert!(listing.is_ok(), "a prefix is listable: {:?}", listing.err());
+    }
+
+    #[tokio::test]
+    async fn whitespace_the_parser_drops_is_refused() {
+        let client = client();
+        for url in [
+            "s3://b/a ",
+            " s3://b/a",
+            "s3://b/a\tb",
+            "s3://b/a\nb",
+            "s3://b/a\r",
+        ] {
+            assert_invalid(url, client.get(url).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_keys_still_reach_the_store() {
+        let client = client();
+        for url in ["s3://b/a..b", "s3://b/a%2Fb"] {
+            let err = client.get(url).await.expect_err("nothing listens");
+            assert!(!matches!(err, Error::InvalidInput(_)), "{url}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn userinfo_is_refused() {
+        let client = client();
+        for url in [
+            "http://u:p4ss@127.0.0.1:1/x",
+            "http://u@127.0.0.1:1/x",
+            "http://:p4ss@127.0.0.1:1/x",
+            "s3://u:p4ss@b/k",
+            "abfss://c@acct.dfs.core.windows.net/p",
+        ] {
+            let err = client.get(url).await.expect_err(url);
+            assert!(matches!(err, Error::InvalidInput(_)), "{url}: {err:?}");
+            assert!(!format!("{err} {err:?}").contains("p4ss"), "{url}: {err:?}");
+        }
+    }
+}
+
 mod presign_input {
     use super::*;
     use std::collections::HashMap;
@@ -581,6 +681,73 @@ mod presign_input {
             let err = sign(bad).await.expect_err(bad);
             assert!(matches!(err, Error::InvalidInput(_)), "{bad}: {err:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_expiry_outside_one_second_to_seven_days() {
+        let client = s3_client();
+        for expires in [
+            Duration::ZERO,
+            Duration::from_millis(999),
+            Duration::from_secs(604_801),
+            Duration::from_secs(u64::MAX),
+        ] {
+            let err = client
+                .get_pre_signed_url(
+                    "s3://b/k",
+                    SignMethod::Get,
+                    expires,
+                    &SignOptions::default(),
+                )
+                .await
+                .expect_err("single");
+            assert!(
+                matches!(err, Error::InvalidInput(_)),
+                "{expires:?}: {err:?}"
+            );
+            let err = client
+                .get_pre_signed_urls(
+                    &["s3://b/k"],
+                    SignMethod::Get,
+                    expires,
+                    &SignOptions::default(),
+                )
+                .await
+                .expect_err("batch");
+            assert!(
+                matches!(err, Error::InvalidInput(_)),
+                "{expires:?}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn azure_expiry_beyond_chrono_range_is_invalid_input() {
+        let client = ObjectStorageClient::with_vars(HashMap::new());
+        let err = client
+            .get_pre_signed_url(
+                "az://c/b",
+                SignMethod::Get,
+                Duration::from_secs(10_000_000_000_000),
+                &SignOptions::default(),
+            )
+            .await
+            .expect_err("expiry");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn seven_days_is_accepted() -> Result<()> {
+        let signed = s3_client()
+            .get_pre_signed_url(
+                "s3://b/k",
+                SignMethod::Get,
+                Duration::from_hours(168),
+                &SignOptions::default(),
+            )
+            .await?;
+        assert!(signed.contains("X-Amz-Expires=604800"), "{signed}");
+        Ok(())
     }
 
     #[tokio::test]
@@ -670,25 +837,6 @@ async fn test_absolute_path_handling() -> std::result::Result<(), Box<dyn std::e
 }
 
 #[tokio::test]
-async fn test_relative_path_handling() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let client = ObjectStorageClient::new();
-
-    // Verify that we can see Cargo.toml in the current directory (project root during tests)
-    assert!(
-        client.exists("Cargo.toml").await?,
-        "Cargo.toml should be visible via relative path"
-    );
-
-    // We can also check a non-existent relative path
-    assert!(
-        !client.exists("non_existent_file_in_cwd.txt").await?,
-        "Non-existent relative path should return false"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_mixed_local_paths() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let client = ObjectStorageClient::new();
     let tmp = tempdir()?;
@@ -714,32 +862,6 @@ async fn test_mixed_local_paths() -> std::result::Result<(), Box<dyn std::error:
     Ok(())
 }
 
-#[tokio::test]
-async fn test_single_letter_scheme_handling() -> std::result::Result<(), Box<dyn std::error::Error>>
-{
-    let client = ObjectStorageClient::new();
-
-    // In our implementation, a single-letter scheme (like C: in Windows)
-    // is treated as a local filesystem path.
-    // On Linux, "c:/some/path" is technically a relative path if it doesn't start with /
-    // but Url::parse might see "c" as a scheme.
-    let result = client.exists("c:/non_existent_path_12345").await;
-
-    if let Err(e) = result {
-        let err_str = format!("{e:?}");
-        assert!(
-            !err_str.contains("UnsupportedScheme(\"c\")"),
-            "Single-letter scheme should be treated as local path, \
-            not unsupported scheme: {err_str}"
-        );
-    } else {
-        // false: Correct: it was treated as a local path and not found.
-        // true: Unlikely but possible if such a file exists
-    }
-
-    Ok(())
-}
-
 /// Writes to `file://` keep files private while they are written and follow
 /// the destination's, the source's or the umask's mode when they are complete.
 #[cfg(unix)]
@@ -755,13 +877,19 @@ mod modes {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
+    /// The process umask, learned from the mode of a file created with 0o666,
+    /// so that it works on every Unix.
     fn umask() -> u32 {
-        let status = fs::read_to_string("/proc/self/status").expect("status");
-        let line = status
-            .lines()
-            .find_map(|l| l.strip_prefix("Umask:"))
-            .expect("Umask line");
-        u32::from_str_radix(line.trim(), 8).expect("octal")
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempdir().expect("tempdir");
+        let probe = dir.path().join("probe");
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&probe)
+            .expect("probe");
+        !mode(&probe) & 0o777
     }
 
     fn mode(path: &Path) -> u32 {
@@ -941,4 +1069,125 @@ mod modes {
         assert_eq!(names(dir.path()), ["a", "b"]);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_special_file_destination_is_refused_and_kept() -> Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempdir()?;
+        let client = ObjectStorageClient::new();
+
+        let socket = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let err = client
+            .put(&url(&socket), b"x".to_vec())
+            .await
+            .expect_err("socket");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(fs::symlink_metadata(&socket)?.file_type().is_socket());
+
+        #[cfg(target_os = "linux")]
+        {
+            let fifo = dir.path().join("fifo");
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .map_err(std::io::Error::from)?;
+            let err = client
+                .put(&url(&fifo), b"x".to_vec())
+                .await
+                .expect_err("fifo");
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+            assert!(fs::symlink_metadata(&fifo)?.file_type().is_fifo());
+        }
+
+        let mut left = names(dir.path());
+        left.retain(|n| n.contains('#'));
+        assert!(left.is_empty(), "staging files left: {left:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_directory_destination_is_refused() -> Result<()> {
+        let dir = tempdir()?;
+        let target = dir.path().join("d");
+        fs::create_dir(&target)?;
+        fs::write(target.join("inner"), b"keep")?;
+        let err = ObjectStorageClient::new()
+            .put(&url(&target), b"x".to_vec())
+            .await
+            .expect_err("directory");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(fs::metadata(&target)?.is_dir());
+        assert_eq!(fs::read(target.join("inner"))?, b"keep");
+        assert_eq!(names(dir.path()), ["d"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_symlink_destination_is_replaced_not_followed() -> Result<()> {
+        let dir = tempdir()?;
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        fs::write(&target, b"keep")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        ObjectStorageClient::new()
+            .put(&url(&link), b"new".to_vec())
+            .await?;
+        assert!(fs::symlink_metadata(&link)?.file_type().is_file());
+        assert_eq!(fs::read(&link)?, b"new");
+        assert_eq!(fs::read(&target)?, b"keep");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_empty_url_list_is_invalid_input() {
+    let err = ObjectStorageClient::new()
+        .get_pre_signed_urls(
+            &[],
+            SignMethod::Get,
+            Duration::from_mins(1),
+            &SignOptions::default(),
+        )
+        .await
+        .expect_err("no URLs");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn content_binding_on_a_non_s3_store_is_invalid_input() {
+    use std::collections::HashMap;
+    // The public Azurite development account; nothing is sent anywhere.
+    let client = ObjectStorageClient::with_vars(HashMap::from([
+        ("AZURE_STORAGE_ACCOUNT_NAME".into(), "devstoreaccount1".into()),
+        (
+            "AZURE_STORAGE_ACCOUNT_KEY".into(),
+            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+                .into(),
+        ),
+        (
+            "AZURE_STORAGE_ENDPOINT".into(),
+            "http://127.0.0.1:1/devstoreaccount1".into(),
+        ),
+        ("AZURE_ALLOW_HTTP".into(), "true".into()),
+    ]));
+    let options = SignOptions {
+        content_length: Some(10),
+        content_type: None,
+    };
+    let err = client
+        .get_pre_signed_url(
+            "az://c/b",
+            SignMethod::Put,
+            Duration::from_mins(1),
+            &options,
+        )
+        .await
+        .expect_err("binding is S3-only");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
 }

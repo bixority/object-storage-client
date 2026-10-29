@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use super::context::EncryptionContext;
 use super::fixtures::{dek, edk, small_limits};
 use super::frame::{self, Decryptor, Encryptor, Progress};
-use super::header::{DecodeLimits, HeaderCodec};
+use super::header::{DecodeLimits, HeaderCodec, HeaderParse};
 use super::keys::DataKey;
 use super::suite::DecryptError;
 
@@ -30,9 +30,24 @@ fn start(frame_length: u32) -> (Bytes, Encryptor) {
 static KEYED_HEADER: LazyLock<Bytes> = LazyLock::new(|| start(64).0);
 
 /// Parses arbitrary bytes as a header; must never panic.
+///
+/// A header that parses must re-serialise to the exact bytes the header tag
+/// covers: parsing is canonical.
 pub fn header_parse(data: &[u8]) {
-    let _ = HeaderCodec::parse(data, &DecodeLimits::default());
-    let _ = HeaderCodec::parse(data, &small_limits());
+    for limits in [DecodeLimits::default(), small_limits()] {
+        if let Ok(HeaderParse::Done {
+            header, header_len, ..
+        }) = HeaderCodec::parse(data, &limits)
+        {
+            assert_eq!(
+                HeaderCodec::serialize_unauthenticated(&header)
+                    .ok()
+                    .as_deref(),
+                data.get(..header_len - 16),
+                "a parsed header is not canonical"
+            );
+        }
+    }
 }
 
 /// Feeds arbitrary bytes to a `Decryptor` in fuzz-chosen pieces.
@@ -150,6 +165,25 @@ pub fn encrypt_mutate(data: &[u8]) {
         usize::from(*dec_piece)
     };
     let (released, result) = drive(&msg, piece);
+    let whole = frame::drive_whole(
+        Decryptor::new(small_limits(), None),
+        &msg,
+        || piece,
+        |d| d.set_data_key(&DEK),
+    );
+    match (&result, &whole) {
+        (Ok(()), Ok(got)) => assert_eq!(
+            &got[..],
+            &released[..],
+            "whole-object read released other plaintext"
+        ),
+        (Err(a), Err(b)) => assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "whole-object read failed differently"
+        ),
+        _ => panic!("streaming gave {result:?} but whole-object {whole:?}"),
+    }
     assert!(
         plain.starts_with(&released),
         "released bytes that are not a verified plaintext prefix"
@@ -159,5 +193,51 @@ pub fn encrypt_mutate(data: &[u8]) {
         assert_eq!(released, plain, "unmodified message did not round-trip");
     } else {
         assert!(result.is_err(), "a modified message was accepted");
+    }
+}
+
+/// Replays the committed seeds in `fuzz/seeds/<target>/`, so a crash found once
+/// stays covered by `cargo test` and the harness assertions above run on every
+/// build.
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    /// Runs `entry` on every seed of `target`, naming the seed it is about to
+    /// replay (the test harness shows this output for a failing test).
+    fn replay(target: &str, entry: fn(&[u8])) {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/seeds")
+            .join(target);
+        let mut seeds: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+            .map(|entry| entry.expect("seed entry").path())
+            .collect();
+        seeds.sort();
+        assert!(
+            seeds.len() >= 10,
+            "{} holds only {} seeds",
+            dir.display(),
+            seeds.len()
+        );
+        for seed in seeds {
+            println!("replaying {}", seed.display());
+            entry(&std::fs::read(&seed).expect("readable seed"));
+        }
+    }
+
+    #[test]
+    fn header_parse_seeds_replay() {
+        replay("header_parse", super::header_parse);
+    }
+
+    #[test]
+    fn decryptor_feed_seeds_replay() {
+        replay("decryptor_feed", super::decryptor_feed);
+    }
+
+    #[test]
+    fn encrypt_mutate_seeds_replay() {
+        replay("encrypt_mutate", super::encrypt_mutate);
     }
 }

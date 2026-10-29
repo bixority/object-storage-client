@@ -19,7 +19,6 @@ use object_storage_client::sign::{SignOptions, presign_s3};
 use object_storage_client::{Client, Error, ObjectStorageClient, Result};
 use object_store::{MultipartUpload, ObjectStoreExt};
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -529,6 +528,7 @@ async fn failed_multipart_upload_leaves_nothing_behind() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "needs a container runtime (docker or podman)"]
 async fn cli_encrypted_put_get_against_garage() -> TestResult {
@@ -544,11 +544,10 @@ async fn cli_encrypted_put_get_against_garage() -> TestResult {
     let url = format!("{}cli-obj", unique_prefix("cli"));
 
     let osc = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_osc"))
+        let out = crate::support::Osc::new()
             .arg("--keyring")
             .arg(&path)
             .args(args)
-            .env_remove("OSC_KEYRING_COMMAND")
             .envs(garage_vars())
             .output()
             .expect("run osc");

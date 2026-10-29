@@ -9,7 +9,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.2.1"
+version = "0.2.2"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -20,7 +20,7 @@ name = "object_storage_client"
 async-trait = "0.1"
 aws-config = { version = "1.13", default-features = false, features = ["rt-tokio", "default-https-client", "sso", "credentials-process"] }
 aws-credential-types = "1.3"
-aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 aws-runtime = "1.10"
 aws-sigv4 = { version = "1.6", default-features = false, features = ["sign-http", "http1"] }
 aws-types = "1.7"
@@ -30,7 +30,6 @@ clap = { version = "4.6", features = ["derive", "env"], optional = true }
 futures = "0.3"
 http = "1.5"
 http-body = "1"
-http-body-util = "0.1"
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
 percent-encoding = "2.3"
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }

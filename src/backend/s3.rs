@@ -20,6 +20,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+/// How requests address the bucket. `S3_ADDRESSING_STYLE` sets it; when that is
+/// unset, `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` decides, and path is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddressingStyle {
+    /// `https://<endpoint>/<bucket>/<key>`: the bucket is in the path.
+    Path,
+    /// `https://<bucket>.<endpoint>/<key>`: the bucket is in the host.
+    Virtual,
+}
+
+impl AddressingStyle {
+    /// Parses `path` or `virtual`, ignoring case.
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "path" => Some(Self::Path),
+            "virtual" => Some(Self::Virtual),
+            _ => None,
+        }
+    }
+
+    const fn is_virtual(self) -> bool {
+        matches!(self, Self::Virtual)
+    }
+}
+
 /// S3 backend. Retains the concrete [`AmazonS3`] store so credentials can be
 /// read for header-bound signing and `CreateBucket`, alongside the type-erased
 /// store used for generic object operations.
@@ -35,8 +60,8 @@ pub struct S3Backend {
     region: String,
     /// The configured custom endpoint; `None` means AWS.
     endpoint: Option<String>,
-    /// Virtual-hosted addressing: the bucket is in the host, not the path.
-    virtual_hosted: bool,
+    /// How the bucket is addressed, for object and bucket requests alike.
+    addressing: AddressingStyle,
 }
 
 impl S3Backend {
@@ -76,6 +101,7 @@ impl S3Backend {
         let get_var = |k: &str| vars.get(k);
         let s3_allow_http = get_var("S3_ALLOW_HTTP").unwrap_or_else(|| "false".into());
         let bucket = host.ok_or_else(|| Error::InvalidInput("Missing bucket in S3 URL".into()))?;
+        let addressing_override = Self::addressing_override(vars)?;
         // One boolean decides both this check and whether the profile signs. An
         // explicit profile is the only credential source.
         let uses_profile = profile.is_some();
@@ -123,10 +149,23 @@ impl S3Backend {
         if let Some(ep) = endpoint.as_deref() {
             builder = builder.with_config(AmazonS3ConfigKey::S3Endpoint, ep);
         }
-        let virtual_hosted = builder
-            .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(false);
+        // The store reads the same setting for object calls, so writing the
+        // resolved style back keeps bucket and object requests in agreement.
+        let addressing = addressing_override.unwrap_or_else(|| {
+            let virtual_hosted = builder
+                .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
+                .and_then(|v| parse_bool(&v))
+                .unwrap_or(false);
+            if virtual_hosted {
+                AddressingStyle::Virtual
+            } else {
+                AddressingStyle::Path
+            }
+        });
+        builder = builder.with_config(
+            AmazonS3ConfigKey::VirtualHostedStyleRequest,
+            addressing.is_virtual().to_string(),
+        );
 
         if let Some(access_key_id) = get_var("S3_ACCESS_KEY_ID") {
             builder = builder.with_token("").with_access_key_id(access_key_id);
@@ -167,7 +206,21 @@ impl S3Backend {
             bucket: bucket.to_string(),
             region,
             endpoint,
-            virtual_hosted,
+            addressing,
+        })
+    }
+
+    /// The addressing style `S3_ADDRESSING_STYLE` names, if it is set. Empty is
+    /// unset. Any other value is an error, so a typo cannot silently fall back
+    /// to the default.
+    fn addressing_override(vars: &Vars) -> Result<Option<AddressingStyle>> {
+        let Some(value) = vars.get("S3_ADDRESSING_STYLE").filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        AddressingStyle::parse(&value).map(Some).ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "S3_ADDRESSING_STYLE must be \"path\" or \"virtual\", not \"{value}\""
+            ))
         })
     }
 
@@ -259,13 +312,15 @@ impl S3Backend {
     async fn bucket_request(&self, method: Method, body: Bytes) -> Result<HttpRequest> {
         let (endpoint, region) = self.endpoint_and_region();
         let endpoint = endpoint.trim_end_matches('/');
-        let uri = match (self.virtual_hosted, &self.endpoint) {
+        let uri = match (self.addressing, &self.endpoint) {
             // The store uses a custom endpoint as is in this mode.
-            (true, Some(_)) => format!("{endpoint}/"),
-            (true, None) => format!("https://{}.s3.{region}.amazonaws.com/", self.bucket),
+            (AddressingStyle::Virtual, Some(_)) => format!("{endpoint}/"),
+            (AddressingStyle::Virtual, None) => {
+                format!("https://{}.s3.{region}.amazonaws.com/", self.bucket)
+            }
             // Path-style addressing keeps the request endpoint-agnostic, which
             // is what MinIO / SeaweedFS expect and AWS also accepts.
-            (false, _) => format!("{endpoint}/{}", self.bucket),
+            (AddressingStyle::Path, _) => format!("{endpoint}/{}", self.bucket),
         };
         let mut request: HttpRequest = http::Request::builder()
             .method(method)
@@ -917,6 +972,99 @@ mod tests {
             .await
             .expect("request");
         assert_eq!(request.uri(), "https://bkt.s3.eu-west-1.amazonaws.com/");
+    }
+
+    /// The bucket-level URI a store with `pairs` sends to, against a custom
+    /// endpoint.
+    async fn bucket_uri(pairs: &[(&str, &str)]) -> String {
+        let mut all = vec![("S3_ENDPOINT", "http://127.0.0.1:1")];
+        all.extend_from_slice(pairs);
+        let request = keyed(&all)
+            .bucket_request(Method::PUT, Bytes::new())
+            .await
+            .expect("request");
+        request.uri().to_string()
+    }
+
+    #[tokio::test]
+    async fn addressing_style_defaults_to_path() {
+        assert_eq!(bucket_uri(&[]).await, "http://127.0.0.1:1/bkt");
+    }
+
+    #[tokio::test]
+    async fn s3_addressing_style_selects_the_style_case_insensitively() {
+        assert_eq!(
+            bucket_uri(&[("S3_ADDRESSING_STYLE", "virtual")]).await,
+            "http://127.0.0.1:1/"
+        );
+        assert_eq!(
+            bucket_uri(&[("S3_ADDRESSING_STYLE", "PATH")]).await,
+            "http://127.0.0.1:1/bkt"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_addressing_style_overrides_virtual_hosted_style_request() {
+        assert_eq!(
+            bucket_uri(&[
+                ("S3_ADDRESSING_STYLE", "path"),
+                ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "true"),
+            ])
+            .await,
+            "http://127.0.0.1:1/bkt"
+        );
+        assert_eq!(
+            bucket_uri(&[
+                ("S3_ADDRESSING_STYLE", "virtual"),
+                ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false"),
+            ])
+            .await,
+            "http://127.0.0.1:1/"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_s3_addressing_style_is_unset() {
+        assert_eq!(
+            bucket_uri(&[
+                ("S3_ADDRESSING_STYLE", ""),
+                ("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "true")
+            ])
+            .await,
+            "http://127.0.0.1:1/"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_requests_follow_s3_addressing_style() {
+        let path = signed(&keyed(&[("S3_ENDPOINT", "http://127.0.0.1:1")])).await;
+        assert_eq!(path.path(), "/bkt/o");
+
+        let virtual_hosted = signed(&keyed(&[
+            ("S3_ENDPOINT", "http://127.0.0.1:1"),
+            ("S3_ADDRESSING_STYLE", "virtual"),
+        ]))
+        .await;
+        // A custom endpoint is used as is in this mode: the bucket is not in the
+        // path, and the endpoint is expected to be scoped to it.
+        assert_eq!(virtual_hosted.host_str(), Some("127.0.0.1"));
+        assert_eq!(virtual_hosted.path(), "/o");
+    }
+
+    #[test]
+    fn unknown_s3_addressing_style_is_rejected() {
+        let all = [
+            ("S3_ACCESS_KEY_ID", "k"),
+            ("S3_SECRET_ACCESS_KEY", "s"),
+            ("S3_ADDRESSING_STYLE", "hostname"),
+        ];
+        let err = S3Backend::new(Some("bkt"), &Vars::from_pairs(&all), None)
+            .err()
+            .expect("rejected");
+        assert!(
+            matches!(&err, Error::InvalidInput(msg) if msg.contains("S3_ADDRESSING_STYLE")),
+            "{err:?}"
+        );
     }
 
     /// Whether a store with `pairs` and a custom endpoint runs unsigned.

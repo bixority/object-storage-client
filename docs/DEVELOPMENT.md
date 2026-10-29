@@ -51,28 +51,6 @@ names (`AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`), but the AWS SDK still
 reads the process environment (SSO and STS endpoint variables, FIPS settings)
 and `HOME` (the SSO token cache).
 
-## Third-party licenses
-
-The wheels statically link their dependency crates, so they ship
-`THIRD_PARTY_LICENSES.html` next to `LICENSE` (`license-files` in
-`pyproject.toml`; PEP 639 puts both under `*.dist-info/licenses/`). It lists
-the license texts of the crates in the wheel (normal dependencies with
-`--no-default-features --features python,encryption`) and the NOTICE of
-`object_store`, which Apache-2.0 section 4(d) requires. `about.toml` names the
-licenses that are accepted (a dependency under another one fails the `licenses`
-jobs of `tests.yaml` and `ci.yaml`) and `about.hbs` is the template. After a
-dependency change, regenerate and commit the file:
-
-```bash
-cargo install --locked cargo-about --version 0.9.3
-cargo about generate --locked --fail --no-default-features \
-    --features python,encryption about.hbs --output-file THIRD_PARTY_LICENSES.html
-```
-
-The NOTICE text in `about.hbs` is static; keep it equal to the `NOTICE.txt` of
-the locked `object_store`. The crate published to the registry is source only
-and needs no notices file.
-
 ## Checks
 
 CI runs these on every pull request, alongside the tests:

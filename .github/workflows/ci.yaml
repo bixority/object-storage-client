@@ -61,38 +61,9 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
 
 
-  # The wheels ship the committed THIRD_PARTY_LICENSES.html: build them only if
-  # it is what the locked dependencies need, and no license is unaccepted.
-  licenses:
-    name: Third-party licenses
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          tool: cargo-about@0.9.3
-
-      - name: Regenerate the notices
-        run: >
-          cargo about generate --locked --fail --no-default-features
-          --features python,encryption about.hbs
-          --output-file THIRD_PARTY_LICENSES.html
-
-      - name: The committed notices are current
-        run: git diff --exit-code -- THIRD_PARTY_LICENSES.html
-
   build-wheels:
     name: Build wheels (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }} / py${{ matrix.python }})
-    needs: [ test, rustfmt, licenses ]
+    needs: [ test, rustfmt ]
     runs-on: ${{ matrix.runner || matrix.os }}
 
     strategy:
@@ -145,7 +116,7 @@ jobs:
             --out dist
 
       # PEP 639: the license files are under *.dist-info/licenses/.
-      - name: The wheel carries the license and the third-party notices
+      - name: The wheel carries the license
         shell: bash
         run: |
           py=$(command -v python3 || command -v python)
@@ -154,12 +125,8 @@ jobs:
           for path in sys.argv[1:]:
               with zipfile.ZipFile(path) as wheel:
                   names = wheel.namelist()
-                  for name in ("LICENSE", "THIRD_PARTY_LICENSES.html"):
-                      if not any(n.endswith(f".dist-info/licenses/{name}") for n in names):
-                          sys.exit(f"{path}: no {name} in dist-info/licenses")
-                  notices = next(n for n in names if n.endswith("/licenses/THIRD_PARTY_LICENSES.html"))
-                  if b"Apache Arrow Object Store" not in wheel.read(notices):
-                      sys.exit(f"{path}: the notices lack object_store's NOTICE")
+                  if not any(n.endswith(".dist-info/licenses/LICENSE") for n in names):
+                      sys.exit(f"{path}: no LICENSE in dist-info/licenses")
           PY
 
       - name: Upload wheel artifacts

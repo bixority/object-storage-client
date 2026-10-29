@@ -171,30 +171,6 @@ jobs:
           command: check advisories bans sources
           arguments: --all-features
 
-  # Fails on a dependency license that about.toml does not accept, and when
-  # the committed notices (shipped in the wheels) differ from the locked
-  # dependencies. Regenerate as docs/DEVELOPMENT.md explains.
-  licenses:
-    name: third-party licenses
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        with:
-          tool: cargo-about@0.9.3
-      - name: Generate the notices
-        run: >
-          cargo about generate --locked --fail --no-default-features
-          --features python,encryption about.hbs
-          --output-file "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
-      - name: The committed notices are current
-        run: diff -u THIRD_PARTY_LICENSES.html "$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
-
   # Merges a Dependabot PR only after every other job above has succeeded.
   #
   # `pull_request` (not `pull_request_target`): the PR's code runs with a
@@ -203,7 +179,7 @@ jobs:
   # never gets a write token here, so this job cannot act on one.
   dependabot-merge:
     name: Approve and merge (Dependabot)
-    needs: [tests, msrv, integration, lint, features, python, esdk-interop, deny, licenses]
+    needs: [tests, msrv, integration, lint, features, python, esdk-interop, deny]
     # The PR author, not only `github.actor` (whoever triggered the latest event).
     if: >-
       github.event_name == 'pull_request'

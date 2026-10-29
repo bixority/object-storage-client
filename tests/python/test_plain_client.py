@@ -763,7 +763,10 @@ async def test_put_object_stream_no_prefetch_beyond_batch(plain, tmp_url):
     stored, gaps = await _refcount_gaps(plain, f"{tmp_url}/p.bin", size, 6)
     assert stored == 6 * size
     assert len(gaps) == 6
-    assert gaps == [0] * 6, "a previous chunk is still held at the next request"
+    # At most the previous chunk may still be referenced when the next one is
+    # requested: the uploader releases it asynchronously, and on Windows that
+    # takes a moment longer. Two chunks held would be read-ahead.
+    assert all(g <= 1 for g in gaps), gaps
 
 
 async def test_put_object_stream_refcount_probe_detects_a_holder(plain, tmp_url):

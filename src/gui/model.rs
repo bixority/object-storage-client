@@ -115,7 +115,13 @@ pub(crate) struct PanelState {
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
     pub(crate) selection: BTreeSet<EntryKey>,
+    /// The fixed end of a range selection.
     pub(crate) anchor: Option<EntryKey>,
+    /// The row keyboard motion moves from and Enter opens.
+    pub(crate) cursor: Option<EntryKey>,
+    /// How often keyboard motion moved the cursor; the view scrolls to the
+    /// cursor when this changes.
+    pub(crate) cursor_moves: u64,
     pub(crate) seq: u64,
 }
 
@@ -133,6 +139,8 @@ impl PanelState {
             error: None,
             selection: BTreeSet::new(),
             anchor: None,
+            cursor: None,
+            cursor_moves: 0,
             seq: 1,
         }
     }

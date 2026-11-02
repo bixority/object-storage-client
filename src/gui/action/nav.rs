@@ -1,6 +1,6 @@
 //! Navigation, paging and selection rules.
 
-use super::{Command, SelectOp};
+use super::{Command, Motion, SelectOp};
 use crate::gui::location::Location;
 use crate::gui::model::{AppState, Entry, EntryKey, MAX_ENTRIES, Page, PanelState, Side};
 
@@ -25,6 +25,7 @@ fn go(state: &mut AppState, side: Side, location: Location) -> Vec<Command> {
     panel.truncated = false;
     panel.selection.clear();
     panel.anchor = None;
+    panel.cursor = None;
     // The address bar shows where the panel is, even if the listing fails.
     panel.address_text = location.display();
     panel.location = location;
@@ -141,21 +142,66 @@ pub(super) fn select(state: &mut AppState, side: Side, op: SelectOp) -> Vec<Comm
         SelectOp::Only(key) => {
             panel.selection.clear();
             panel.selection.insert(key.clone());
-            panel.anchor = Some(key);
+            panel.anchor = Some(key.clone());
+            panel.cursor = Some(key);
         }
         SelectOp::Toggle(key) => {
             if !panel.selection.remove(&key) {
                 panel.selection.insert(key.clone());
             }
-            panel.anchor = Some(key);
+            panel.anchor = Some(key.clone());
+            panel.cursor = Some(key);
         }
-        SelectOp::Range(key) => range(panel, key),
+        SelectOp::Range(key) => {
+            range(panel, key.clone());
+            panel.cursor = Some(key);
+        }
         SelectOp::All => {
             panel.selection = panel.entries.iter().map(Entry::key).collect();
         }
         SelectOp::Clear => panel.selection.clear(),
+        SelectOp::Move { motion, extend } => move_cursor(panel, motion, extend),
     }
     Vec::new()
+}
+
+/// Moves the cursor by `motion`; selects the new row alone, or with `extend`
+/// the rows from the anchor to it. Rows of an empty or stale panel are inert.
+fn move_cursor(panel: &mut PanelState, motion: Motion, extend: bool) {
+    if panel.entries.is_empty() || panel.stale() {
+        return;
+    }
+    let last = panel.entries.len() - 1;
+    let position = |wanted: &EntryKey| panel.entries.iter().position(|e| e.is(wanted));
+    let current = panel
+        .cursor
+        .as_ref()
+        .and_then(position)
+        .or_else(|| panel.anchor.as_ref().and_then(position));
+    let new = match (current, motion) {
+        (_, Motion::Home) | (None, Motion::Down | Motion::PageDown(_)) => 0,
+        (_, Motion::End) | (None, Motion::Up | Motion::PageUp(_)) => last,
+        (Some(at), Motion::Up) => at.saturating_sub(1),
+        (Some(at), Motion::Down) => at.saturating_add(1).min(last),
+        (Some(at), Motion::PageUp(rows)) => at.saturating_sub(rows.max(1)),
+        (Some(at), Motion::PageDown(rows)) => at.saturating_add(rows.max(1)).min(last),
+    };
+    let key = panel.entries[new].key();
+    if extend {
+        let anchor = panel.anchor.as_ref().and_then(position);
+        let from = anchor.or(current).unwrap_or(new);
+        if anchor.is_none() {
+            panel.anchor = Some(panel.entries[from].key());
+        }
+        let (low, high) = (from.min(new), from.max(new));
+        panel.selection = panel.entries[low..=high].iter().map(Entry::key).collect();
+    } else {
+        panel.selection.clear();
+        panel.selection.insert(key.clone());
+        panel.anchor = Some(key.clone());
+    }
+    panel.cursor = Some(key);
+    panel.cursor_moves += 1;
 }
 
 /// Selects the rows between the anchor and `key`, in display order.

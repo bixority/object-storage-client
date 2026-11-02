@@ -1,6 +1,6 @@
 //! The eframe applications: the browser window and the startup error window.
 
-use super::action::{Action, Command, Event, Msg, update};
+use super::action::{Action, Command, Event, Msg, SelectOp, update};
 use super::keys::map_key;
 use super::model::{AppState, Closing};
 use super::view;
@@ -100,24 +100,32 @@ impl eframe::App for App {
         // The focus as of the key press: the previous frame's.
         let text_focus = ctx.text_edit_focused();
         let state = &self.state;
+        // A page is what the active table showed fully last frame.
+        let page_rows = view::page_rows(ctx, state.active);
         let keys = &mut self.keys;
         raw_input.events.retain(|event| {
             let egui::Event::Key {
                 key,
                 pressed: true,
-                repeat: false,
+                repeat,
                 modifiers,
                 ..
             } = event
             else {
                 return true;
             };
-            let Some(action) = map_key(*key, *modifiers, state, text_focus) else {
+            let Some(action) = map_key(*key, *modifiers, state, text_focus, page_rows) else {
                 return true;
             };
+            // A held arrow or page key keeps moving; other shortcuts fire once.
+            let motion = matches!(action, Action::Select(_, SelectOp::Move { .. }));
+            if *repeat && !motion {
+                return true;
+            }
             keys.push(action);
-            // Tab switches panels here; egui would also move the focus.
-            *key != egui::Key::Tab
+            // Tab switches panels and the motion keys move the cursor here;
+            // egui would also move the focus or scroll.
+            !(motion || *key == egui::Key::Tab)
         });
     }
 

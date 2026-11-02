@@ -13,6 +13,7 @@ mod tests;
 mod toolbar;
 
 pub(super) use address_bar::address_id;
+pub(super) use panel::page_rows;
 pub(super) use startup_error::draw as draw_startup_error;
 
 use super::action::Action;

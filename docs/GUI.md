@@ -51,21 +51,28 @@ accepts (`s3://`, `gs://`, `az://`, `http(s)://`, `file://`) or a local path.
 The address is always opened as a folder. Buckets are not listed: type the
 bucket's URL. Going up stops at the bucket root (or the file-system root).
 
-| Key            | Action                                         |
-|----------------|------------------------------------------------|
-| F5             | Copy the selection to the other panel's folder |
-| F6             | Move the selection to the other panel's folder |
-| F2             | Rename the selected entry                      |
-| Del            | Delete the selection                           |
-| Enter          | Open the selected folder                       |
-| Backspace      | Up one level                                   |
-| Tab            | Switch panel                                   |
-| Ctrl+A         | Select everything listed                       |
-| Esc            | Clear the selection (or cancel a dialog)       |
-| Ctrl+R         | Refresh                                        |
-| Ctrl+L         | Edit the address                               |
+| Key                               | Action                                         |
+|-----------------------------------|------------------------------------------------|
+| Up / Down                         | Move to the previous or next row and select it |
+| Shift+Up / Down                   | Extend the selection from where it started     |
+| Page Up / Page Down               | Move one page (the rows visible) up or down    |
+| Home / End                        | Go to the first or last row                    |
+| Shift+Page Up / Down / Home / End | Extend the selection the same way              |
+| Enter                             | Open the folder under the cursor               |
+| F5                                | Copy the selection to the other panel's folder |
+| F6                                | Move the selection to the other panel's folder |
+| F2                                | Rename the selected entry                      |
+| Del                               | Delete the selection                           |
+| Backspace                         | Up one level                                   |
+| Tab                               | Switch panel                                   |
+| Ctrl+A                            | Select everything listed                       |
+| Esc                               | Clear the selection (or cancel a dialog)       |
+| Ctrl+R                            | Refresh                                        |
+| Ctrl+L                            | Edit the address                               |
 
-Click, Ctrl-click and Shift-click select entries; double-click opens a folder.
+The cursor is the outlined row: the arrow keys move it, and Enter opens it if
+it is a folder. A click moves the cursor to the clicked row. Click, Ctrl-click
+and Shift-click select entries; double-click opens a folder.
 
 ## Operations
 

@@ -20,6 +20,24 @@ pub(super) enum SelectOp {
     Range(EntryKey),
     All,
     Clear,
+    /// Keyboard motion of the cursor; with `extend`, the selection grows
+    /// from the anchor to the new row.
+    Move {
+        motion: Motion,
+        extend: bool,
+    },
+}
+
+/// Where keyboard motion takes the cursor. The page variants carry the
+/// number of visible rows (at least 1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Motion {
+    Up,
+    Down,
+    PageUp(usize),
+    PageDown(usize),
+    Home,
+    End,
 }
 
 /// What the user did.

@@ -2,6 +2,7 @@ use super::*;
 
 mod close;
 mod jobs;
+mod nav;
 use crate::gui::model::{Entry, MAX_ENTRIES};
 use chrono::DateTime;
 

@@ -9,17 +9,57 @@ use egui_extras::{Column, TableBuilder};
 
 /// Height of one table row.
 const ROW_HEIGHT: f32 = 20.0;
+/// Width of a panel's border, active or not: switching panels moves nothing.
+const BORDER_WIDTH: f32 = 2.0;
+/// Rows a page moves before the table was first drawn.
+pub(super) const DEFAULT_PAGE_ROWS: usize = 20;
+
+/// Where the rows the table of `side` showed fully last frame are kept.
+fn page_rows_id(side: Side) -> egui::Id {
+    egui::Id::unique(("osc-gui page rows", side.index()))
+}
+
+/// Where the `cursor_moves` the view of `side` last scrolled for is kept.
+pub(super) fn seen_moves_id(side: Side) -> egui::Id {
+    egui::Id::unique(("osc-gui cursor moves", side.index()))
+}
+
+/// How many rows of `side`'s table were fully visible last frame: the
+/// distance of Page Up and Page Down.
+pub(in crate::gui) fn page_rows(ctx: &egui::Context, side: Side) -> usize {
+    ctx.data(|d| d.get_temp(page_rows_id(side)))
+        .unwrap_or(DEFAULT_PAGE_ROWS)
+}
+
+/// The `cursor_moves` the view of `side` last scrolled for, if any.
+pub(super) fn seen_moves(ctx: &egui::Context, side: Side) -> Option<u64> {
+    ctx.data(|d| d.get_temp(seen_moves_id(side)))
+}
+
+/// `color` in greyscale, keeping its alpha: its luminance as a grey.
+pub(super) fn desaturate(color: egui::Color32) -> egui::Color32 {
+    let luma =
+        (299 * u32::from(color.r()) + 587 * u32::from(color.g()) + 114 * u32::from(color.b()))
+            / 1000;
+    let luma = u8::try_from(luma).unwrap_or(u8::MAX);
+    egui::Color32::from_rgba_unmultiplied(luma, luma, luma, color.a())
+}
+
+/// The border of a panel. Only the colour shows which one is active.
+pub(super) fn panel_stroke(visuals: &egui::Visuals, active: bool) -> egui::Stroke {
+    let color = if active {
+        visuals.selection.bg_fill
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    egui::Stroke::new(BORDER_WIDTH, color)
+}
 
 pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mut Vec<Action>) {
     let panel = &state.panels[side.index()];
     let active = state.active == side;
-    let stroke = if active {
-        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
-    } else {
-        ui.visuals().widgets.noninteractive.bg_stroke
-    };
     let frame = egui::Frame::group(ui.style())
-        .stroke(stroke)
+        .stroke(panel_stroke(ui.visuals(), active))
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             address_bar::draw(ui, panel, side, actions);
@@ -35,7 +75,18 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mu
                 // Rows of the previous folder are dimmed and inert while the new
                 // one loads: a name would resolve against the new location.
                 ui.add_enabled_ui(!panel.stale(), |ui| {
-                    table(ui, panel, side, height, actions);
+                    if active {
+                        table(ui, panel, side, height, actions);
+                    } else {
+                        // The selection of an inactive panel is greyed out.
+                        ui.scope(|ui| {
+                            let visuals = ui.visuals_mut();
+                            visuals.selection.bg_fill = desaturate(visuals.selection.bg_fill);
+                            visuals.selection.stroke.color =
+                                desaturate(visuals.selection.stroke.color);
+                            table(ui, panel, side, height, actions);
+                        });
+                    }
                 });
             });
             footer_row(ui, panel, side, actions);
@@ -84,8 +135,22 @@ fn table(
     ui.style_mut().interaction.selectable_labels = false;
     let modifiers = ui.input(|i| i.modifiers);
     let spacing = ui.spacing().item_spacing.y;
-    TableBuilder::new(ui)
-        .id_salt(("panel", side.index()))
+    let ctx = ui.ctx().clone();
+    // Keyboard motion since the last frame: bring the cursor into view.
+    // Clicks never scroll, since they do not count as moves.
+    let mut builder = TableBuilder::new(ui).id_salt(("panel", side.index()));
+    if seen_moves(&ctx, side) != Some(panel.cursor_moves) {
+        ctx.data_mut(|d| d.insert_temp(seen_moves_id(side), panel.cursor_moves));
+        let at = panel
+            .cursor
+            .as_ref()
+            .and_then(|cursor| panel.entries.iter().position(|e| e.is(cursor)));
+        if let (Some(at), true) = (at, panel.cursor_moves > 0) {
+            builder = builder.scroll_to_row(at, None);
+        }
+    }
+    let mut cursor_rect = None;
+    let output = builder
         .striped(true)
         .sense(egui::Sense::click())
         .auto_shrink([false, false])
@@ -110,9 +175,10 @@ fn table(
                 let entry = &panel.entries[row.index()];
                 let name = entry.name();
                 let key = entry.key();
+                let is_cursor = panel.cursor.as_ref() == Some(&key);
                 row.set_selected(panel.selection.contains(&key));
                 let icon = if entry.is_folder() { "🗀" } else { "🗋" };
-                row.col(|ui| {
+                let (first, _) = row.col(|ui| {
                     ui.add(egui::Label::new(format!("{icon} {}", display::text(name))).truncate());
                 });
                 let (size_text, modified_text) = match entry {
@@ -125,10 +191,14 @@ fn table(
                 row.col(|ui| {
                     ui.label(size_text);
                 });
-                row.col(|ui| {
+                let (last, _) = row.col(|ui| {
                     ui.label(modified_text);
                 });
                 let response = row.response();
+                if is_cursor {
+                    // The cells span exactly the row; the row's response may not.
+                    cursor_rect = Some(first.union(last));
+                }
                 if response.double_clicked() {
                     // Only folders open; an object may share a folder's name.
                     if entry.is_folder() {
@@ -146,6 +216,20 @@ fn table(
                 }
             });
         });
+    let body = output.inner_rect;
+    let rows = (body.height() / (ROW_HEIGHT + spacing)).floor();
+    // Truncation is the point: whole rows only, at least one.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let rows = rows.max(1.0) as usize;
+    ctx.data_mut(|d| d.insert_temp(page_rows_id(side), rows));
+    // The cursor outline is painted over the row, inside it: the row keeps
+    // its height, and an unselected cursor still shows.
+    if let Some(rect) = cursor_rect {
+        let stroke = egui::Stroke::new(1.0, ui.visuals().selection.stroke.color);
+        ui.painter()
+            .with_clip_rect(body)
+            .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+    }
 }
 
 /// Selection count, shown count and Load more.

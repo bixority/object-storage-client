@@ -1,7 +1,9 @@
 use super::dialogs::{default_answer, overwrite_text};
-use super::panel::{human_size, thousands};
+use super::panel::{
+    DEFAULT_PAGE_ROWS, desaturate, human_size, panel_stroke, seen_moves, seen_moves_id, thousands,
+};
 use super::*;
-use crate::gui::action::{Answer, Event, Msg, SelectOp, update};
+use crate::gui::action::{Answer, Event, Motion, Msg, SelectOp, update};
 use crate::gui::location::Location;
 use crate::gui::model::{
     Closing, Dialog, Encryption, Entry, Failure, Job, JobId, JobPhase, Outcome, Page, Plan,
@@ -296,4 +298,151 @@ fn sizes_and_counts_read_well() {
     assert_eq!(thousands(1_234_567), "1,234,567");
     assert_eq!(count(1, "item"), "1 item");
     assert_eq!(count(2, "item"), "2 items");
+}
+
+#[test]
+fn panel_border_width_does_not_depend_on_focus() {
+    for visuals in [egui::Visuals::dark(), egui::Visuals::light()] {
+        let active = panel_stroke(&visuals, true);
+        let inactive = panel_stroke(&visuals, false);
+        assert!((active.width - inactive.width).abs() < f32::EPSILON);
+        assert!((active.width - 2.0).abs() < f32::EPSILON);
+        assert_eq!(active.color, visuals.selection.bg_fill);
+        assert_eq!(
+            inactive.color,
+            visuals.widgets.noninteractive.bg_stroke.color
+        );
+    }
+}
+
+/// The left panel lists many rows and keyboard motion put the cursor on the
+/// last one: the next frame has a scroll to do.
+fn moved_state() -> AppState {
+    let mut s = state();
+    let many = (0..500)
+        .map(|i| Entry::Object {
+            name: format!("r{i:03}"),
+            size: 1,
+            modified: DateTime::UNIX_EPOCH,
+        })
+        .collect();
+    update(
+        &mut s,
+        Msg::Event(Event::Page {
+            side: Side::Left,
+            seq: 1,
+            first: true,
+            result: Ok(Page {
+                entries: many,
+                next: None,
+            }),
+        }),
+    );
+    update(
+        &mut s,
+        Msg::Action(Action::Select(
+            Side::Left,
+            SelectOp::Move {
+                motion: Motion::End,
+                extend: false,
+            },
+        )),
+    );
+    s
+}
+
+#[test]
+fn render_with_cursor_and_pending_scroll() {
+    let mut s = moved_state();
+    assert_eq!(s.panels[0].cursor_moves, 1);
+    assert_eq!(render(&s), Vec::new());
+    // A cursor that is not selected is drawn too.
+    update(
+        &mut s,
+        Msg::Action(Action::Select(Side::Left, SelectOp::Clear)),
+    );
+    assert_eq!(render(&s), Vec::new());
+}
+
+#[test]
+fn view_remembers_moves_and_page_rows() {
+    let s = moved_state();
+    let ctx = egui::Context::default();
+    assert_eq!(page_rows(&ctx, Side::Left), DEFAULT_PAGE_ROWS);
+    assert_eq!(seen_moves(&ctx, Side::Left), None);
+    for _ in 0..2 {
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = draw(ui, &s);
+        })
+        .drop_without_applying_deltas();
+    }
+    assert_eq!(seen_moves(&ctx, Side::Left), Some(1));
+    let rows = page_rows(&ctx, Side::Left);
+    assert!((1..500).contains(&rows), "{rows}");
+}
+
+/// Whether a frame painted the cursor outline.
+fn cursor_drawn(output: &egui::FullOutput, visuals: &egui::Visuals) -> bool {
+    let want = egui::Stroke::new(1.0, visuals.selection.stroke.color);
+    output.shapes.iter().any(|clipped| {
+        matches!(&clipped.shape, egui::Shape::Rect(rect)
+            if rect.stroke == want && rect.fill == egui::Color32::TRANSPARENT)
+    })
+}
+
+#[test]
+fn keyboard_motion_scrolls_the_cursor_into_view() {
+    let s = moved_state();
+    let ctx = egui::Context::default();
+    let mut drawn = false;
+    // The scroll may animate: let time pass.
+    for frame in 0..30 {
+        let input = egui::RawInput {
+            time: Some(f64::from(frame) * 0.1),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            let _ = draw(ui, &s);
+        });
+        drawn = cursor_drawn(&output, &ctx.global_style().visuals);
+        output.drop_without_applying_deltas();
+    }
+    assert!(drawn, "the last row, under the cursor, was never laid out");
+
+    // Without a move, the table stays at the top: the last row is not drawn.
+    let ctx = egui::Context::default();
+    let mut drawn = true;
+    for frame in 0..30 {
+        let input = egui::RawInput {
+            time: Some(f64::from(frame) * 0.1),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            if frame == 0 {
+                // As if the move had been scrolled for already.
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(seen_moves_id(Side::Left), 1_u64));
+            }
+            let _ = draw(ui, &s);
+        });
+        drawn = cursor_drawn(&output, &ctx.global_style().visuals);
+        output.drop_without_applying_deltas();
+    }
+    assert!(!drawn, "scrolled without a new move");
+}
+
+#[test]
+fn desaturate_keeps_luminance_and_alpha() {
+    use eframe::egui::Color32;
+    let blue = Color32::from_rgba_unmultiplied(0, 92, 128, 200);
+    let grey = desaturate(blue);
+    assert_eq!(
+        (grey.r(), grey.g(), grey.b()),
+        (grey.r(), grey.r(), grey.r())
+    );
+    assert_eq!(grey.a(), 200);
+    assert_eq!(desaturate(Color32::WHITE), Color32::WHITE);
+    assert_eq!(desaturate(Color32::BLACK), Color32::BLACK);
+    let red = desaturate(Color32::from_rgb(255, 0, 0));
+    assert_eq!(red.r(), 76, "0.299 of 255");
 }

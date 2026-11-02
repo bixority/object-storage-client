@@ -109,12 +109,6 @@ then waits up to 10 seconds for interrupted uploads to be cleaned up (aborted
 multipart uploads, removed staging files) before the window closes. Ctrl-C or
 SIGTERM in the terminal that started `osc-gui` does the same without asking.
 
-## Accessibility
-
-The window supports screen readers through AccessKit. Everything shown,
-including what a screen reader announces, has credentials and query strings
-removed from URLs, and control characters escaped.
-
 ## Licences
 
 `osc-gui` bundles egui's default fonts (the `epaint_default_fonts` crate):

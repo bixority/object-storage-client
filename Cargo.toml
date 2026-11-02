@@ -27,7 +27,7 @@ aws-types = "1.7"
 bytes = "1.12"
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "env"], optional = true }
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "accesskit", "default_fonts", "x11", "wayland", "clipboard"], optional = true }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "clipboard"], optional = true }
 egui_extras = { version = "0.37.0", default-features = false, optional = true }
 # Only for its bundled icon and emoji fonts (folder/file/arrow glyphs); eframe
 # brings everything else.

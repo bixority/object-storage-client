@@ -75,18 +75,19 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mu
                 // Rows of the previous folder are dimmed and inert while the new
                 // one loads: a name would resolve against the new location.
                 ui.add_enabled_ui(!panel.stale(), |ui| {
-                    if active {
-                        table(ui, panel, side, height, actions);
-                    } else {
-                        // The selection of an inactive panel is greyed out.
-                        ui.scope(|ui| {
+                    // Always the same widget tree, whichever panel is active: a
+                    // click that activates a panel must still reach its row on
+                    // release, which needs the row to keep its id.
+                    ui.scope(|ui| {
+                        if !active {
+                            // The selection of an inactive panel is greyed out.
                             let visuals = ui.visuals_mut();
                             visuals.selection.bg_fill = desaturate(visuals.selection.bg_fill);
                             visuals.selection.stroke.color =
                                 desaturate(visuals.selection.stroke.color);
-                            table(ui, panel, side, height, actions);
-                        });
-                    }
+                        }
+                        table(ui, panel, side, height, actions);
+                    });
                 });
             });
             footer_row(ui, panel, side, actions);

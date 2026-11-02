@@ -4,17 +4,9 @@
 use super::CliError;
 #[cfg(not(unix))]
 use super::transfer::read_err;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::fs;
 use std::ops::ControlFlow;
 use std::path::{Component, Path, PathBuf};
-
-/// What stays unescaped when a relative file path is appended to a URL.
-///
-/// Applied to one path component at a time, so `/`, `\` and `%` are always
-/// escaped.
-pub(super) const URL_PATH_SEGMENTS: &AsciiSet =
-    &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.');
 
 /// Device and inode of a file or directory found by the directory walk.
 #[cfg(unix)]
@@ -398,7 +390,7 @@ pub(super) fn destination_url(dst_root_url: &str, rel_path: &Path) -> Result<Str
         reason,
     };
 
-    let mut encoded = Vec::new();
+    let mut segments = Vec::new();
     for component in rel_path.components() {
         let Component::Normal(name) = component else {
             return Err(unsafe_path("path has a non-normal component"));
@@ -406,12 +398,12 @@ pub(super) fn destination_url(dst_root_url: &str, rel_path: &Path) -> Result<Str
         let name = name
             .to_str()
             .ok_or_else(|| unsafe_path("file name is not valid UTF-8"))?;
-        encoded.push(utf8_percent_encode(name, URL_PATH_SEGMENTS).to_string());
+        segments.push(name);
     }
-    if encoded.is_empty() {
+    if segments.is_empty() {
         return Err(unsafe_path("path is empty"));
     }
-    let dst_url = format!("{dst_root_url}{}", encoded.join("/"));
+    let dst_url = crate::registry::child_url(dst_root_url, segments);
 
     let root = url::Url::parse(dst_root_url).map_err(|_| unsafe_path("invalid destination"))?;
     let parsed = url::Url::parse(&dst_url).map_err(|_| unsafe_path("invalid destination"))?;

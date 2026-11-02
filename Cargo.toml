@@ -9,7 +9,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.2.3"
+version = "0.3.0"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -27,6 +27,11 @@ aws-types = "1.7"
 bytes = "1.12"
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "env"], optional = true }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "accesskit", "default_fonts", "x11", "wayland", "clipboard"], optional = true }
+egui_extras = { version = "0.37.0", default-features = false, optional = true }
+# Only for its bundled icon and emoji fonts (folder/file/arrow glyphs); eframe
+# brings everything else.
+egui = { version = "0.37.0", default-features = false, features = ["monochrome_emoji_fonts"], optional = true }
 futures = "0.3"
 http = "1.5"
 http-body = "1"
@@ -50,6 +55,8 @@ default = ["encryption", "cli"]
 # The `osc` binary and its `cli` module; the Python wheel does not need it.
 cli = ["dep:clap", "dep:tokio-util", "tokio/signal", "tokio/io-std", "tokio/macros"]
 encryption = ["dep:zeroize"]
+# The `osc-gui` binary and its `gui` module (a two-pane desktop browser).
+gui = ["cli", "encryption", "dep:eframe", "dep:egui", "dep:egui_extras"]
 # Exposes `encryption::fuzzing` harness entry points for the `fuzz/` crate.
 fuzzing = ["encryption"]
 python = ["dep:pyo3", "dep:pyo3-async-runtimes", "encryption"]
@@ -58,6 +65,11 @@ python = ["dep:pyo3", "dep:pyo3-async-runtimes", "encryption"]
 name = "osc"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "osc-gui"
+path = "src/bin/osc-gui.rs"
+required-features = ["gui"]
 
 [[bench]]
 name = "throughput"

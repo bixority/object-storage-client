@@ -9,6 +9,9 @@ mod encryption;
 mod file_roundtrip;
 #[path = "integration/gcs_storage_ops.rs"]
 mod gcs_storage_ops;
+#[cfg(feature = "gui")]
+#[path = "integration/gui_ops.rs"]
+mod gui_ops;
 #[cfg(feature = "encryption")]
 #[path = "integration/reencrypt.rs"]
 mod reencrypt;

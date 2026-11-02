@@ -88,9 +88,10 @@ pub(super) enum KeyringCommand {
 /// The configured key sources: `--keyring` (`OSC_KEYRING_FILE`) and the
 /// command of `OSC_KEYRING_COMMAND`. The binary reads the environment; this
 /// code never does.
-pub(super) struct KeySources {
-    pub(super) file: Option<PathBuf>,
-    pub(super) command: Option<OsString>,
+#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+pub struct KeySources {
+    pub file: Option<PathBuf>,
+    pub command: Option<OsString>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -112,12 +113,14 @@ fn source(sources: KeySources) -> Result<Option<Source>, CliError> {
 }
 
 /// Whether a key source is configured (which enables encryption).
-pub(super) fn is_configured(sources: KeySources) -> Result<bool, CliError> {
+#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+pub fn is_configured(sources: KeySources) -> Result<bool, CliError> {
     source(sources).map(|s| s.is_some())
 }
 
 /// The configured keyring, or `None` for plain operation.
-pub(super) async fn open(sources: KeySources) -> Result<Option<Arc<Keyring>>, CliError> {
+#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+pub async fn open(sources: KeySources) -> Result<Option<Arc<Keyring>>, CliError> {
     let ring = match source(sources)? {
         None => return Ok(None),
         Some(Source::File(path)) => Keyring::from_file(path)?,

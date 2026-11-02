@@ -227,7 +227,7 @@ async fn empty_or(backend: &dyn Backend, loc: &Location, e: object_store::Error)
 /// # Errors
 /// [`Error::NotEncrypted`] for objects that are not envelope messages,
 /// [`Error::Decryption`] for malformed headers, and storage errors.
-#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
 pub(crate) async fn inspect_encryption_raw(
     client: &crate::ObjectStorageClient,
     url: &str,

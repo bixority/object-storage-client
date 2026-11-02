@@ -1,0 +1,197 @@
+//! One panel: address bar, banners, the listing table and its footer.
+
+use super::address_bar;
+use crate::gui::action::{Action, SelectOp};
+use crate::gui::display;
+use crate::gui::model::{AppState, Entry, MAX_ENTRIES, PanelState, Side};
+use eframe::egui;
+use egui_extras::{Column, TableBuilder};
+
+/// Height of one table row.
+const ROW_HEIGHT: f32 = 20.0;
+
+pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mut Vec<Action>) {
+    let panel = &state.panels[side.index()];
+    let active = state.active == side;
+    let stroke = if active {
+        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
+    let frame = egui::Frame::group(ui.style())
+        .stroke(stroke)
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            address_bar::draw(ui, panel, side, actions);
+            banners(ui, panel, side, actions);
+            // Leave room for the footer below the table.
+            let footer = ui
+                .spacing()
+                .item_spacing
+                .y
+                .mul_add(2.0, ui.spacing().interact_size.y);
+            let height = (ui.available_height() - footer).max(ROW_HEIGHT);
+            ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+                // Rows of the previous folder are dimmed and inert while the new
+                // one loads: a name would resolve against the new location.
+                ui.add_enabled_ui(!panel.stale(), |ui| {
+                    table(ui, panel, side, height, actions);
+                });
+            });
+            footer_row(ui, panel, side, actions);
+        });
+    let pressed = ui.input(|i| i.pointer.primary_pressed());
+    if !active && pressed && ui.rect_contains_pointer(frame.response.rect) {
+        actions.push(Action::Activate(side));
+    }
+}
+
+/// Loading strip, listing error with Retry, truncation warning.
+fn banners(ui: &mut egui::Ui, panel: &PanelState, side: Side, actions: &mut Vec<Action>) {
+    if panel.loading {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.weak("Loading…");
+        });
+    }
+    if let Some(error) = &panel.error {
+        ui.horizontal(|ui| {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+            if ui.button("Retry").clicked() {
+                actions.push(Action::Retry(side));
+            }
+        });
+    }
+    if panel.truncated {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "The listing is incomplete: only the first {} entries are shown.",
+                thousands(MAX_ENTRIES)
+            ),
+        );
+    }
+}
+
+/// The virtualized listing.
+fn table(
+    ui: &mut egui::Ui,
+    panel: &PanelState,
+    side: Side,
+    height: f32,
+    actions: &mut Vec<Action>,
+) {
+    ui.style_mut().interaction.selectable_labels = false;
+    let modifiers = ui.input(|i| i.modifiers);
+    let spacing = ui.spacing().item_spacing.y;
+    TableBuilder::new(ui)
+        .id_salt(("panel", side.index()))
+        .striped(true)
+        .sense(egui::Sense::click())
+        .auto_shrink([false, false])
+        // The header row sits above the scrolled body.
+        .max_scroll_height((height - ROW_HEIGHT - spacing).max(ROW_HEIGHT))
+        .column(Column::remainder().clip(true))
+        .column(Column::exact(90.0))
+        .column(Column::exact(130.0))
+        .header(ROW_HEIGHT, |mut header| {
+            header.col(|ui| {
+                ui.strong("Name");
+            });
+            header.col(|ui| {
+                ui.strong("Size");
+            });
+            header.col(|ui| {
+                ui.strong("Modified");
+            });
+        })
+        .body(|body| {
+            body.rows(ROW_HEIGHT, panel.entries.len(), |mut row| {
+                let entry = &panel.entries[row.index()];
+                let name = entry.name();
+                let key = entry.key();
+                row.set_selected(panel.selection.contains(&key));
+                let icon = if entry.is_folder() { "🗀" } else { "🗋" };
+                row.col(|ui| {
+                    ui.add(egui::Label::new(format!("{icon} {}", display::text(name))).truncate());
+                });
+                let (size_text, modified_text) = match entry {
+                    Entry::Folder { .. } => (String::new(), String::new()),
+                    Entry::Object { size, modified, .. } => (
+                        human_size(*size),
+                        modified.format("%Y-%m-%d %H:%M").to_string(),
+                    ),
+                };
+                row.col(|ui| {
+                    ui.label(size_text);
+                });
+                row.col(|ui| {
+                    ui.label(modified_text);
+                });
+                let response = row.response();
+                if response.double_clicked() {
+                    // Only folders open; an object may share a folder's name.
+                    if entry.is_folder() {
+                        actions.push(Action::Open(side, name.to_owned()));
+                    }
+                } else if response.clicked() {
+                    let op = if modifiers.command || modifiers.ctrl {
+                        SelectOp::Toggle(key)
+                    } else if modifiers.shift {
+                        SelectOp::Range(key)
+                    } else {
+                        SelectOp::Only(key)
+                    };
+                    actions.push(Action::Select(side, op));
+                }
+            });
+        });
+}
+
+/// Selection count, shown count and Load more.
+fn footer_row(ui: &mut egui::Ui, panel: &PanelState, side: Side, actions: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "{} selected · {} shown",
+            thousands(panel.selection.len()),
+            thousands(panel.entries.len())
+        ));
+        if panel.next.is_some() && !panel.truncated {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let more = ui.add_enabled(!panel.loading, egui::Button::new("Load more"));
+                if more.clicked() {
+                    actions.push(Action::LoadMore(side));
+                }
+            });
+        }
+    });
+}
+
+/// `50000` as `50,000`.
+pub(super) fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// A byte count with a binary unit and one decimal: `1.5 KiB`.
+pub(super) fn human_size(size: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    if size < 1024 {
+        return format!("{size} B");
+    }
+    // Tenths of the unit, in integers: no float rounding surprises.
+    let mut tenths = u128::from(size) * 10;
+    let mut unit = 0;
+    while tenths >= 1024 * 10 && unit < UNITS.len() - 1 {
+        tenths /= 1024;
+        unit += 1;
+    }
+    format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
+}

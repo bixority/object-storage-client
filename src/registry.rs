@@ -3,6 +3,7 @@
 use crate::backend::{self, AwsProfile, Backend, Vars};
 use crate::client::{Error, Result};
 use object_store::path::Path as ObjectPath;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +22,24 @@ pub fn origin(url: &Url) -> &str {
 pub fn object_path(url: &Url) -> Result<ObjectPath> {
     ObjectPath::from_url_path(url.path())
         .map_err(|e| Error::InvalidInput(format!("Invalid object path in URL: {e}")))
+}
+
+/// What stays unescaped when a relative file path is appended to a URL.
+///
+/// Applied to one path component at a time, so `/`, `\` and `%` are always
+/// escaped.
+pub const URL_PATH_SEGMENTS: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.');
+
+/// `dir` (ending in `/`) followed by each segment percent-encoded with
+/// [`URL_PATH_SEGMENTS`] and joined by `/`.
+#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+pub fn child_url<'a>(dir: &str, segments: impl IntoIterator<Item = &'a str>) -> String {
+    debug_assert!(dir.ends_with('/'), "directory URL must end in `/`: {dir}");
+    let encoded: Vec<String> = segments
+        .into_iter()
+        .map(|s| utf8_percent_encode(s, URL_PATH_SEGMENTS).to_string())
+        .collect();
+    format!("{dir}{}", encoded.join("/"))
 }
 
 /// A resolved backend and the object path within it.
@@ -287,6 +306,16 @@ fn path_to_file_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_url_encodes_each_segment() {
+        assert_eq!(
+            child_url("s3://b/p/", ["a b", "c%d", "é#?"]),
+            "s3://b/p/a%20b/c%25d/%C3%A9%23%3F"
+        );
+        assert_eq!(child_url("file:///t/", ["x"]), "file:///t/x");
+        assert_eq!(child_url("s3://b/", ["d", "e.txt"]), "s3://b/d/e.txt");
+    }
 
     fn parts(url: &str) -> Result<Vec<String>> {
         let url = Url::parse(url).expect("url");

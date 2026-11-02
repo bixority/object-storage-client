@@ -149,6 +149,13 @@ pub trait Backend: Send + Sync {
         true
     }
 
+    /// The store's paged, delimiter-aware listing, if it has one (S3, GCS and
+    /// Azure); `None` for stores that only offer `list_with_delimiter`.
+    #[cfg(feature = "gui")]
+    fn paginated(&self) -> Option<&dyn object_store::list::PaginatedListStore> {
+        None
+    }
+
     /// The file system path `path` maps to, for the local backend on Unix;
     /// `None` for every other backend. Writes to such a path go through the
     /// crate's own private-staging writer instead of the store's `put`.

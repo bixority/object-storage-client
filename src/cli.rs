@@ -27,12 +27,19 @@ mod output;
 mod args;
 #[cfg(feature = "encryption")]
 mod enc;
+#[cfg(unix)]
+mod harden;
 #[cfg(feature = "encryption")]
 mod keyring;
 mod transfer;
 mod tree;
 
 pub use args::Cli;
+#[cfg(unix)]
+#[doc(hidden)]
+pub use harden::harden_process;
+#[cfg(feature = "gui")]
+pub(crate) use keyring::{KeySources, open as open_keyring};
 
 /// Waits for the cancelled uploads' clean-up (aborting multipart uploads and
 /// removing staging files). Re-exported for the binary.

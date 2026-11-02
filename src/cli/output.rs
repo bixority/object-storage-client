@@ -50,51 +50,12 @@ pub fn sanitize(text: &str) -> String {
     text::escape(text, usize::MAX)
 }
 
-/// Removes what a URL carries beyond its location: the user name and
-/// password, the query and the fragment, which may hold tokens (the library's
-/// [`crate::codec::redacted`] policy). A dropped query or fragment leaves `?…`
-/// behind. Text that does not parse as a URL is cut at the first `?` or `#`
-/// and loses any `user:password@` in its authority.
-#[must_use]
-pub(super) fn redact_url(text: &str) -> String {
-    if let Ok(url) = url::Url::parse(text) {
-        let mut out = crate::codec::redacted(&url);
-        if url.query().is_some() || url.fragment().is_some() {
-            out.push_str("?…");
-        }
-        return out;
-    }
-    let cut = text.find(['?', '#']);
-    let head = cut.map_or(text, |i| &text[..i]);
-    let head = match head.split_once("://") {
-        Some((scheme, rest)) => {
-            let (auth, path) = rest
-                .split_once('/')
-                .map_or((rest, None), |(a, p)| (a, Some(p)));
-            let auth = auth.rsplit_once('@').map_or(auth, |(_, host)| host);
-            path.map_or_else(
-                || format!("{scheme}://{auth}"),
-                |p| format!("{scheme}://{auth}/{p}"),
-            )
-        }
-        None => head.to_string(),
-    };
-    if cut.is_some() {
-        format!("{head}?…")
-    } else {
-        head
-    }
-}
-
 /// A URL made safe for a status line: redacted, then escaped.
 pub(super) fn show_url(text: &str) -> String {
-    sanitize(&redact_url(text))
+    sanitize(&crate::codec::redact_url(text))
 }
 
 /// A local path made safe for a status line.
 pub(super) fn show_path(path: &Path) -> String {
     sanitize(&path.display().to_string())
 }
-
-#[cfg(test)]
-mod tests;

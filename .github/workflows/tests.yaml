@@ -105,6 +105,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings -W clippy::pedantic
+      # The desktop browser on its own (gui implies cli and encryption).
+      - run: cargo clippy --locked --all-targets --no-default-features --features gui -- -D warnings -W clippy::pedantic
       - run: cargo check --locked --no-default-features --features python
       - run: cargo check --locked --features fuzzing
       # Keeps `encryption::fuzzing` and the fuzz targets compiling.

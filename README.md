@@ -46,7 +46,7 @@ export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages
 
 ```toml
 [dependencies]
-object-storage-client = { version = "0.2", registry = "bixority" }
+object-storage-client = { version = "0.3", registry = "bixority" }
 # or: object-storage-client = { git = "https://codeberg.org/bixority/object-storage-client" }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -55,7 +55,7 @@ The `encryption` and `cli` features are on by default. A library that does not
 need the CLI can drop `clap` and `tokio-util`:
 
 ```toml
-object-storage-client = { version = "0.2", registry = "bixority", default-features = false, features = ["encryption"] }
+object-storage-client = { version = "0.3", registry = "bixority", default-features = false, features = ["encryption"] }
 ```
 
 ```rust
@@ -315,6 +315,19 @@ osc --keyring keyring enc reencrypt s3://my-bucket/ --from <old key ID>
 prints the keyring (`OSC_KEYRING_COMMAND`), so the keyring never touches the
 disk.
 
+## Desktop browser (`osc-gui`)
+
+An optional two-panel browser (Cargo feature `gui`) for browsing, copying,
+moving, renaming and deleting objects and folders across all of the above, with
+the same keys and credentials as `osc`:
+
+```bash
+cargo install object-storage-client --registry bixority --features gui
+osc-gui s3://my-bucket/photos/ ~/Pictures
+```
+
+See [Desktop browser](docs/GUI.md).
+
 ## Documentation
 
 - [Configuration](docs/CONFIGURATION.md): credentials and environment variables
@@ -323,5 +336,6 @@ disk.
   rotation, responding to a key leak, the format and interop.
 - [Behaviour and limits](docs/BEHAVIOR.md): URL rules, copy and move, deletes,
   file permissions, large objects, pre-signing, CLI and Python details.
+- [Desktop browser](docs/GUI.md): `osc-gui`, its keys, limits and closing.
 - [Upgrading](docs/UPGRADING.md): breaking changes between releases.
 - [Development](docs/DEVELOPMENT.md) and [Testing](docs/TESTING.md).

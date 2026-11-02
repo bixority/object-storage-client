@@ -107,6 +107,11 @@ impl AzureBackend {
 
 #[async_trait::async_trait]
 impl Backend for AzureBackend {
+    #[cfg(feature = "gui")]
+    fn paginated(&self) -> Option<&dyn object_store::list::PaginatedListStore> {
+        Some(self.inner.as_ref())
+    }
+
     fn store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
     }

@@ -54,31 +54,9 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// on a FIFO, a write to a full pipe) before the process exits regardless.
 const BLOCKING_SHUTDOWN: Duration = Duration::from_millis(200);
 
-/// Keeps key material out of core dumps and away from same-user debuggers.
-///
-/// A release build aborts on panic and the abort signal dumps core by
-/// default, which would write every loaded key and credential to disk. Both
-/// calls are best effort: a limit that cannot be set is not worth refusing to
-/// run for. The process keeps access to its own `/proc/self`, and children
-/// (the keyring command) inherit the zero core limit.
-#[cfg(unix)]
-fn harden_process() {
-    use rustix::process::{Resource, Rlimit, setrlimit};
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
-    let _ = setrlimit(
-        Resource::Core,
-        Rlimit {
-            current: Some(0),
-            maximum: Some(0),
-        },
-    );
-}
-
 fn main() -> ExitCode {
     #[cfg(unix)]
-    harden_process();
+    object_storage_client::cli::harden_process();
     // Built by hand so that after a signal the runtime can be shut down
     // without waiting for blocking threads, which cannot be cancelled.
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -178,7 +156,7 @@ async fn run() -> Exit {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
-    use super::harden_process;
+    use object_storage_client::cli::harden_process;
     use rustix::process::{DumpableBehavior, Resource, Rlimit, dumpable_behavior, getrlimit};
 
     /// Irreversible for this test process, which no other test shares.

@@ -264,7 +264,10 @@ impl Drop for PendingAbort {
 /// Waits, for at most `timeout`, for the aborts of uploads that were dropped
 /// mid-way (cancelled commands) to finish, so a pending multipart upload or a
 /// staging file is not left behind when the process exits right after.
-#[cfg_attr(not(any(feature = "cli", feature = "python")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "cli", feature = "python", feature = "gui")),
+    allow(dead_code)
+)]
 #[doc(hidden)]
 pub async fn drain_pending_aborts(timeout: Duration) {
     let drained = async {

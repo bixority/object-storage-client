@@ -1,0 +1,115 @@
+# Desktop browser (`osc-gui`)
+
+`osc-gui` is a two-panel browser for every store the crate supports. Each panel
+shows one folder. You copy, move, rename and delete objects and whole folders
+within a panel or between the two. It is built on egui, and it does all its
+storage work through the same client as `osc`: listing, copy, move, delete,
+encryption and credentials behave exactly as they do there.
+
+## Install
+
+The browser is behind the `gui` Cargo feature, which is off by default:
+
+```bash
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+cargo install object-storage-client --registry bixority --features gui
+# or, from a checkout: cargo install --path . --features gui
+```
+
+This installs `osc` and `osc-gui`. Linux needs no extra system packages: the
+window opens on X11 or Wayland, whichever is running.
+
+## Launch
+
+```bash
+osc-gui                                         # both panels on the current directory
+osc-gui s3://my-bucket/photos/ ~/Pictures       # left and right panel
+osc-gui --profile dev s3://my-bucket/           # credentials from the AWS profile "dev"
+osc-gui --keyring keyring s3://my-bucket/ .     # copies encrypt and decrypt
+```
+
+The options are the ones `osc` takes:
+
+| Option                 | Environment              | Meaning                                                   |
+|------------------------|--------------------------|-----------------------------------------------------------|
+| `--profile NAME`       |                          | AWS profile for `s3://` ([details](CONFIGURATION.md#aws-profiles-and-sso)) |
+| `--keyring FILE`       | `OSC_KEYRING_FILE`       | Keyring file; enables encryption                          |
+|                        | `OSC_KEYRING_COMMAND`    | A command that prints the keyring (instead of a file)     |
+| `--require-encryption` | `OSC_REQUIRE_ENCRYPTION` | Refuse to start without a key source                      |
+
+Keys are loaded once, at launch. The toolbar shows whether encryption is on and
+where the keys came from. With encryption on, every copy and move encrypts
+what it writes and decrypts what it reads, as `osc cp` and `osc mv` do.
+
+If the keys or the profile cannot be loaded, `osc-gui` prints the error and
+shows it in a small window, then exits with status 1.
+
+## Using it
+
+Type an address into a panel's address bar and press Enter: any URL `osc`
+accepts (`s3://`, `gs://`, `az://`, `http(s)://`, `file://`) or a local path.
+The address is always opened as a folder. Buckets are not listed: type the
+bucket's URL. Going up stops at the bucket root (or the file-system root).
+
+| Key            | Action                                         |
+|----------------|------------------------------------------------|
+| F5             | Copy the selection to the other panel's folder |
+| F6             | Move the selection to the other panel's folder |
+| F2             | Rename the selected entry                      |
+| Del            | Delete the selection                           |
+| Enter          | Open the selected folder                       |
+| Backspace      | Up one level                                   |
+| Tab            | Switch panel                                   |
+| Ctrl+A         | Select everything listed                       |
+| Esc            | Clear the selection (or cancel a dialog)       |
+| Ctrl+R         | Refresh                                        |
+| Ctrl+L         | Edit the address                               |
+
+Click, Ctrl-click and Shift-click select entries; double-click opens a folder.
+
+## Operations
+
+- **Folders are handled recursively.** Copying, moving, renaming or deleting a
+  folder works on every object under it.
+- **One operation runs at a time.** You can keep browsing while it runs. The
+  status bar shows how far it got, and Cancel stops it. Objects already done
+  stay done.
+- **A failure does not stop the job.** At the end, a list of the failed items
+  and their errors is shown, and it can be copied.
+- **Existing destinations are checked first**, for up to 1,000 items: one
+  question per job offers to overwrite all, skip existing or cancel. A larger
+  job is not checked; you are warned that existing objects will be overwritten.
+- **Moves and deletes ask first.** Deleting at a bucket root also asks you to
+  type the bucket name.
+- **Copying a folder into itself is refused.** So is copying onto the folder it
+  already is in.
+- **Empty directories can stay behind.** Moving or deleting a local folder can
+  leave empty directories behind, as deleting a prefix with the client does.
+
+## Limits
+
+- Listings load 1,000 entries per page; **Load more** fetches the next page. A
+  panel holds at most 50,000 entries. Past that, a banner says the listing is
+  incomplete; open a deeper folder to see the rest.
+- Local folders and `http(s)://` listings arrive in one page.
+- Sizes of encrypted objects are their stored sizes, as in `osc ls`.
+- Nothing is saved between runs: no settings, history or credentials.
+
+## Closing
+
+Closing the window while a job runs asks first. Quitting cancels the job,
+then waits up to 10 seconds for interrupted uploads to be cleaned up (aborted
+multipart uploads, removed staging files) before the window closes. Ctrl-C or
+SIGTERM in the terminal that started `osc-gui` does the same without asking.
+
+## Accessibility
+
+The window supports screen readers through AccessKit. Everything shown,
+including what a screen reader announces, has credentials and query strings
+removed from URLs, and control characters escaped.
+
+## Licences
+
+`osc-gui` bundles egui's default fonts (the `epaint_default_fonts` crate):
+Ubuntu Light under the Ubuntu Font Licence 1.0, Noto Emoji under the SIL Open
+Font Licence 1.1, and Hack and emoji-icon-font under the MIT licence.

@@ -13,6 +13,9 @@ pub mod codec;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 mod fsmode;
+#[cfg(feature = "gui")]
+#[doc(hidden)]
+pub mod gui;
 pub(crate) mod hex;
 #[cfg(feature = "python")]
 mod python;

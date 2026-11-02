@@ -420,7 +420,7 @@ impl<C: Codec> Client<C> {
     /// [`Self::put_stream`] of a local file with permission bits `source_mode`:
     /// a new `file://` destination takes them (less the umask), as a copy does,
     /// so uploading a private file does not create a world-readable one.
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
     pub(crate) async fn put_local_file(
         &self,
         url: &str,
@@ -529,6 +529,64 @@ impl<C: Codec> Client<C> {
         let r = self.resolve_prefix(url)?;
         let (store, path) = (r.backend.store(), r.loc.path);
         Ok(relative_listing(store.list(Some(&path)), path))
+    }
+
+    /// One page of the immediate children of the directory `url`: folder names
+    /// and objects, as single-segment names relative to it. `page_token` is a
+    /// `next` from an earlier page; stores without paged listing return one
+    /// complete page, and an empty one for a token. A missing directory is an
+    /// empty page. The order is the store's.
+    #[cfg(feature = "gui")]
+    pub(crate) async fn list_dir(
+        &self,
+        url: &str,
+        page_token: Option<String>,
+        max: usize,
+    ) -> Result<DirPage> {
+        use object_store::list::PaginatedListOptions;
+
+        let r = self.resolve_prefix(url)?;
+        let path = r.loc.path;
+        let (listed, next) = if let Some(store) = r.backend.paginated() {
+            let prefix = (!path.as_ref().is_empty()).then(|| format!("{path}/"));
+            let opts = PaginatedListOptions {
+                delimiter: Some("/".into()),
+                max_keys: Some(max),
+                page_token,
+                ..Default::default()
+            };
+            let page = store.list_paginated(prefix.as_deref(), opts).await?;
+            (page.result, page.page_token)
+        } else if page_token.is_some() {
+            return Ok(DirPage::default());
+        } else {
+            match r.backend.store().list_with_delimiter(Some(&path)).await {
+                Ok(listed) => (listed, None),
+                Err(object_store::Error::NotFound { .. }) => return Ok(DirPage::default()),
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let folders = listed
+            .common_prefixes
+            .iter()
+            .filter_map(|p| relative_name(p, &path))
+            .collect();
+        let objects = listed
+            .objects
+            .iter()
+            .filter_map(|m| {
+                relative_name(&m.location, &path).map(|name| DirObject {
+                    name,
+                    size: m.size,
+                    modified: m.last_modified,
+                })
+            })
+            .collect();
+        Ok(DirPage {
+            folders,
+            objects,
+            next,
+        })
     }
 
     /// Retrieves metadata for the object at the given URL.
@@ -1209,6 +1267,25 @@ fn check_dot_segments(raw: &str) -> Result<()> {
     Ok(())
 }
 
+/// One page of [`Client::list_dir`].
+#[cfg(feature = "gui")]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirPage {
+    pub(crate) folders: Vec<String>,
+    pub(crate) objects: Vec<DirObject>,
+    /// The token for the next page; `None` on the last one.
+    pub(crate) next: Option<String>,
+}
+
+/// An object listed by [`Client::list_dir`].
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DirObject {
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) modified: chrono::DateTime<chrono::Utc>,
+}
+
 /// The name of `location` relative to `prefix`, or `None` when it is not
 /// strictly below it: the prefix's own marker (`p/` is the path `p`), a key
 /// `/` at the bucket root, or an entry outside the prefix.
@@ -1551,5 +1628,99 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("\\u{a}\\u{1b}[2J"), "{text}");
         assert!(!text.chars().any(crate::text::is_unsafe_char), "{text}");
+    }
+
+    #[cfg(feature = "gui")]
+    mod list_dir {
+        use super::*;
+        use crate::registry::child_url;
+
+        fn dir_url(dir: &std::path::Path) -> String {
+            let mut u = url::Url::from_file_path(dir).expect("file URL").to_string();
+            if !u.ends_with('/') {
+                u.push('/');
+            }
+            u
+        }
+
+        fn write(dir: &std::path::Path, rel: &str, bytes: &[u8]) {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, bytes).expect("write");
+        }
+
+        #[tokio::test]
+        async fn list_dir_splits_folders_and_objects() {
+            let t = tempfile::tempdir().expect("tempdir");
+            write(t.path(), "a/x.txt", b"x");
+            write(t.path(), "b/y.txt", b"y");
+            write(t.path(), "c.txt", b"abc");
+            let page = client()
+                .list_dir(&dir_url(t.path()), None, 10)
+                .await
+                .expect("list");
+            let mut folders = page.folders.clone();
+            folders.sort();
+            assert_eq!(folders, ["a", "b"]);
+            assert_eq!(page.objects.len(), 1, "{page:?}");
+            assert_eq!(page.objects[0].name, "c.txt");
+            assert_eq!(page.objects[0].size, 3);
+            assert_eq!(page.next, None);
+        }
+
+        #[tokio::test]
+        async fn list_dir_names_round_trip() {
+            let t = tempfile::tempdir().expect("tempdir");
+            let mut names = vec!["a b.txt", "c%d.txt"];
+            if cfg!(windows) {
+                names.push("é#.txt");
+            } else {
+                names.push("é#?.txt");
+            }
+            for n in &names {
+                write(t.path(), n, n.as_bytes());
+            }
+            let dir = dir_url(t.path());
+            let c = client();
+            let page = c.list_dir(&dir, None, 10).await.expect("list");
+            assert_eq!(page.objects.len(), names.len(), "{page:?}");
+            for o in &page.objects {
+                let got = c
+                    .get(&child_url(&dir, [o.name.as_str()]))
+                    .await
+                    .expect("get");
+                assert_eq!(got.as_ref(), o.name.as_bytes());
+            }
+        }
+
+        #[tokio::test]
+        async fn list_dir_missing_directory_is_empty() {
+            let t = tempfile::tempdir().expect("tempdir");
+            let url = dir_url(&t.path().join("missing"));
+            let page = client().list_dir(&url, None, 10).await;
+            assert_eq!(page.expect("ok"), DirPage::default());
+        }
+
+        #[tokio::test]
+        async fn list_dir_on_a_file_is_empty() {
+            let t = tempfile::tempdir().expect("tempdir");
+            write(t.path(), "c.txt", b"abc");
+            let url = dir_url(t.path()) + "c.txt";
+            let page = client().list_dir(&url, None, 10).await.expect("ok");
+            assert!(
+                page.folders.is_empty() && page.objects.is_empty(),
+                "{page:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn list_dir_token_on_unpaged_store_is_empty() {
+            let t = tempfile::tempdir().expect("tempdir");
+            write(t.path(), "c.txt", b"abc");
+            let page = client()
+                .list_dir(&dir_url(t.path()), Some("x".into()), 10)
+                .await;
+            assert_eq!(page.expect("ok"), DirPage::default());
+        }
     }
 }

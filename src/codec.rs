@@ -265,6 +265,43 @@ pub(crate) fn redacted(url: &Url) -> String {
     url.to_string()
 }
 
+/// Removes what a URL carries beyond its location: the user name and
+/// password, the query and the fragment, which may hold tokens (the library's
+/// [`crate::codec::redacted`] policy). A dropped query or fragment leaves `?…`
+/// behind. Text that does not parse as a URL is cut at the first `?` or `#`
+/// and loses any `user:password@` in its authority.
+#[must_use]
+#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+pub(crate) fn redact_url(text: &str) -> String {
+    if let Ok(url) = url::Url::parse(text) {
+        let mut out = crate::codec::redacted(&url);
+        if url.query().is_some() || url.fragment().is_some() {
+            out.push_str("?…");
+        }
+        return out;
+    }
+    let cut = text.find(['?', '#']);
+    let head = cut.map_or(text, |i| &text[..i]);
+    let head = match head.split_once("://") {
+        Some((scheme, rest)) => {
+            let (auth, path) = rest
+                .split_once('/')
+                .map_or((rest, None), |(a, p)| (a, Some(p)));
+            let auth = auth.rsplit_once('@').map_or(auth, |(_, host)| host);
+            path.map_or_else(
+                || format!("{scheme}://{auth}"),
+                |p| format!("{scheme}://{auth}/{p}"),
+            )
+        }
+        None => head.to_string(),
+    };
+    if cut.is_some() {
+        format!("{head}?…")
+    } else {
+        head
+    }
+}
+
 /// The store a URL addresses, normalised so aliases compare equal: `gs` and
 /// `gcs`; the Azure schemes (`az`, `wasb`, `wasbs`, `abfs`, `abfss`), which all
 /// take the URL host as the container of the one configured account; and
@@ -411,6 +448,21 @@ fn crosses_devices(err: &(dyn std::error::Error + 'static)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_url_drops_secrets() {
+        assert_eq!(
+            redact_url("https://user:secret@host.example/a/b?X-Amz-Signature=abc#frag"),
+            "https://host.example/a/b?…"
+        );
+        assert_eq!(redact_url("s3://bucket/key"), "s3://bucket/key");
+        assert_eq!(redact_url("https://h/x?sig=1"), "https://h/x?…");
+        assert_eq!(redact_url("https://:pw@h/x"), "https://h/x");
+        assert_eq!(redact_url("https://tok@h/x?q=1"), "https://h/x?…");
+        // Not parseable as a URL: still cut.
+        let odd = redact_url("http://u:pw@[bad/x?token=1");
+        assert!(!odd.contains("pw") && !odd.contains("token"), "{odd}");
+    }
 
     fn at(url: &str) -> Location {
         let url = Url::parse(url).expect("url");

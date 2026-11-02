@@ -1,11 +1,11 @@
 //! `osc enc scan` and `osc enc reencrypt`: walk a prefix and inspect or
 //! rewrite each object, a bounded number at a time.
 
-use super::output::{redact_url, sanitize, show_url};
+use super::output::{sanitize, show_url};
 use super::transfer::{run_weighted, weight};
-use super::tree::URL_PATH_SEGMENTS;
 use super::{CliError, keyring};
 use crate::client::Error as StorageError;
+use crate::codec::redact_url;
 use crate::encryption::EncryptionConfig;
 use crate::encryption::envelope::inspect_encryption_raw;
 use crate::encryption::keys::KeyError;
@@ -14,7 +14,6 @@ use crate::{Client, Codec, ObjectStorageClient, ReencryptOptions, Reencrypted};
 use chrono::{DateTime, Utc};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, TryStreamExt};
-use percent_encoding::utf8_percent_encode;
 use std::collections::BTreeMap;
 use tokio::sync::Semaphore;
 
@@ -76,14 +75,10 @@ fn object_urls<C: Codec>(
         .map_ok(move |(name, size)| {
             // The listed name is in the store's path form; each segment is
             // escaped so that it resolves back to the same object.
-            let segments: Vec<String> = name
-                .split('/')
-                .map(|s| utf8_percent_encode(s, URL_PATH_SEGMENTS).to_string())
-                .collect();
-            let mut url = root.clone();
-            let path = format!("{}{}", url.path(), segments.join("/"));
-            url.set_path(&path);
-            (url.to_string(), size)
+            (
+                crate::registry::child_url(root.as_str(), name.split('/')),
+                size,
+            )
         })
         .boxed())
 }

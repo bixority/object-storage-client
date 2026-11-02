@@ -149,9 +149,10 @@ fn table(
             builder = builder.scroll_to_row(at, None);
         }
     }
-    let mut cursor_rect = None;
     let output = builder
         .striped(true)
+        // Cell content is centred on the row's height.
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
         .sense(egui::Sense::click())
         .auto_shrink([false, false])
         // The header row sits above the scrolled body.
@@ -175,10 +176,9 @@ fn table(
                 let entry = &panel.entries[row.index()];
                 let name = entry.name();
                 let key = entry.key();
-                let is_cursor = panel.cursor.as_ref() == Some(&key);
                 row.set_selected(panel.selection.contains(&key));
                 let icon = if entry.is_folder() { "🗀" } else { "🗋" };
-                let (first, _) = row.col(|ui| {
+                row.col(|ui| {
                     ui.add(egui::Label::new(format!("{icon} {}", display::text(name))).truncate());
                 });
                 let (size_text, modified_text) = match entry {
@@ -191,14 +191,10 @@ fn table(
                 row.col(|ui| {
                     ui.label(size_text);
                 });
-                let (last, _) = row.col(|ui| {
+                row.col(|ui| {
                     ui.label(modified_text);
                 });
                 let response = row.response();
-                if is_cursor {
-                    // The cells span exactly the row; the row's response may not.
-                    cursor_rect = Some(first.union(last));
-                }
                 if response.double_clicked() {
                     // Only folders open; an object may share a folder's name.
                     if entry.is_folder() {
@@ -222,14 +218,6 @@ fn table(
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let rows = rows.max(1.0) as usize;
     ctx.data_mut(|d| d.insert_temp(page_rows_id(side), rows));
-    // The cursor outline is painted over the row, inside it: the row keeps
-    // its height, and an unselected cursor still shows.
-    if let Some(rect) = cursor_rect {
-        let stroke = egui::Stroke::new(1.0, ui.visuals().selection.stroke.color);
-        ui.painter()
-            .with_clip_rect(body)
-            .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
-    }
 }
 
 /// Selection count, shown count and Load more.

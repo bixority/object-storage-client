@@ -381,12 +381,11 @@ fn view_remembers_moves_and_page_rows() {
     assert!((1..500).contains(&rows), "{rows}");
 }
 
-/// Whether a frame painted the cursor outline.
-fn cursor_drawn(output: &egui::FullOutput, visuals: &egui::Visuals) -> bool {
-    let want = egui::Stroke::new(1.0, visuals.selection.stroke.color);
+/// Whether a frame painted a row with this name: the table lays out only the
+/// rows in view, so the last row is painted only after it scrolled there.
+fn row_painted(output: &egui::FullOutput, name: &str) -> bool {
     output.shapes.iter().any(|clipped| {
-        matches!(&clipped.shape, egui::Shape::Rect(rect)
-            if rect.stroke == want && rect.fill == egui::Color32::TRANSPARENT)
+        matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text().contains(name))
     })
 }
 
@@ -404,12 +403,12 @@ fn keyboard_motion_scrolls_the_cursor_into_view() {
         let output = ctx.run_ui(input, |ui| {
             let _ = draw(ui, &s);
         });
-        drawn = cursor_drawn(&output, &ctx.global_style().visuals);
+        drawn = row_painted(&output, "r499");
         output.drop_without_applying_deltas();
     }
-    assert!(drawn, "the last row, under the cursor, was never laid out");
+    assert!(drawn, "the cursor row was never scrolled into view");
 
-    // Without a move, the table stays at the top: the last row is not drawn.
+    // Without a move, the table stays at the top: the cursor row is not drawn.
     let ctx = egui::Context::default();
     let mut drawn = true;
     for frame in 0..30 {
@@ -425,7 +424,7 @@ fn keyboard_motion_scrolls_the_cursor_into_view() {
             }
             let _ = draw(ui, &s);
         });
-        drawn = cursor_drawn(&output, &ctx.global_style().visuals);
+        drawn = row_painted(&output, "r499");
         output.drop_without_applying_deltas();
     }
     assert!(!drawn, "scrolled without a new move");

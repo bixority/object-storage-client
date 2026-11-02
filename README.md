@@ -317,16 +317,43 @@ disk.
 
 ## Desktop browser (`osc-gui`)
 
-An optional two-panel browser (Cargo feature `gui`) for browsing, copying,
-moving, renaming and deleting objects and folders across all of the above, with
-the same keys and credentials as `osc`:
+`osc-gui` is a two-panel desktop browser for the same stores as `osc`. Each
+panel shows one folder, and you copy, move, rename and delete objects and whole
+folders within a panel or between the two. It uses the same credentials and
+encryption options as `osc`.
+
+![osc-gui showing the root folder in both panels](docs/images/osc-gui.png)
+
+### Install
+
+The browser is behind the optional `gui` feature, so `osc` alone is unaffected.
+Install both binaries from the registry:
 
 ```bash
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
 cargo install object-storage-client --registry bixority --features gui
-osc-gui s3://my-bucket/photos/ ~/Pictures
 ```
 
-See [Desktop browser](docs/GUI.md).
+Or from a checkout:
+
+```bash
+cargo install --path . --features gui
+```
+
+Linux needs no extra packages: the window opens on X11 or Wayland.
+
+### Run
+
+```bash
+osc-gui                                        # both panels on the current directory
+osc-gui s3://my-bucket/photos/ ~/Pictures      # left and right panel
+osc-gui --profile dev s3://my-bucket/          # credentials from the AWS profile "dev"
+osc-gui --keyring keyring s3://my-bucket/ .    # copies encrypt and decrypt
+```
+
+Type any URL or path into a panel's address bar and press Enter. Buckets are not
+listed, so type the bucket's URL. The keys and shortcuts are listed in
+[Desktop browser](docs/GUI.md), which also covers limits and closing behaviour.
 
 ## Documentation
 

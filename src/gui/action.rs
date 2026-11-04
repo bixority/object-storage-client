@@ -1,6 +1,7 @@
 //! Messages and the pure reducer: no I/O, no async, no egui.
 
 mod close;
+mod conn;
 mod job;
 mod nav;
 #[cfg(test)]
@@ -11,6 +12,8 @@ use super::model::{
     AppState, Batch, Closing, Dialog, Encryption, EntryKey, JobId, OnExisting, OpKind, Outcome,
     Page, PanelState, Plan, Side,
 };
+use crate::connection::{Connection, Discovery};
+use std::sync::Arc;
 
 /// A change to the selection of one panel. Rows are named by their key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +63,17 @@ pub(super) enum Action {
     DialogText(String),
     DialogAnswer(Answer),
     CancelJob,
+    /// The panel switches to the connection `id` and shows its root.
+    SelectConnection {
+        side: Side,
+        id: String,
+    },
+    /// Search for connections again.
+    Rescan,
+    /// Log in to the SSO connection of the panel.
+    LogIn {
+        side: Side,
+    },
     CloseRequested,
     /// Ctrl+L: focus the panel's address field. Handled by the window; the
     /// reducer ignores it.
@@ -81,19 +95,31 @@ pub(super) enum Command {
     List {
         side: Side,
         seq: u64,
+        conn: Arc<Connection>,
         url: String,
         token: Option<String>,
     },
     Plan {
         job: JobId,
         batch: Batch,
+        src_conn: Arc<Connection>,
+        dst_conn: Arc<Connection>,
     },
     Execute {
         job: JobId,
+        src_conn: Arc<Connection>,
+        dst_conn: Arc<Connection>,
         plan: Plan,
         on_existing: OnExisting,
     },
     Abort(JobId),
+    /// Search for connections; reported by `Event::Connections`.
+    Discover,
+    /// Log in to the connection, then report `LoginCode` and `LoginDone`.
+    Login {
+        conn: Arc<Connection>,
+    },
+    CancelLogin,
     Shutdown,
 }
 
@@ -120,6 +146,23 @@ pub(super) enum Event {
         job: JobId,
         outcome: Outcome,
     },
+    /// What a scan found: first the local result, then (`done`) the final one
+    /// with the Azure accounts.
+    Connections {
+        discovery: Discovery,
+        done: bool,
+    },
+    /// The device login of `conn_id` waits for the user to approve `user_code`
+    /// at `url`.
+    LoginCode {
+        conn_id: String,
+        user_code: String,
+        url: String,
+    },
+    LoginDone {
+        conn_id: String,
+        result: Result<(), String>,
+    },
     ShutdownDone,
     /// SIGINT or SIGTERM: close without asking.
     Interrupted,
@@ -134,19 +177,28 @@ pub(super) enum Msg {
 }
 
 impl AppState {
-    /// Both panels start loading their first page (`seq` 1); returns those listings.
-    pub(super) fn new(
-        left: Location,
-        right: Location,
-        encryption: Encryption,
-    ) -> (Self, Vec<Command>) {
-        let panels = [PanelState::new(left), PanelState::new(right)];
-        let commands = [Side::Left, Side::Right]
+    /// Both panels start on Local, loading their first page (`seq` 1), and a
+    /// scan for connections starts; returns those commands.
+    pub(super) fn new(encryption: Encryption) -> (Self, Vec<Command>) {
+        let local = Arc::new(Connection::local());
+        // The current directory, or the file system root if it is gone.
+        let start = Location::parse(".")
+            .or_else(|_| Location::parse("file:///"))
+            .unwrap_or_else(|err| unreachable!("`file:///` parses: {err}"));
+        let panels = [
+            PanelState::new(Arc::clone(&local), start.clone()),
+            PanelState::new(Arc::clone(&local), start),
+        ];
+        let mut commands: Vec<Command> = [Side::Left, Side::Right]
             .into_iter()
             .map(|side| nav::list(side, &panels[side.index()], None))
             .collect();
+        commands.push(Command::Discover);
         let state = Self {
             panels,
+            connections: vec![local],
+            notes: Vec::new(),
+            discovering: true,
             active: Side::Left,
             status: String::new(),
             encryption,
@@ -158,6 +210,19 @@ impl AppState {
             deferred: None,
         };
         (state, commands)
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    /// A fresh state whose panels start on Local at `left` and `right`.
+    pub(crate) fn at(left: Location, right: Location, encryption: Encryption) -> Self {
+        let mut state = Self::new(encryption).0;
+        for (panel, location) in state.panels.iter_mut().zip([left, right]) {
+            panel.address_text = location.display();
+            panel.location = location;
+        }
+        state
     }
 }
 
@@ -186,14 +251,18 @@ pub(super) fn update(state: &mut AppState, msg: Msg) -> Vec<Command> {
             Action::StartRename => job::start_rename(state),
             Action::Delete => job::delete(state),
             Action::DialogText(text) => job::dialog_text(state, text),
-            Action::DialogAnswer(answer) => {
-                if matches!(state.dialog, Some(Dialog::Quit)) {
-                    close::quit_answer(state, answer)
-                } else {
-                    job::answer(state, answer)
+            Action::DialogAnswer(answer) => match state.dialog {
+                Some(Dialog::Quit) => close::quit_answer(state, answer),
+                Some(Dialog::Login { .. }) if answer == Answer::Cancel => {
+                    state.dialog = None;
+                    vec![Command::CancelLogin]
                 }
-            }
+                _ => job::answer(state, answer),
+            },
             Action::CancelJob => job::cancel(state),
+            Action::SelectConnection { side, id } => conn::select(state, side, &id),
+            Action::Rescan => conn::rescan(state),
+            Action::LogIn { side } => conn::log_in(state, side),
             Action::CloseRequested => close::close_requested(state),
             Action::FocusAddress(_) => Vec::new(),
         },
@@ -211,6 +280,17 @@ pub(super) fn update(state: &mut AppState, msg: Msg) -> Vec<Command> {
             current,
         }) => job::progress(state, job, done, total, current),
         Msg::Event(Event::Finished { job, outcome }) => job::finished(state, job, outcome),
+        Msg::Event(Event::Connections { discovery, done }) => {
+            conn::connections(state, discovery, done)
+        }
+        Msg::Event(Event::LoginCode {
+            conn_id,
+            user_code,
+            url,
+        }) => conn::login_code(state, &conn_id, user_code, url),
+        Msg::Event(Event::LoginDone { conn_id, result }) => {
+            conn::login_done(state, &conn_id, result)
+        }
         Msg::Event(Event::ShutdownDone) => close::shutdown_done(state),
         Msg::Event(Event::Interrupted) => close::interrupt(state),
         Msg::Event(Event::WorkerGone) => close::worker_gone(state),

@@ -3,19 +3,22 @@ use super::panel::{
     DEFAULT_PAGE_ROWS, desaturate, human_size, panel_stroke, seen_moves, seen_moves_id, thousands,
 };
 use super::*;
+use crate::connection::sso::SsoLogin;
+use crate::connection::{Connection, Login, Provider, Source};
 use crate::gui::action::{Answer, Event, Motion, Msg, SelectOp, update};
 use crate::gui::location::Location;
 use crate::gui::model::{
     Closing, Dialog, Encryption, Entry, Failure, Job, JobId, JobPhase, Outcome, Page, Plan,
 };
 use chrono::DateTime;
+use std::sync::Arc;
 
 fn loc(url: &str) -> Location {
     Location::parse(url).expect("test url parses")
 }
 
 fn state() -> AppState {
-    AppState::new(loc("s3://bucket/"), loc("file:///r/"), Encryption::File).0
+    AppState::at(loc("s3://bucket/"), loc("file:///r/"), Encryption::File)
 }
 
 fn entries() -> Vec<Entry> {
@@ -80,7 +83,9 @@ fn job(phase: JobPhase) -> Job {
         done: 3,
         total: 48,
         current: "photos/x.jpg".to_owned(),
+        src_conn: Arc::new(Connection::local()),
         src_dir: loc("file:///l/"),
+        dst_conn: Arc::new(Connection::local()),
         dst_dir: loc("file:///r/"),
         cancelled: false,
     }
@@ -139,6 +144,12 @@ fn dialogs() -> Vec<Dialog> {
                 cancelled: true,
                 failures,
             },
+        },
+        Dialog::Login {
+            conn_id: "aws:dev".to_owned(),
+            label: "AWS dev".to_owned(),
+            code: None,
+            error: None,
         },
         Dialog::Quit,
     ]
@@ -275,6 +286,7 @@ fn enter_takes_the_safe_answer_and_esc_cancels() {
             Answer::Cancel,
             Answer::Cancel,
             Answer::Proceed,
+            Answer::Cancel,
             Answer::Cancel,
         ]
     );
@@ -451,4 +463,222 @@ fn desaturate_keeps_luminance_and_alpha() {
     assert_eq!(desaturate(Color32::BLACK), Color32::BLACK);
     let red = desaturate(Color32::from_rgb(255, 0, 0));
     assert_eq!(red.r(), 76, "0.299 of 255");
+}
+
+fn sso() -> Connection {
+    Connection {
+        id: "aws:dev".to_owned(),
+        label: "AWS dev".to_owned(),
+        provider: Provider::S3,
+        source: Source::Env,
+        login: Some(Login::AwsSso(SsoLogin {
+            identifier: "dev".to_owned(),
+            start_url: "https://example.awsapps.com/start".to_owned(),
+            region: "eu-west-1".to_owned(),
+            scopes: Vec::new(),
+        })),
+    }
+}
+
+fn connections_state() -> AppState {
+    let mut s = main_state();
+    s.connections = vec![Arc::new(Connection::local()), Arc::new(sso())];
+    s.notes = vec!["gcloud is not installed".to_owned()];
+    s
+}
+
+/// Everything painted by one frame.
+fn painted(shapes: &[egui::epaint::ClippedShape]) -> String {
+    shapes
+        .iter()
+        .filter_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One frame of `state` fed `events`: what it painted and the actions.
+fn frame(
+    ctx: &egui::Context,
+    state: &AppState,
+    events: Vec<egui::Event>,
+) -> (Vec<egui::epaint::ClippedShape>, Vec<Action>) {
+    let mut actions = Vec::new();
+    let output = ctx.run_ui(
+        egui::RawInput {
+            events,
+            ..Default::default()
+        },
+        |ui| actions = draw(ui, state),
+    );
+    let shapes = output.shapes.clone();
+    output.drop_without_applying_deltas();
+    (shapes, actions)
+}
+
+/// Where `text` was first painted, inside the glyphs.
+fn find_text(shapes: &[egui::epaint::ClippedShape], text: &str) -> egui::Pos2 {
+    shapes
+        .iter()
+        .find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(t) if t.galley.text() == text => Some(t.pos + egui::vec2(4.0, 4.0)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{text} is not painted"))
+}
+
+/// A context after two frames of `state`, and what the second painted.
+fn settled(state: &AppState) -> (egui::Context, Vec<egui::epaint::ClippedShape>) {
+    let ctx = egui::Context::default();
+    let _ = frame(&ctx, state, Vec::new());
+    let (shapes, _) = frame(&ctx, state, Vec::new());
+    (ctx, shapes)
+}
+
+/// Clicks at `pos` over a few frames: what the last frame painted and the
+/// actions of all of them.
+fn click(
+    ctx: &egui::Context,
+    state: &AppState,
+    pos: egui::Pos2,
+) -> (Vec<egui::epaint::ClippedShape>, Vec<Action>) {
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let mut seen = Vec::new();
+    let mut actions = Vec::new();
+    for events in [
+        vec![egui::Event::PointerMoved(pos)],
+        vec![button(true)],
+        vec![button(false)],
+        Vec::new(),
+        Vec::new(),
+    ] {
+        let (shapes, got) = frame(ctx, state, events);
+        seen = shapes;
+        actions.extend(got);
+    }
+    (seen, actions)
+}
+
+/// A context with the left panel's selector open.
+fn selector_open(s: &AppState) -> (egui::Context, Vec<egui::epaint::ClippedShape>) {
+    let (ctx, shapes) = settled(s);
+    let (shapes, actions) = click(&ctx, s, find_text(&shapes, "Local"));
+    assert!(actions.is_empty() && ctx.any_popup_open());
+    (ctx, shapes)
+}
+
+#[test]
+fn selector_shows_the_label_and_opens_to_the_items() {
+    let mut s = connections_state();
+    s.discovering = true;
+    let (_, shapes) = settled(&s);
+    assert!(painted(&shapes).contains("Local"));
+    assert!(!painted(&shapes).contains("AWS dev"));
+    let (_, shapes) = selector_open(&s);
+    let seen = painted(&shapes);
+    for item in ["AWS dev", "Searching…", "gcloud is not installed"] {
+        assert!(seen.contains(item), "{item} missing in {seen}");
+    }
+}
+
+#[test]
+fn the_selector_items_emit_their_actions() {
+    let mut s = connections_state();
+    s.discovering = true;
+    let (ctx, shapes) = selector_open(&s);
+    let (_, actions) = click(&ctx, &s, find_text(&shapes, "AWS dev"));
+    assert_eq!(
+        actions,
+        [Action::SelectConnection {
+            side: Side::Left,
+            id: "aws:dev".to_owned()
+        }]
+    );
+
+    s.discovering = false;
+    let (ctx, shapes) = selector_open(&s);
+    let seen = painted(&shapes);
+    assert!(
+        seen.contains("Rescan") && !seen.contains("Searching…"),
+        "{seen}"
+    );
+    let (_, actions) = click(&ctx, &s, find_text(&shapes, "Rescan"));
+    assert_eq!(actions, [Action::Rescan]);
+}
+
+#[test]
+fn up_works_at_a_bucket_root_but_not_at_the_provider_root() {
+    let mut s = connections_state();
+    s.panels[0].connection = Arc::new(sso());
+    for (url, expected) in [
+        ("s3://media/", vec![Action::Up(Side::Left)]),
+        ("s3:///", vec![]),
+        ("file:///", vec![]),
+    ] {
+        s.panels[0].location = loc(url);
+        let (ctx, shapes) = settled(&s);
+        let (_, actions) = click(&ctx, &s, find_text(&shapes, "⬆ Up"));
+        assert_eq!(actions, expected, "{url}");
+    }
+}
+
+#[test]
+fn error_banner_offers_the_login_of_the_connection() {
+    let mut s = connections_state();
+    s.panels[0].connection = Arc::new(sso());
+    s.panels[0].error = Some("expired".to_owned());
+    let (ctx, shapes) = settled(&s);
+    let seen = painted(&shapes);
+    assert!(seen.contains("Log in") && seen.contains("Retry"), "{seen}");
+    let (_, actions) = click(&ctx, &s, find_text(&shapes, "Log in"));
+    assert_eq!(actions, [Action::LogIn { side: Side::Left }]);
+
+    let mut command = sso();
+    command.login = Some(Login::Command("gcloud auth login"));
+    s.panels[0].connection = Arc::new(command);
+    let (shapes, _) = frame(&ctx, &s, Vec::new());
+    let seen = painted(&shapes);
+    assert!(
+        seen.contains("Run `gcloud auth login` in a terminal, then Rescan"),
+        "{seen}"
+    );
+    assert!(!seen.contains("Log in"), "{seen}");
+}
+
+#[test]
+fn login_dialog_shows_the_code_and_the_buttons() {
+    let login = |code: Option<(&str, &str)>, error: Option<&str>| Dialog::Login {
+        conn_id: "aws:dev".to_owned(),
+        label: "AWS dev".to_owned(),
+        code: code.map(|(c, u)| (c.to_owned(), u.to_owned())),
+        error: error.map(str::to_owned),
+    };
+    let seen = |dialog| {
+        let mut s = main_state();
+        s.dialog = Some(dialog);
+        painted(&settled(&s).1)
+    };
+    let waiting = seen(login(None, None));
+    assert!(waiting.contains("Waiting…") && waiting.contains("Cancel"));
+    assert!(!waiting.contains("Open browser"));
+    let code = seen(login(Some(("ABCD-EFGH", "https://x/verify")), None));
+    for text in ["Log in to AWS dev", "ABCD-EFGH", "Open browser", "Cancel"] {
+        assert!(code.contains(text), "{text} missing in {code}");
+    }
+    let failed = seen(login(None, Some("denied")));
+    assert!(failed.contains("denied") && failed.contains("Close"));
+    assert!(!failed.contains("Cancel"));
+
+    let mut s = main_state();
+    s.dialog = Some(login(None, None));
+    let (ctx, shapes) = settled(&s);
+    let (_, actions) = click(&ctx, &s, find_text(&shapes, "Cancel"));
+    assert_eq!(actions, [Action::DialogAnswer(Answer::Cancel)]);
 }

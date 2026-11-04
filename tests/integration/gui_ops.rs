@@ -134,10 +134,11 @@ async fn gui_folder_copy_s3_to_azure() -> TestResult {
         dst_dir: Location::parse(&dst_root)?,
         rename_to: None,
     };
-    let planned = plan(&client, batch).await;
+    let planned = plan(&client, &client, batch).await;
     assert!(planned.failures.is_empty(), "{:?}", planned.failures);
     let progress = Progress::default();
     let outcome = execute(
+        &client,
         &client,
         planned,
         OnExisting::Overwrite,

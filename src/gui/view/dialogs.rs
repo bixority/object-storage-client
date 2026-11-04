@@ -48,8 +48,32 @@ pub(super) const fn default_answer(dialog: &Dialog) -> Answer {
         | Dialog::ConfirmMove { .. }
         | Dialog::ConfirmDelete { .. }
         | Dialog::ConfirmBucketDelete { .. }
+        | Dialog::Login { .. }
         | Dialog::Quit => Answer::Cancel,
     }
+}
+
+/// The SSO login: the code to approve, or why the login failed.
+fn login(
+    ui: &mut egui::Ui,
+    label: &str,
+    code: Option<&(String, String)>,
+    error: Option<&str>,
+) -> Option<Answer> {
+    ui.heading(format!("Log in to {label}"));
+    if let Some(error) = error {
+        ui.colored_label(ui.visuals().error_fg_color, display::text(error));
+    } else if let Some((user_code, url)) = code {
+        ui.label("Approve this code in the browser:");
+        ui.heading(display::text(user_code));
+        if ui.button("Open browser").clicked() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+    } else {
+        ui.label("Waiting…");
+    }
+    let cancel = if error.is_some() { "Close" } else { "Cancel" };
+    ui.button(cancel).clicked().then_some(Answer::Cancel)
 }
 
 /// The dialog's text and buttons; returns the button clicked.
@@ -109,6 +133,9 @@ fn body(
             typed,
         } => bucket_delete(ui, *n, *folders, bucket, typed, actions),
         Dialog::Failures { kind, outcome } => failures(ui, *kind, outcome),
+        Dialog::Login {
+            label, code, error, ..
+        } => login(ui, label, code.as_ref(), error.as_deref()),
         Dialog::Quit => {
             if let Some(job) = &state.job {
                 // The job keeps running behind the question: show its live count.

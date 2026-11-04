@@ -291,6 +291,7 @@ async fn plain_and_truncated_objects_are_rejected() {
 fn resolved(host: &str, name: &str, store: Arc<dyn ObjectStore>, multipart: bool) -> Resolved {
     Resolved {
         backend: Arc::new(TestBackend { store, multipart }),
+        registry: 0,
         loc: Location {
             url: Url::parse(&format!("test://{host}/{name}")).expect("url"),
             path: ObjectPath::from(name),
@@ -941,6 +942,7 @@ async fn copy_or_move_onto_itself_does_nothing_whatever_the_key() {
             store: store.clone(),
             multipart: false,
         }),
+        registry: 0,
         loc: Location {
             url: Url::parse(&format!("{scheme}://bucket/{name}")).expect("url"),
             path: ObjectPath::from(name),
@@ -1064,14 +1066,12 @@ async fn copy_never_uses_the_stores_copy() {
             let path = ObjectPath::from_url_path(url.path()).expect("path");
             Resolved {
                 backend: Arc::clone(&backend),
+                registry: 0,
                 loc: Location { url, path },
             }
         };
         let (x, y) = (at("x"), at("y"));
-        assert!(
-            !same_object(&x.loc, &y.loc).await,
-            "{scheme}: x and y differ"
-        );
+        assert!(!same_object(&x, &y).await, "{scheme}: x and y differ");
         put(&env, &store, &x.loc, &CallerContext::new()).await;
 
         env.copy(&x, &y, true).await.expect("copy");
@@ -1710,6 +1710,7 @@ async fn an_alias_rebind_is_abandoned_when_the_file_changed() {
             store: store.clone(),
             multipart: false,
         }),
+        registry: 0,
         loc,
     };
     // Encrypted for (bound to) the link name, stored under the real one.

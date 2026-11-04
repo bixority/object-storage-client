@@ -8,5 +8,5 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     #[cfg(unix)]
     object_storage_client::cli::harden_process();
-    gui::run(Args::parse().with_keyring_command(env::var_os("OSC_KEYRING_COMMAND")))
+    gui::run(&Args::parse().with_keyring_command(env::var_os("OSC_KEYRING_COMMAND")))
 }

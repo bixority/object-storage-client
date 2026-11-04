@@ -72,19 +72,28 @@ pub async fn list_page_with<C: Codec>(
 /// there are at most `CHECK_LIMIT` (1,000) items.
 ///
 /// A plan of more than `MAX_PLAN_ITEMS` (1,000,000) items fails as a whole.
-pub async fn plan<C: Codec>(client: &Client<C>, batch: Batch) -> Plan {
-    plan_with(client, batch, MAX_PLAN_ITEMS).await
+///
+/// Source folders are listed through `src` and destinations checked through
+/// `dst`; pass the same client twice when both folders are on one connection.
+pub async fn plan<C: Codec>(src: &Client<C>, dst: &Client<C>, batch: Batch) -> Plan {
+    plan_with(src, dst, batch, MAX_PLAN_ITEMS).await
 }
 
 /// [`plan`] with an explicit item cap.
 #[doc(hidden)]
-pub async fn plan_with<C: Codec>(client: &Client<C>, batch: Batch, max_items: usize) -> Plan {
+pub async fn plan_with<C: Codec>(
+    src: &Client<C>,
+    dst: &Client<C>,
+    batch: Batch,
+    max_items: usize,
+) -> Plan {
     let Batch {
         kind,
         src_dir,
         entries,
         dst_dir,
         rename_to,
+        ..
     } = batch;
     let mut items = Vec::new();
     let mut failures = Vec::new();
@@ -95,7 +104,7 @@ pub async fn plan_with<C: Codec>(client: &Client<C>, batch: Batch, max_items: us
     let budget = AtomicUsize::new(max_items);
     let listings: Vec<_> = entries
         .iter()
-        .map(|entry| entry_items(client, kind, dirs, entry, rename_to, &budget))
+        .map(|entry| entry_items(src, kind, dirs, entry, rename_to, &budget))
         .collect();
     let mut results = futures::stream::iter(listings).buffered(CHECK_CONCURRENCY);
     let mut selected = entries.iter();
@@ -133,7 +142,7 @@ pub async fn plan_with<C: Codec>(client: &Client<C>, batch: Batch, max_items: us
     }
     let checked = kind == OpKind::Delete || items.len() <= CHECK_LIMIT;
     if kind != OpKind::Delete && checked {
-        check_existing(client, &mut items).await;
+        check_existing(dst, &mut items).await;
     }
     Plan {
         kind,
@@ -374,6 +383,8 @@ impl Progress {
 }
 
 /// Runs a plan, `OP_CONCURRENCY` (4) items at a time, continuing past failures.
+/// Transfers read through `src` and write through `dst`, deletes go through
+/// `src`.
 ///
 /// Selected objects of a bucket store are deleted in batches instead: the
 /// progress then advances in bursts, and a cancelled job can leave a batch
@@ -384,7 +395,8 @@ impl Progress {
 /// items that succeeded; the failures are those `progress` was seeded with
 /// (the plan's), then the run's.
 pub async fn execute<C: Codec>(
-    client: &Client<C>,
+    src: &Client<C>,
+    dst: &Client<C>,
     plan: Plan,
     on_existing: OnExisting,
     progress: &Progress,
@@ -414,7 +426,7 @@ pub async fn execute<C: Codec>(
         .partition(|item| matches!(item, Item::DeleteObject { url, .. } if bulk_deletable(url)));
     let each =
         futures::stream::iter(items).for_each_concurrent(OP_CONCURRENCY, |item| async move {
-            let (rel, result) = run(client, kind, item).await;
+            let (rel, result) = run((src, dst), kind, item).await;
             record(progress, notify, total, &rel, result);
         });
     let (urls, rels): (Vec<String>, Vec<String>) = bulk
@@ -426,12 +438,11 @@ pub async fn execute<C: Codec>(
         .unzip();
     let batched = async {
         if !urls.is_empty() {
-            client
-                .delete_many(&urls, |index, result| {
-                    let result = result.map_err(RunError::Failed);
-                    record(progress, notify, total, &rels[index], result);
-                })
-                .await;
+            src.delete_many(&urls, |index, result| {
+                let result = result.map_err(RunError::Failed);
+                record(progress, notify, total, &rels[index], result);
+            })
+            .await;
         }
     };
     batched.await;
@@ -486,7 +497,7 @@ enum RunError {
 
 /// Runs one item, returning its raw relative name and the result.
 async fn run<C: Codec>(
-    client: &Client<C>,
+    (src_client, dst_client): (&Client<C>, &Client<C>),
     kind: OpKind,
     item: Item,
 ) -> (String, Result<(), RunError>) {
@@ -498,14 +509,16 @@ async fn run<C: Codec>(
             size,
             ..
         } => {
-            let result = if kind == OpKind::Copy {
-                // A zero size may be a console folder marker: let the copy find out.
-                client
-                    .copy_sized(&src, &dst, (size > 0).then_some(size))
-                    .await
-            } else {
-                client.move_object(&src, &dst).await
-            };
+            // A zero size may be a console folder marker: let the copy find out.
+            let result = src_client
+                .transfer(
+                    dst_client,
+                    &src,
+                    &dst,
+                    (size > 0).then_some(size),
+                    kind != OpKind::Copy,
+                )
+                .await;
             return (
                 rel,
                 result.map_err(|err| match err {
@@ -519,8 +532,8 @@ async fn run<C: Codec>(
             );
         }
         Item::RenameLink { src, dst, rel, .. } => (rel, rename_link(&src, &dst).await),
-        Item::DeleteObject { url, rel } => (rel, client.delete(&url).await),
-        Item::DeletePrefix { url, rel } => (rel, client.delete_by_prefix(&url).await),
+        Item::DeleteObject { url, rel } => (rel, src_client.delete(&url).await),
+        Item::DeletePrefix { url, rel } => (rel, src_client.delete_by_prefix(&url).await),
     };
     (rel, result.map_err(RunError::Failed))
 }

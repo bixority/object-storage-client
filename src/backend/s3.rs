@@ -6,6 +6,8 @@ use super::{
     create_failed, default_timeouts, error_body, parse_bool, read_document, redact_error_body,
     send_signed, send_with_retry,
 };
+#[cfg(feature = "gui")]
+use super::{collect_pages, encode, xml_listing_page};
 use crate::client::{Error, Result};
 use crate::sign::{self, SignMethod, SignOptions};
 use bytes::Bytes;
@@ -140,7 +142,7 @@ impl S3Backend {
         }
         let mut builder = match vars {
             Vars::Env => AmazonS3Builder::from_env(),
-            Vars::Map(_) => vars
+            Vars::Map { .. } => vars
                 .config_entries::<AmazonS3ConfigKey>("AWS_")
                 .into_iter()
                 .fold(AmazonS3Builder::new(), |b, (k, v)| b.with_config(k, v)),
@@ -404,9 +406,15 @@ impl S3Backend {
                 format!("{}/{}", self.endpoint().trim_end_matches('/'), self.bucket)
             }
         };
+        self.signed_request(method, &uri, body).await
+    }
+
+    /// A request to `uri` carrying `body`, `SigV4`-signed unless signing is
+    /// skipped.
+    async fn signed_request(&self, method: Method, uri: &str, body: Bytes) -> Result<HttpRequest> {
         let mut request: HttpRequest = http::Request::builder()
             .method(method)
-            .uri(&uri)
+            .uri(uri)
             .body(HttpRequestBody::from(body))
             .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
 
@@ -418,6 +426,27 @@ impl S3Backend {
                 .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
         }
         Ok(request)
+    }
+
+    /// `ListBuckets` (`GET /` on the endpoint): the names of all buckets of the
+    /// account, sorted, following the continuation token.
+    #[cfg(feature = "gui")]
+    pub async fn list_buckets(&self) -> Result<Vec<String>> {
+        collect_pages(|token| async move {
+            let mut uri = format!("{}/", self.endpoint().trim_end_matches('/'));
+            if let Some(token) = token {
+                uri = format!("{uri}?continuation-token={}", encode(&token));
+            }
+            let request = self.signed_request(Method::GET, &uri, Bytes::new()).await?;
+            xml_listing_page(
+                self.http.get()?,
+                request,
+                "S3 ListBuckets",
+                "ContinuationToken",
+            )
+            .await
+        })
+        .await
     }
 
     /// `source` as the backend a `CopyObject` into this bucket may read from,
@@ -1012,7 +1041,7 @@ mod tests {
                 path.display().to_string(),
             );
         }
-        (dir, Vars::Map(Arc::new(map)))
+        (dir, Vars::map(map))
     }
 
     /// A backend for bucket `bkt` signing through the AWS profile `profile`.
@@ -2024,6 +2053,7 @@ mod tests {
             let path = ObjectPath::from_url_path(url.path()).expect("path");
             Resolved {
                 backend: Arc::new(backend),
+                registry: 0,
                 loc: Location { url, path },
             }
         };
@@ -2109,6 +2139,7 @@ mod tests {
             let path = ObjectPath::from_url_path(url.path()).expect("path");
             Resolved {
                 backend: Arc::new(backend),
+                registry: 0,
                 loc: Location { url, path },
             }
         };
@@ -2259,5 +2290,84 @@ mod tests {
             assert!(!done.expect("refused"), "{extra:?}");
         }
         assert!(stub.requests().is_empty());
+    }
+
+    #[cfg(feature = "gui")]
+    mod list_buckets {
+        use super::*;
+
+        fn page(names: &[&str], token: Option<&str>) -> Reply {
+            let buckets = names
+                .iter()
+                .map(|n| format!("<Bucket><Name>{n}</Name><CreationDate>d</CreationDate></Bucket>"))
+                .collect::<Vec<_>>()
+                .concat();
+            let token = token.map_or_else(String::new, |t| {
+                format!("<ContinuationToken>{t}</ContinuationToken>")
+            });
+            Reply::new(
+                200,
+                format!(
+                    "<?xml version=\"1.0\"?><ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Owner><ID>i</ID><DisplayName>me</DisplayName></Owner>\
+                     <Buckets>{buckets}</Buckets>{token}</ListAllMyBucketsResult>"
+                ),
+            )
+        }
+
+        async fn list(replies: Vec<Reply>) -> (Result<Vec<String>>, Vec<Request>) {
+            let stub = serve(replies).await;
+            let result = stubbed(&stub.base).list_buckets().await;
+            (result, stub.requests())
+        }
+
+        #[tokio::test]
+        async fn pages_are_followed_and_the_names_sorted() {
+            let (names, requests) = list(vec![
+                page(&["zeta", "alpha"], Some("t/+=")),
+                page(&["mid"], None),
+            ])
+            .await;
+            assert_eq!(names.expect("list"), ["alpha", "mid", "zeta"]);
+            assert_eq!(requests[0].line, "GET / HTTP/1.1");
+            assert_eq!(
+                requests[1].line,
+                "GET /?continuation-token=t%2F%2B%3D HTTP/1.1"
+            );
+            assert!(
+                requests[0]
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: aws4-hmac-sha256"),
+                "{}",
+                requests[0].headers
+            );
+        }
+
+        #[tokio::test]
+        async fn no_buckets_is_an_empty_list() {
+            let (names, requests) = list(vec![page(&[], None)]).await;
+            assert_eq!(names.expect("list"), Vec::<String>::new());
+            assert_eq!(requests.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_denied_listing_is_denied() {
+            for status in [401, 403] {
+                let doc = error_document("AccessDenied", "Access Denied");
+                let (result, _) = list(vec![Reply::new(status, doc)]).await;
+                let err = result.expect_err("denied");
+                assert!(matches!(err, Error::Denied(_)), "{err:?}");
+                assert!(err.to_string().contains("AccessDenied"), "{err}");
+            }
+            let (result, _) = list(vec![Reply::new(500, "")]).await;
+            assert!(matches!(result, Err(Error::Generic(_))));
+        }
+
+        #[tokio::test]
+        async fn a_token_that_does_not_advance_is_an_error() {
+            let (result, _) = list(vec![page(&["a"], Some("t")), page(&["b"], Some("t"))]).await;
+            assert!(result.is_err());
+        }
     }
 }

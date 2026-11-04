@@ -1,6 +1,7 @@
 //! Job and dialog rules: starting operations, planning, confirming, progress.
 
 use super::{Answer, Command, nav};
+use crate::connection::Connection;
 use crate::gui::display;
 use crate::gui::location::Location;
 use crate::gui::model::{
@@ -8,6 +9,7 @@ use crate::gui::model::{
     Outcome, Plan, Side,
 };
 use std::mem;
+use std::sync::Arc;
 
 /// The status shown once the worker has stopped.
 pub(super) const WORKER_GONE: &str = "The background worker stopped; restart to continue";
@@ -32,8 +34,26 @@ fn can_start(state: &mut AppState) -> bool {
     state.closing == Closing::Open && state.job.is_none() && state.dialog.is_none()
 }
 
+/// Whether `sides` are all inside a bucket or a local folder. A provider root
+/// lists buckets, which cannot be copied, moved, renamed or deleted: the
+/// status says so otherwise.
+fn off_root(state: &mut AppState, sides: &[Side]) -> bool {
+    let at_root = sides
+        .iter()
+        .any(|side| state.panels[side.index()].location.is_provider_root());
+    if at_root {
+        "Open a bucket or container first".clone_into(&mut state.status);
+    }
+    !at_root
+}
+
 /// Allocates a job in `Planning` and asks the worker for its plan.
-fn start(state: &mut AppState, batch: Batch) -> Vec<Command> {
+fn start(
+    state: &mut AppState,
+    src_conn: Arc<Connection>,
+    dst_conn: Arc<Connection>,
+    batch: Batch,
+) -> Vec<Command> {
     let id = JobId(state.next_job);
     state.next_job += 1;
     state.job = Some(Job {
@@ -43,11 +63,18 @@ fn start(state: &mut AppState, batch: Batch) -> Vec<Command> {
         done: 0,
         total: 0,
         current: String::new(),
+        src_conn: Arc::clone(&src_conn),
         src_dir: batch.src_dir.clone(),
+        dst_conn: Arc::clone(&dst_conn),
         dst_dir: batch.dst_dir.clone(),
         cancelled: false,
     });
-    vec![Command::Plan { job: id, batch }]
+    vec![Command::Plan {
+        job: id,
+        batch,
+        src_conn,
+        dst_conn,
+    }]
 }
 
 /// `Copy` or `Move` of the active panel's selection into the other panel.
@@ -57,12 +84,17 @@ pub(super) fn transfer(state: &mut AppState, kind: OpKind) -> Vec<Command> {
     }
     let side = state.active;
     let entries = selected(state, side);
-    if entries.is_empty() {
+    if entries.is_empty() || !off_root(state, &[side, side.other()]) {
         return Vec::new();
     }
-    let src_dir = state.panels[side.index()].location.clone();
-    let dst_dir = state.panels[side.other().index()].location.clone();
-    if dst_dir.same_folder(&src_dir) {
+    let (src, dst) = (
+        &state.panels[side.index()],
+        &state.panels[side.other().index()],
+    );
+    let (src_conn, src_dir) = (Arc::clone(&src.connection), src.location.clone());
+    let (dst_conn, dst_dir) = (Arc::clone(&dst.connection), dst.location.clone());
+    let same_conn = src_conn.id == dst_conn.id;
+    if same_conn && dst_dir.same_folder(&src_dir) {
         "Source and destination are the same folder".clone_into(&mut state.status);
         return Vec::new();
     }
@@ -70,7 +102,7 @@ pub(super) fn transfer(state: &mut AppState, kind: OpKind) -> Vec<Command> {
         .iter()
         .filter(|entry| entry.is_folder())
         .filter_map(|entry| src_dir.child_dir(entry.name()))
-        .any(|child| child.contains(&dst_dir));
+        .any(|child| same_conn && child.contains(&dst_dir));
     if into_itself {
         let verb = if kind == OpKind::Move { "move" } else { "copy" };
         state.status = format!("Cannot {verb} a folder into itself");
@@ -78,6 +110,8 @@ pub(super) fn transfer(state: &mut AppState, kind: OpKind) -> Vec<Command> {
     }
     start(
         state,
+        src_conn,
+        dst_conn,
         Batch {
             kind,
             src_dir,
@@ -95,12 +129,15 @@ pub(super) fn delete(state: &mut AppState) -> Vec<Command> {
     }
     let side = state.active;
     let entries = selected(state, side);
-    if entries.is_empty() {
+    if entries.is_empty() || !off_root(state, &[side]) {
         return Vec::new();
     }
-    let dir = state.panels[side.index()].location.clone();
+    let panel = &state.panels[side.index()];
+    let (conn, dir) = (Arc::clone(&panel.connection), panel.location.clone());
     start(
         state,
+        Arc::clone(&conn),
+        conn,
         Batch {
             kind: OpKind::Delete,
             src_dir: dir.clone(),
@@ -118,7 +155,7 @@ pub(super) fn start_rename(state: &mut AppState) -> Vec<Command> {
     }
     let side = state.active;
     let entries = selected(state, side);
-    if let [entry] = entries.as_slice() {
+    if let ([entry], true) = (entries.as_slice(), off_root(state, &[side])) {
         let from = entry.name().to_owned();
         state.dialog = Some(Dialog::Rename {
             side,
@@ -198,10 +235,12 @@ fn rename(state: &mut AppState) -> Vec<Command> {
         .filter(|entry| entry.is(&key))
         .cloned()
         .collect();
-    let dir = panel.location.clone();
+    let (conn, dir) = (Arc::clone(&panel.connection), panel.location.clone());
     state.dialog = None;
     start(
         state,
+        Arc::clone(&conn),
+        conn,
         Batch {
             kind: OpKind::Rename,
             src_dir: dir.clone(),
@@ -229,6 +268,8 @@ fn execute(state: &mut AppState, on_existing: OnExisting) -> Vec<Command> {
     job.current.clear();
     vec![Command::Execute {
         job: job.id,
+        src_conn: Arc::clone(&job.src_conn),
+        dst_conn: Arc::clone(&job.dst_conn),
         plan,
         on_existing,
     }]
@@ -415,12 +456,13 @@ pub(super) fn finished(state: &mut AppState, id: JobId, outcome: Outcome) -> Vec
         (
             job.kind,
             job.total,
-            (job.src_dir.clone(), job.dst_dir.clone()),
+            (job.src_conn.id.clone(), job.src_dir.clone()),
+            (job.dst_conn.id.clone(), job.dst_dir.clone()),
         )
     }) else {
         return Vec::new();
     };
-    let (kind, total, (src_dir, dst_dir)) = job;
+    let (kind, total, src, dst) = job;
     state.job = None;
     // Closing: the drain owns the status, and nothing is left to report to.
     if state.closing != Closing::Open {
@@ -451,18 +493,18 @@ pub(super) fn finished(state: &mut AppState, id: JobId, outcome: Outcome) -> Vec
     // A copy changes only its destination; a move, rename or delete changes
     // its source, and a move its destination too. A panel above or below such
     // a folder shows the change, one elsewhere keeps its pages and selection.
-    let touched: &[&Location] = match kind {
-        OpKind::Copy => &[&dst_dir],
-        OpKind::Move => &[&src_dir, &dst_dir],
-        OpKind::Rename | OpKind::Delete => &[&src_dir],
+    let touched: &[&(String, Location)] = match kind {
+        OpKind::Copy => &[&dst],
+        OpKind::Move => &[&src, &dst],
+        OpKind::Rename | OpKind::Delete => &[&src],
     };
     let mut commands = Vec::new();
     for side in [Side::Left, Side::Right] {
-        let shown = &state.panels[side.index()].location;
-        if touched
-            .iter()
-            .any(|dir| dir.contains(shown) || shown.contains(dir))
-        {
+        let panel = &state.panels[side.index()];
+        let shown = &panel.location;
+        if touched.iter().any(|(conn, dir)| {
+            *conn == panel.connection.id && (dir.contains(shown) || shown.contains(dir))
+        }) {
             commands.extend(nav::reload(state, side));
         }
     }

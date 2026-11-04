@@ -14,6 +14,8 @@ mod backend;
 pub mod cli;
 pub mod client;
 pub mod codec;
+#[cfg(feature = "gui")]
+mod connection;
 #[cfg(feature = "encryption")]
 pub mod encryption;
 mod fsmode;

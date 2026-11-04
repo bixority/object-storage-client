@@ -10,7 +10,7 @@ use crate::gui::model::{
 
 /// A state with object `a` selected on the left, `file:///l/` → `file:///r/`.
 fn selected() -> AppState {
-    let mut s = AppState::new(loc("file:///l/"), loc("file:///r/"), Encryption::Off).0;
+    let mut s = AppState::at(loc("file:///l/"), loc("file:///r/"), Encryption::Off);
     update(&mut s, page(Side::Left, 1, true, vec![obj("a")], None));
     act(
         &mut s,

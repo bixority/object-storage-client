@@ -1,6 +1,7 @@
 //! One panel: address bar, banners, the listing table and its footer.
 
 use super::address_bar;
+use crate::connection::Login;
 use crate::gui::action::{Action, SelectOp};
 use crate::gui::display;
 use crate::gui::model::{AppState, Entry, MAX_ENTRIES, PanelState, Side};
@@ -62,7 +63,7 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mu
         .stroke(panel_stroke(ui.visuals(), active))
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            address_bar::draw(ui, panel, side, actions);
+            address_bar::draw(ui, state, side, actions);
             banners(ui, panel, side, actions);
             // Leave room for the footer below the table.
             let footer = ui
@@ -111,6 +112,17 @@ fn banners(ui: &mut egui::Ui, panel: &PanelState, side: Side, actions: &mut Vec<
             ui.colored_label(ui.visuals().error_fg_color, error);
             if ui.button("Retry").clicked() {
                 actions.push(Action::Retry(side));
+            }
+            match &panel.connection.login {
+                Some(Login::AwsSso(_)) => {
+                    if ui.button("Log in").clicked() {
+                        actions.push(Action::LogIn { side });
+                    }
+                }
+                Some(Login::Command(command)) => {
+                    ui.label(format!("Run `{command}` in a terminal, then Rescan"));
+                }
+                None => {}
             }
         });
     }

@@ -183,7 +183,13 @@ impl Transport {
             proxy_ca_certificate: get(ClientConfigKey::ProxyCaCertificate),
             proxy_excludes: get(ClientConfigKey::ProxyExcludes),
             user_agent: get(ClientConfigKey::UserAgent),
-            no_system_proxy: matches!(vars, Vars::Map(_)),
+            no_system_proxy: matches!(
+                vars,
+                Vars::Map {
+                    system_proxy: false,
+                    ..
+                }
+            ),
         }
     }
 
@@ -234,6 +240,23 @@ impl Transport {
         }
         builder.build().map_err(failed)
     }
+}
+
+/// A client for the crate's own HTTP calls outside a store (the GUI's Azure
+/// account lookup), with the bucket-call settings: the system proxy and
+/// certificates apply, timeouts are bounded and redirects are not followed.
+/// Plain `http` is refused unless `allow_http` (a test seam).
+///
+/// # Errors
+///
+/// Returns [`Error::Generic`] if the client cannot be built.
+#[cfg(feature = "gui")]
+pub fn http_client(allow_http: bool) -> crate::client::Result<reqwest::Client> {
+    Transport {
+        allow_http,
+        ..Transport::default()
+    }
+    .client()
 }
 
 /// A store's own client for its bucket calls (`create_bucket`,
@@ -648,6 +671,16 @@ mod tests {
         assert!(!Transport::read(|_| None, &Vars::Env).no_system_proxy);
     }
 
+    #[test]
+    fn an_isolated_map_honours_the_system_proxy() {
+        let vars = Vars::Map {
+            vars: Arc::default(),
+            system_proxy: true,
+        };
+        assert!(!Transport::read(|_| None, &vars).no_system_proxy);
+        assert!(Transport::read(|_| None, &Vars::map(HashMap::new())).no_system_proxy);
+    }
+
     #[tokio::test]
     async fn the_proxy_setting_reaches_the_bucket_client() {
         use crate::backend::stub::{Reply, serve};
@@ -696,6 +729,18 @@ mod tests {
         });
         let err = client
             .get()
+            .expect("client")
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("https only");
+        assert!(err.is_builder(), "{err}");
+    }
+
+    #[cfg(feature = "gui")]
+    #[tokio::test]
+    async fn the_http_client_refuses_plain_http_unless_allowed() {
+        let err = http_client(false)
             .expect("client")
             .get("http://127.0.0.1:9/")
             .send()

@@ -22,12 +22,13 @@ aws-config = { version = "1.13", default-features = false, features = ["rt-tokio
 aws-credential-types = "1.3"
 aws-lc-rs = { version = "1.19", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 aws-runtime = "1.10"
+aws-sdk-ssooidc = { version = "1.121", default-features = false, optional = true }
 aws-sigv4 = { version = "1.6", default-features = false, features = ["sign-http", "http1"] }
 aws-types = "1.7"
 bytes = "1.12"
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "env"], optional = true }
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "clipboard"], optional = true }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "clipboard", "links"], optional = true }
 egui_extras = { version = "0.37.0", default-features = false, optional = true }
 # Only for its bundled icon and emoji fonts (folder/file/arrow glyphs); eframe
 # brings everything else.
@@ -59,7 +60,7 @@ default = ["encryption", "cli"]
 cli = ["dep:clap", "dep:tokio-util", "tokio/signal", "tokio/io-std", "tokio/macros", "tokio/process", "encryption"]
 encryption = ["dep:zeroize"]
 # The `osc-gui` binary and its `gui` module (a two-pane desktop browser).
-gui = ["cli", "dep:eframe", "dep:egui", "dep:egui_extras"]
+gui = ["cli", "dep:aws-sdk-ssooidc", "dep:eframe", "dep:egui", "dep:egui_extras"]
 # Exposes `encryption::fuzzing` harness entry points for the `fuzz/` crate.
 fuzzing = ["encryption"]
 python = ["dep:pyo3", "dep:pyo3-async-runtimes", "encryption"]

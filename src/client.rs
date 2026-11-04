@@ -257,7 +257,7 @@ impl<C: Codec> Client<C> {
     }
 
     /// Serves the origin of `url` from `store`, for unit tests.
-    #[cfg(all(test, any(feature = "cli", feature = "encryption")))]
+    #[cfg(all(test, any(feature = "cli", feature = "encryption", feature = "gui")))]
     pub(crate) fn preload_store(&self, url: &str, store: Arc<dyn ObjectStore>) {
         let backend = crate::backend::TestBackend {
             store,
@@ -300,10 +300,20 @@ impl<C: Codec> Client<C> {
 
     /// Parses and checks `raw` before any backend is built, then resolves it.
     fn resolve_checked(&self, raw: &str, dots: Dots, needs_object: bool) -> Result<Resolved> {
-        let url = parse_checked(raw, dots, needs_object)?;
+        self.resolve_url(parse_checked(raw, dots, needs_object)?)
+    }
+
+    /// Identity of this client's registry, told apart from other clients'.
+    fn registry_id(&self) -> usize {
+        Arc::as_ptr(&self.registry) as usize
+    }
+
+    /// Resolves the checked `url`.
+    fn resolve_url(&self, url: Url) -> Result<Resolved> {
         let (backend, path) = self.registry.resolve(&url)?;
         Ok(Resolved {
             backend,
+            registry: self.registry_id(),
             loc: Location { url, path },
         })
     }
@@ -336,6 +346,7 @@ impl<C: Codec> Client<C> {
         Ok((
             Resolved {
                 backend: src,
+                registry: self.registry_id(),
                 loc: Location {
                     url: from,
                     path: src_path,
@@ -343,6 +354,7 @@ impl<C: Codec> Client<C> {
             },
             Resolved {
                 backend: dst,
+                registry: self.registry_id(),
                 loc: Location {
                     url: to,
                     path: dst_path,
@@ -623,6 +635,13 @@ impl<C: Codec> Client<C> {
     /// complete page, and an empty one for a token. A missing directory is an
     /// empty page. The order is the store's. For `file://`, symlinks are not
     /// folders or objects: their names are in `links`.
+    ///
+    /// A provider root (`s3://`, `gs://`, `az://` and the other bucket schemes
+    /// with no bucket) lists the buckets or containers of the credentials as
+    /// folders, sorted, in one page with no `next` (a token gives an empty
+    /// page, and `max` is ignored). A folder name is the bucket name itself,
+    /// not escaped: `<scheme>://<name>/` opens it. No other operation accepts
+    /// a provider root.
     #[cfg(feature = "gui")]
     pub(crate) async fn list_dir(
         &self,
@@ -632,7 +651,17 @@ impl<C: Codec> Client<C> {
     ) -> Result<DirPage> {
         use object_store::list::PaginatedListOptions;
 
-        let r = self.resolve_prefix(url)?;
+        let url = parse_checked(url, Dots::OffFile, false)?;
+        if let Some(scheme) = crate::registry::provider_root(&url) {
+            if page_token.is_some() {
+                return Ok(DirPage::default());
+            }
+            return Ok(DirPage {
+                folders: self.registry.list_buckets(scheme).await?,
+                ..DirPage::default()
+            });
+        }
+        let r = self.resolve_url(url)?;
         let path = r.loc.path;
         let (listed, next) = if let Some(store) = r.backend.paginated() {
             let prefix = (!path.as_ref().is_empty()).then(|| format!("{path}/"));
@@ -830,19 +859,6 @@ impl<C: Codec> Client<C> {
         self.codec.copy(&src, &dst, false).await
     }
 
-    /// [`copy`](Self::copy) of an object whose size a listing gave, so a
-    /// server-side copy on S3 does not `HEAD` the source for it.
-    #[cfg(feature = "gui")]
-    pub(crate) async fn copy_sized(
-        &self,
-        from_url: &str,
-        to_url: &str,
-        size: Option<u64>,
-    ) -> Result<()> {
-        let (src, dst) = self.resolve_pair(from_url, to_url)?;
-        self.codec.copy_sized(&src, &dst, size).await
-    }
-
     /// Moves an object from one URL to another.
     /// Supports cross-provider moves. Moving an object onto itself does
     /// nothing. The checks and costs of [`copy`](Self::copy) apply.
@@ -875,12 +891,57 @@ impl<C: Codec> Client<C> {
         if same_name(&src.loc, &dst.loc) {
             return Ok(());
         }
+        self.move_resolved(&src, &dst).await
+    }
+
+    /// Moves between resolved ends: refuses a `WebDAV` collection, which the
+    /// delete would remove with everything in it, then copies and deletes.
+    async fn move_resolved(&self, src: &Resolved, dst: &Resolved) -> Result<()> {
         refuse_collection(
-            &src,
+            src,
             "moving it would remove everything in it; move the objects in it one by one",
         )
         .await?;
-        self.codec.copy(&src, &dst, true).await
+        self.codec.copy(src, dst, true).await
+    }
+
+    /// Copies (or moves, when `delete_source`) `from_url` read through `self`
+    /// to `to_url` written through `dst`. One registry behaves as
+    /// [`copy`](Self::copy) / [`move_object`](Self::move_object);
+    /// two registries never copy server-side, as their credentials differ.
+    ///
+    /// A move between two registries onto the same name is refused with
+    /// [`Error::InvalidInput`] before any I/O, because both may reach one
+    /// object and the source is kept. A copy onto the same name is allowed.
+    #[cfg(feature = "gui")]
+    pub(crate) async fn transfer(
+        &self,
+        dst: &Self,
+        from_url: &str,
+        to_url: &str,
+        size: Option<u64>,
+        delete_source: bool,
+    ) -> Result<()> {
+        let one = Arc::ptr_eq(&self.registry, &dst.registry);
+        if one && delete_source {
+            return self.move_object(from_url, to_url).await;
+        }
+        let (src, to) = if one {
+            self.resolve_pair(from_url, to_url)?
+        } else {
+            (self.resolve(from_url)?, dst.resolve(to_url)?)
+        };
+        if !delete_source {
+            return self.codec.copy_sized(&src, &to, size).await;
+        }
+        if same_name(&src.loc, &to.loc) {
+            return Err(Error::InvalidInput(
+                "the two connections may reach the same object, so the move is refused \
+                 and the source is kept"
+                    .into(),
+            ));
+        }
+        self.move_resolved(&src, &to).await
     }
 }
 
@@ -1058,6 +1119,17 @@ impl Client<Plain> {
     pub fn with_vars(vars: std::collections::HashMap<String, String>) -> Self {
         Self {
             registry: Arc::new(StoreRegistry::with_vars(vars)),
+            codec: Plain,
+        }
+    }
+
+    /// Like [`Self::with_vars`], but the backends honour the system proxy
+    /// setting.
+    #[cfg(feature = "gui")]
+    #[must_use]
+    pub(crate) fn isolated(vars: std::collections::HashMap<String, String>) -> Self {
+        Self {
+            registry: Arc::new(StoreRegistry::isolated(vars)),
             codec: Plain,
         }
     }
@@ -1647,6 +1719,24 @@ mod tests {
             assert_eq!(lines(&stub), ["PROPFIND /photos"]);
         }
 
+        #[cfg(feature = "gui")]
+        #[tokio::test]
+        async fn a_move_to_another_client_refuses_a_collection() {
+            let stub = serve(vec![Reply::new(207, COLLECTION)]).await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let to = url::Url::from_file_path(dir.path().join("b"))
+                .expect("file URL")
+                .to_string();
+            let other = ObjectStorageClient::isolated(std::collections::HashMap::new());
+            let err = client()
+                .transfer(&other, &format!("{}/a", stub.base), &to, None, true)
+                .await
+                .expect_err("collection");
+            assert!(is_collection_error(&err), "{err:?}");
+            assert_eq!(lines(&stub), ["PROPFIND /a"]);
+            assert!(!dir.path().join("b").exists());
+        }
+
         #[tokio::test]
         async fn delete_goes_ahead_for_a_file_or_a_server_without_webdav() {
             for probe in [
@@ -2110,6 +2200,181 @@ mod tests {
     }
 
     #[cfg(feature = "gui")]
+    mod transfer {
+        use super::*;
+        use crate::encryption::keys::Keyring;
+
+        struct Side {
+            dir: tempfile::TempDir,
+            plain: ObjectStorageClient,
+        }
+
+        impl Side {
+            fn new() -> Self {
+                Self {
+                    dir: tempfile::tempdir().expect("tempdir"),
+                    plain: ObjectStorageClient::isolated(std::collections::HashMap::new()),
+                }
+            }
+
+            fn url(&self, name: &str) -> String {
+                url::Url::from_file_path(self.dir.path().join(name))
+                    .expect("file URL")
+                    .to_string()
+            }
+
+            fn exists(&self, name: &str) -> bool {
+                self.dir.path().join(name).exists()
+            }
+        }
+
+        fn config() -> EncryptionConfig {
+            let ring = Keyring::from_material("kek-1", &[("kek-1", &[7; 32])]);
+            EncryptionConfig::new(Arc::new(ring))
+        }
+
+        #[tokio::test]
+        async fn a_failed_move_keeps_the_source() {
+            let (a, b) = (Side::new(), Side::new());
+            a.plain.put(&a.url("x"), "payload").await.expect("put");
+            // The destination directory cannot be created below a file.
+            b.plain.put(&b.url("f"), "file").await.expect("put");
+            let result = a
+                .plain
+                .transfer(&b.plain, &a.url("x"), &b.url("f/y"), None, true)
+                .await;
+            assert!(result.is_err());
+            assert!(a.exists("x"));
+        }
+
+        #[tokio::test]
+        async fn the_same_url_is_copied_but_a_move_is_refused() {
+            let a = Side::new();
+            a.plain.put(&a.url("x"), "payload").await.expect("put");
+            // Another client over the same URL: the copy is not a no-op.
+            let same = ObjectStorageClient::isolated(std::collections::HashMap::new());
+            let url = a.url("x");
+            a.plain
+                .transfer(&same, &url, &url, None, false)
+                .await
+                .expect("copy");
+            let err = a
+                .plain
+                .transfer(&same, &url, &url, None, true)
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+            assert_eq!(a.plain.get(&url).await.expect("kept"), "payload");
+            // Within one client a copy or move onto itself is still a no-op.
+            a.plain
+                .transfer(&a.plain, &url, &url, None, true)
+                .await
+                .expect("no-op");
+            assert_eq!(a.plain.get(&url).await.expect("kept"), "payload");
+        }
+
+        /// Each client over its own in-memory store for the same URLs.
+        fn stored_pair(
+            scheme_a: &str,
+            scheme_b: &str,
+        ) -> (
+            (ObjectStorageClient, Arc<object_store::memory::InMemory>),
+            (ObjectStorageClient, Arc<object_store::memory::InMemory>),
+        ) {
+            let iso = || ObjectStorageClient::isolated(std::collections::HashMap::new());
+            let (a, b) = (iso(), iso());
+            let (sa, sb) = (
+                Arc::new(object_store::memory::InMemory::new()),
+                Arc::new(object_store::memory::InMemory::new()),
+            );
+            a.preload_store(scheme_a, sa.clone());
+            b.preload_store(scheme_b, sb.clone());
+            ((a, sa), (b, sb))
+        }
+
+        #[tokio::test]
+        async fn a_transfer_reads_through_self_and_writes_through_dst() {
+            use object_store::path::Path;
+            let ((a, sa), (b, sb)) = stored_pair("s3://b", "s3://b");
+            sa.put(&Path::from("x"), "one".into()).await.expect("put");
+            a.transfer(&b, "s3://b/x", "s3://b/x", None, false)
+                .await
+                .expect("copy");
+            let got = sb.get(&Path::from("x")).await.expect("copied");
+            assert_eq!(got.bytes().await.expect("bytes").as_ref(), b"one");
+            a.transfer(&b, "s3://b/x", "s3://b/y", None, true)
+                .await
+                .expect("move");
+            assert!(sa.head(&Path::from("x")).await.is_err());
+            assert!(sb.head(&Path::from("y")).await.is_ok());
+            assert!(sa.head(&Path::from("y")).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn a_transfer_between_clients_needs_object_urls() {
+            let (a, b) = (Side::new(), Side::new());
+            a.plain.put(&a.url("x"), "payload").await.expect("put");
+            let cases = [
+                (a.url("x"), format!("{}/", b.url("d"))),
+                (a.url("x"), "s3:///".to_owned()),
+                ("s3:///".to_owned(), b.url("y")),
+            ];
+            for (from, to) in cases {
+                for delete in [false, true] {
+                    let err = a
+                        .plain
+                        .transfer(&b.plain, &from, &to, None, delete)
+                        .await
+                        .expect_err("refused");
+                    assert!(
+                        matches!(err, Error::InvalidInput(_)),
+                        "{from} -> {to}: {err:?}"
+                    );
+                }
+            }
+            assert!(a.exists("x") && !b.exists("d") && !b.exists("y"));
+        }
+
+        #[tokio::test]
+        async fn encrypted_clients_decrypt_and_re_encrypt() {
+            let (a, b) = (Side::new(), Side::new());
+            let cfg = config();
+            let (ea, eb) = (
+                a.plain.with_encryption(cfg.clone()),
+                b.plain.with_encryption(cfg),
+            );
+            ea.put(&a.url("x"), "secret").await.expect("put");
+            ea.transfer(&eb, &a.url("x"), &b.url("y"), None, false)
+                .await
+                .expect("copy");
+            assert_eq!(eb.get(&b.url("y")).await.expect("get"), "secret");
+            let stored = b.plain.get(&b.url("y")).await.expect("raw");
+            assert_ne!(stored.as_ref(), b"secret");
+            ea.transfer(&eb, &a.url("x"), &b.url("z"), None, true)
+                .await
+                .expect("move");
+            assert_eq!(eb.get(&b.url("z")).await.expect("get"), "secret");
+            assert!(!a.exists("x"));
+            // Equal URLs: the copy rewrites the object, the move is refused.
+            let same = ObjectStorageClient::isolated(std::collections::HashMap::new())
+                .with_encryption(config());
+            let url = a.url("y");
+            ea.put(&url, "again").await.expect("put");
+            let before = a.plain.get(&url).await.expect("raw");
+            ea.transfer(&same, &url, &url, None, false)
+                .await
+                .expect("copy");
+            assert_ne!(a.plain.get(&url).await.expect("raw"), before);
+            let err = ea
+                .transfer(&same, &url, &url, None, true)
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+            assert_eq!(ea.get(&url).await.expect("kept"), "again");
+        }
+    }
+
+    #[cfg(feature = "gui")]
     mod list_dir {
         use super::*;
         use crate::registry::child_url;
@@ -2126,6 +2391,123 @@ mod tests {
             let p = dir.join(rel);
             std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
             std::fs::write(p, bytes).expect("write");
+        }
+
+        /// A client over a stub that answers with the buckets `b` and `a`.
+        async fn root_client() -> (ObjectStorageClient, crate::backend::stub::Stub) {
+            use crate::backend::stub::{Reply, serve};
+            let body = "<ListAllMyBucketsResult><Buckets>\
+                        <Bucket><Name>b</Name></Bucket><Bucket><Name>a</Name></Bucket>\
+                        </Buckets></ListAllMyBucketsResult>";
+            let stub = serve(vec![Reply::new(200, body)]).await;
+            let vars = std::collections::HashMap::from(
+                [
+                    ("S3_ENDPOINT", stub.base.as_str()),
+                    ("S3_ALLOW_HTTP", "true"),
+                    ("S3_REGION", "us-east-1"),
+                    ("S3_ACCESS_KEY_ID", "k"),
+                    ("S3_SECRET_ACCESS_KEY", "s"),
+                ]
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            );
+            (ObjectStorageClient::with_vars(vars), stub)
+        }
+
+        #[tokio::test]
+        async fn a_profile_client_lists_with_the_profiles_keys_region_and_endpoint() {
+            use crate::backend::stub::{Reply, serve};
+            let body = "<ListAllMyBucketsResult><Buckets><Bucket><Name>a</Name></Bucket>\
+                        </Buckets></ListAllMyBucketsResult>";
+            let stub = serve(vec![Reply::new(200, body)]).await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = dir.path().join("config");
+            std::fs::write(
+                &config,
+                format!(
+                    "[profile dev]\nregion = eu-west-3\nendpoint_url = {}\n\
+                     aws_access_key_id = AKIDDEV\naws_secret_access_key = devsecret\n",
+                    stub.base
+                ),
+            )
+            .expect("write");
+            let vars = std::collections::HashMap::from([
+                ("AWS_CONFIG_FILE".to_owned(), config.display().to_string()),
+                ("S3_ALLOW_HTTP".to_owned(), "true".to_owned()),
+            ]);
+            let c = ObjectStorageClient::isolated(vars)
+                .with_s3_profile("dev")
+                .expect("profile");
+            assert_eq!(
+                c.list_dir("s3:///", None, 10).await.expect("list").folders,
+                ["a"]
+            );
+            let headers = stub.requests()[0].headers.to_ascii_lowercase();
+            assert!(headers.contains("credential=akiddev/"), "{headers}");
+            assert!(headers.contains("/eu-west-3/s3/aws4_request"), "{headers}");
+        }
+
+        #[tokio::test]
+        async fn every_bucket_scheme_root_lists() {
+            use crate::backend::stub::{Reply, serve};
+            let vars = |p: &[(&str, &str)]| {
+                std::collections::HashMap::from_iter(
+                    p.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+                )
+            };
+            for root in ["gs:///", "gcs:///"] {
+                let stub = serve(vec![Reply::new(200, r#"{"items":[{"name":"g"}]}"#)]).await;
+                let c = ObjectStorageClient::with_vars(vars(&[
+                    ("GCS_BASE_URL", &stub.base),
+                    ("GOOGLE_BEARER_TOKEN", "tok"),
+                    ("GOOGLE_CLOUD_PROJECT", "p"),
+                ]));
+                assert_eq!(c.list_dir(root, None, 1).await.expect(root).folders, ["g"]);
+            }
+            let body = "<EnumerationResults><Containers><Container><Name>z</Name></Container>\
+                        </Containers><NextMarker /></EnumerationResults>";
+            for root in ["az:///", "wasb:///", "wasbs:///", "abfs:///", "abfss:///"] {
+                let stub = serve(vec![Reply::new(200, body)]).await;
+                let endpoint = format!("{}/acct", stub.base);
+                let c = ObjectStorageClient::with_vars(vars(&[
+                    ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                    ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
+                    ("AZURE_STORAGE_ENDPOINT", &endpoint),
+                    ("AZURE_ALLOW_HTTP", "true"),
+                ]));
+                assert_eq!(c.list_dir(root, None, 1).await.expect(root).folders, ["z"]);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_provider_root_lists_the_buckets_as_folders() {
+            for root in ["s3://", "s3:///"] {
+                let (c, stub) = root_client().await;
+                let page = c.list_dir(root, None, 1).await.expect("list");
+                assert_eq!(page.folders, ["a", "b"], "{root}");
+                assert!(page.objects.is_empty() && page.links.is_empty());
+                assert_eq!(page.next, None);
+                assert_eq!(stub.requests().len(), 1);
+                assert_eq!(c.backend_count(), 0, "nothing is cached");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_provider_root_with_a_token_is_an_empty_page() {
+            let (c, stub) = root_client().await;
+            let page = c.list_dir("s3:///", Some("t".into()), 10).await;
+            assert_eq!(page.expect("ok"), DirPage::default());
+            assert!(stub.requests().is_empty());
+        }
+
+        #[tokio::test]
+        async fn no_other_operation_accepts_a_provider_root() {
+            let (c, stub) = root_client().await;
+            for root in ["s3://", "s3:///", "gs:///", "az:///"] {
+                assert!(c.list(root).await.is_err(), "{root}");
+                assert!(c.exists(root).await.is_err(), "{root}");
+                assert!(c.get(root).await.is_err(), "{root}");
+            }
+            assert!(stub.requests().is_empty());
         }
 
         #[tokio::test]

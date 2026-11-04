@@ -1,23 +1,16 @@
-//! Builds the client exactly as `osc` does.
+//! Resolves the key source exactly as `osc` does.
 
 use super::args::Args;
 use super::model::Encryption;
 use crate::cli::{CliError, KeySources, key_source, open_keyring};
 use crate::encryption::EncryptionConfig;
-use crate::{EncryptedObjectStorageClient, ObjectStorageClient};
 
-/// The client the GUI works through.
-pub enum Opened {
-    Plain(ObjectStorageClient),
-    Encrypted(EncryptedObjectStorageClient, Encryption),
-}
+/// The encryption every connection's client gets, and where its keys came from.
+pub type Keys = Option<(EncryptionConfig, Encryption)>;
 
-/// Opens the client: profile, then key source, then the encryption policy.
-pub async fn open_client(args: &Args) -> Result<Opened, CliError> {
-    let client = match &args.profile {
-        Some(profile) => ObjectStorageClient::new().with_s3_profile(profile.clone())?,
-        None => ObjectStorageClient::new(),
-    };
+/// Opens the keyring if a key source is configured; with none, `None`
+/// (plaintext) unless `--require-encryption` forbids it.
+pub async fn open_keys(args: &Args) -> Result<Keys, CliError> {
     let encryption = if args.keyring.is_some() {
         Encryption::File
     } else {
@@ -28,12 +21,12 @@ pub async fn open_client(args: &Args) -> Result<Opened, CliError> {
         command: args.keyring_command.clone(),
     })?;
     match source {
-        Some(source) => Ok(Opened::Encrypted(
-            client.with_encryption(EncryptionConfig::new(open_keyring(source).await?)),
+        Some(source) => Ok(Some((
+            EncryptionConfig::new(open_keyring(source).await?),
             encryption,
-        )),
+        ))),
         None if args.require_encryption => Err(CliError::EncryptionRequired),
-        None => Ok(Opened::Plain(client)),
+        None => Ok(None),
     }
 }
 
@@ -45,10 +38,7 @@ mod tests {
         Args {
             keyring: None,
             keyring_command: None,
-            profile: None,
             require_encryption: false,
-            left: None,
-            right: None,
         }
     }
 
@@ -61,7 +51,7 @@ mod tests {
             ..args()
         };
         assert!(matches!(
-            open_client(&args).await,
+            open_keys(&args).await,
             Err(CliError::KeyringSourcesConflict)
         ));
     }
@@ -73,13 +63,13 @@ mod tests {
             ..args()
         };
         assert!(matches!(
-            open_client(&args).await,
+            open_keys(&args).await,
             Err(CliError::EncryptionRequired)
         ));
     }
 
     #[tokio::test]
     async fn no_key_source_is_plain() {
-        assert!(matches!(open_client(&args()).await, Ok(Opened::Plain(_))));
+        assert!(matches!(open_keys(&args()).await, Ok(None)));
     }
 }

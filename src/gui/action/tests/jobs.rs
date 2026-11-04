@@ -1,6 +1,6 @@
 //! Job and dialog rules.
 
-use super::{act, dir, loc, obj, page, plan, planned, state};
+use super::{act, dir, loc, local, obj, page, plan, planned, state};
 use crate::gui::action::{Action, Answer, Command, Event, Msg, SelectOp, update};
 use crate::gui::model::{
     AppState, Batch, Dialog, Encryption, Entry, Failure, Item, JobId, JobPhase, OnExisting, OpKind,
@@ -9,7 +9,7 @@ use crate::gui::model::{
 
 /// A state whose left panel lists `entries` with `selected` chosen.
 fn with_selection(left: &str, right: &str, entries: Vec<Entry>, selected: &[&str]) -> AppState {
-    let mut s = AppState::new(loc(left), loc(right), Encryption::Off).0;
+    let mut s = AppState::at(loc(left), loc(right), Encryption::Off);
     update(&mut s, page(Side::Left, 1, true, entries, None));
     for name in selected {
         let key = s.panels[0]
@@ -84,6 +84,8 @@ fn copy_sends_plan_for_selection() {
                 dst_dir: loc("file:///r/"),
                 rename_to: None,
             },
+            src_conn: local(),
+            dst_conn: local(),
         }]
     );
     assert_eq!(phase(&s), Some(&JobPhase::Planning));
@@ -217,6 +219,8 @@ fn rename_validation() {
                 dst_dir: loc("file:///l/"),
                 rename_to: Some("new".to_owned()),
             },
+            src_conn: local(),
+            dst_conn: local(),
         }]
     );
     assert_eq!(s.dialog, None);
@@ -257,6 +261,8 @@ fn rename_onto_existing_asks() {
     assert_eq!(
         answer(&mut s, Answer::Overwrite),
         vec![Command::Execute {
+            src_conn: local(),
+            dst_conn: local(),
             job: JobId(1),
             plan: p,
             on_existing: OnExisting::Overwrite,
@@ -287,6 +293,8 @@ fn unchecked_plan_warns() {
     assert_eq!(
         answer(&mut s, Answer::Proceed),
         vec![Command::Execute {
+            src_conn: local(),
+            dst_conn: local(),
             job: JobId(1),
             plan: p,
             on_existing: OnExisting::Overwrite,
@@ -318,6 +326,8 @@ fn skip_answer_executes_skip() {
     assert_eq!(
         answer(&mut s, Answer::Skip),
         vec![Command::Execute {
+            src_conn: local(),
+            dst_conn: local(),
             job: JobId(1),
             plan: p,
             on_existing: OnExisting::Skip,
@@ -346,6 +356,8 @@ fn copy_without_existing_runs_at_once() {
     assert_eq!(
         planned(&mut s, 1, copy_plan()),
         vec![Command::Execute {
+            src_conn: local(),
+            dst_conn: local(),
             job: JobId(1),
             plan: copy_plan(),
             on_existing: OnExisting::Overwrite,
@@ -387,6 +399,8 @@ fn move_always_confirms() {
     assert_eq!(
         answer(&mut s, Answer::Proceed),
         vec![Command::Execute {
+            src_conn: local(),
+            dst_conn: local(),
             job: JobId(1),
             plan: p,
             on_existing: OnExisting::Overwrite,
@@ -441,6 +455,8 @@ fn bucket_root_delete_needs_exact_name() {
     assert_eq!(
         answer(&mut s, Answer::Proceed),
         vec![Command::Execute {
+            src_conn: local(),
+            dst_conn: local(),
             job: JobId(1),
             plan: delete_plan(),
             on_existing: OnExisting::Overwrite,
@@ -528,6 +544,7 @@ fn finished_refreshes_and_reports_failures() {
         commands,
         // A copy changes only its destination.
         vec![Command::List {
+            conn: local(),
             side: Side::Right,
             seq: 2,
             url: "file:///r/".to_owned(),

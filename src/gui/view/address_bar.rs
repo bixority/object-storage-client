@@ -1,7 +1,8 @@
-//! Up, the address field and Go.
+//! The connection list, Up, the address field and Go.
 
 use crate::gui::action::Action;
-use crate::gui::model::{PanelState, Side};
+use crate::gui::display;
+use crate::gui::model::{AppState, Side};
 use eframe::egui;
 
 /// The id of `side`'s address field, so Ctrl+L can focus it.
@@ -9,10 +10,42 @@ pub(in crate::gui) fn address_id(side: Side) -> egui::Id {
     egui::Id::unique(("osc-gui address", side.index()))
 }
 
-pub(super) fn draw(ui: &mut egui::Ui, panel: &PanelState, side: Side, actions: &mut Vec<Action>) {
+pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mut Vec<Action>) {
+    let panel = &state.panels[side.index()];
     ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(("osc-gui connection", side.index()))
+            .selected_text(display::text(&panel.connection.label))
+            .show_ui(ui, |ui| {
+                for conn in &state.connections {
+                    let current = conn.id == panel.connection.id;
+                    if ui
+                        .selectable_label(current, display::text(&conn.label))
+                        .clicked()
+                    {
+                        actions.push(Action::SelectConnection {
+                            side,
+                            id: conn.id.clone(),
+                        });
+                    }
+                }
+                ui.separator();
+                if state.discovering {
+                    ui.add_enabled(
+                        false,
+                        egui::Label::new(egui::RichText::new("Searching…").small()),
+                    );
+                } else if ui.selectable_label(false, "Rescan").clicked() {
+                    actions.push(Action::Rescan);
+                }
+                for note in &state.notes {
+                    ui.add_enabled(
+                        false,
+                        egui::Label::new(egui::RichText::new(display::text(note)).small()),
+                    );
+                }
+            });
         let up = ui
-            .add_enabled(!panel.location.is_root(), egui::Button::new("⬆ Up"))
+            .add_enabled(panel.location.parent().is_some(), egui::Button::new("⬆ Up"))
             .on_hover_text("Up one level (Backspace)");
         if up.clicked() {
             actions.push(Action::Up(side));

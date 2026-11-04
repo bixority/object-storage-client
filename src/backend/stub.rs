@@ -19,10 +19,18 @@ pub fn client() -> reqwest::Client {
         .expect("client")
 }
 
-/// A loopback port nothing listens on.
+/// A loopback port nothing listens on. It stays bound (without listening)
+/// until the process ends, so a connection to it is refused and no stub of
+/// a concurrent test can be given the same port.
 pub fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("addr").port()
+    static HELD: Mutex<Vec<tokio::net::TcpSocket>> = Mutex::new(Vec::new());
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        .expect("bind");
+    let port = socket.local_addr().expect("addr").port();
+    HELD.lock().expect("lock").push(socket);
+    port
 }
 
 /// A canned response.

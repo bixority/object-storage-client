@@ -3,7 +3,10 @@
 use super::location::Location;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::connection::Connection;
 
 /// How the opened client encrypts, and where its keys came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +121,8 @@ pub struct Page {
 
 /// Everything one panel shows.
 pub(crate) struct PanelState {
+    /// The connection whose client lists and changes `location`.
+    pub(crate) connection: Arc<Connection>,
     pub(crate) location: Location,
     pub(crate) address_text: String,
     pub(crate) address_error: Option<String>,
@@ -138,9 +143,11 @@ pub(crate) struct PanelState {
 }
 
 impl PanelState {
-    /// A panel at `location`, waiting for its first page (listing `seq` 1).
-    pub(crate) fn new(location: Location) -> Self {
+    /// A panel at `location` of `connection`, waiting for its first page
+    /// (listing `seq` 1).
+    pub(crate) fn new(connection: Arc<Connection>, location: Location) -> Self {
         Self {
+            connection,
             address_text: location.display(),
             location,
             address_error: None,
@@ -302,8 +309,10 @@ pub(crate) struct Job {
     pub(crate) total: usize,
     /// Display text of the item last reported.
     pub(crate) current: String,
+    pub(crate) src_conn: Arc<Connection>,
     /// The folder the batch's entries are in.
     pub(crate) src_dir: Location,
+    pub(crate) dst_conn: Arc<Connection>,
     /// The batch's destination folder, for the confirmation dialogs.
     pub(crate) dst_dir: Location,
     /// Cancel was pressed; a plan that arrives later is dropped.
@@ -351,12 +360,27 @@ pub(crate) enum Dialog {
         kind: OpKind,
         outcome: Outcome,
     },
+    /// An SSO login in progress for the connection `conn_id` (shown as
+    /// `label`). `code` is the user code and the page to approve it on, once
+    /// the worker has them.
+    Login {
+        conn_id: String,
+        label: String,
+        code: Option<(String, String)>,
+        error: Option<String>,
+    },
     Quit,
 }
 
 /// The whole GUI state.
 pub(crate) struct AppState {
     pub(crate) panels: [PanelState; 2],
+    /// The connections to choose from; the first is always Local.
+    pub(crate) connections: Vec<Arc<Connection>>,
+    /// What the last scan could not use.
+    pub(crate) notes: Vec<String>,
+    /// Whether a scan is still running.
+    pub(crate) discovering: bool,
     pub(crate) active: Side,
     pub(crate) status: String,
     pub(crate) encryption: Encryption,

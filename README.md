@@ -345,14 +345,14 @@ On Linux, `osc-gui` needs a Wayland session; X11 is not supported.
 ### Run
 
 ```bash
-osc-gui                                        # both panels on the current directory
-osc-gui s3://my-bucket/photos/ ~/Pictures      # left and right panel
-osc-gui --profile dev s3://my-bucket/          # credentials from the AWS profile "dev"
-osc-gui --keyring keyring s3://my-bucket/ .    # copies encrypt and decrypt
+osc-gui                                        # both panels on Local, the current directory
+osc-gui --keyring keyring                      # copies encrypt and decrypt
 ```
 
-Type any URL or path into a panel's address bar and press Enter. Buckets are not
-listed, so type the bucket's URL. The keys and shortcuts are listed in
+Each panel has a connection selector for Local and the AWS profiles, gcloud
+configurations and Azure storage accounts found on the machine; a cloud connection
+lists its buckets. Type any matching URL or path into a panel's address bar and
+press Enter. The keys and shortcuts are listed in
 [Desktop browser](docs/GUI.md), which also covers limits and closing behaviour.
 
 ## Documentation

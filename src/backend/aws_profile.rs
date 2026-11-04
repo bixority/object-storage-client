@@ -73,7 +73,7 @@ const FALLBACK_STS_REGION: &str = "us-east-1";
 /// reads. An injected map reads only `AWS_CONFIG_FILE` and
 /// `AWS_SHARED_CREDENTIALS_FILE` from itself, and never the real `~/.aws`.
 pub fn files(vars: &Vars) -> Option<EnvConfigFiles> {
-    let Vars::Map(_) = vars else {
+    let Vars::Map { .. } = vars else {
         return None;
     };
     // `build` panics on an empty set, so an empty config file is always present.

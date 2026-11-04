@@ -97,8 +97,9 @@ impl eframe::App for App {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        // The focus as of the key press: the previous frame's.
-        let text_focus = ctx.text_edit_focused();
+        // The focus and popups as of the key press: the previous frame's. An
+        // open popup (the connection list) keeps the arrows, Tab, Enter and Esc.
+        let input_busy = ctx.text_edit_focused() || ctx.any_popup_open();
         let state = &self.state;
         // A page is what the active table showed fully last frame.
         let page_rows = view::page_rows(ctx, state.active);
@@ -114,7 +115,7 @@ impl eframe::App for App {
             else {
                 return true;
             };
-            let Some(action) = map_key(*key, *modifiers, state, text_focus, page_rows) else {
+            let Some(action) = map_key(*key, *modifiers, state, input_busy, page_rows) else {
                 return true;
             };
             // A held arrow or page key keeps moving; other shortcuts fire once.

@@ -309,6 +309,37 @@ pub fn unique_gcs_bucket() -> String {
     format!("gs://it-{}/", uuid_like())
 }
 
+/// Lists the provider root `root` (`s3://`, `gs://`, `az://`) and checks that
+/// it is one sorted page of folders that holds every bucket URL of `created`
+/// as `<root><name>/`.
+#[cfg(feature = "gui")]
+pub async fn assert_root_lists(
+    client: &ObjectStorageClient,
+    root: &str,
+    created: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use object_storage_client::gui::location::Location;
+    use object_storage_client::gui::model::Entry;
+    use object_storage_client::gui::ops::list_page_with;
+
+    let page = list_page_with(client, &Location::parse(root)?, None, 1).await?;
+    assert_eq!(page.next, None, "one page");
+    let names: Vec<&str> = page
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            Entry::Folder { name } => name.as_str(),
+            other => panic!("not a folder: {other:?}"),
+        })
+        .collect();
+    assert!(names.is_sorted(), "{names:?}");
+    for url in created {
+        let name = url.trim_start_matches(root).trim_end_matches('/');
+        assert!(names.contains(&name), "{name} is not in {names:?}");
+    }
+    Ok(())
+}
+
 /// A name part that is unique per call, per process and per run: the start
 /// time and the process id (both in hex) plus a counter, so back-to-back calls
 /// never collide whatever the clock resolution.

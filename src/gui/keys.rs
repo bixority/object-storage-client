@@ -6,17 +6,17 @@ use eframe::egui::{Key, Modifiers};
 
 /// The action for `key` with `mods`, if it is a shortcut.
 ///
-/// Nothing is a shortcut while a text field has focus (`text_focus`) or a
-/// dialog is open: dialogs handle Enter and Esc themselves. `page_rows` is
+/// Nothing is a shortcut while a text field has focus or a popup is open
+/// (`input_busy`) or a dialog is open: dialogs handle Enter and Esc themselves. `page_rows` is
 /// how many rows Page Up and Page Down move.
 pub(super) fn map_key(
     key: Key,
     mods: Modifiers,
     state: &AppState,
-    text_focus: bool,
+    input_busy: bool,
     page_rows: usize,
 ) -> Option<Action> {
-    if text_focus || state.dialog.is_some() {
+    if input_busy || state.dialog.is_some() {
         return None;
     }
     let side = state.active;
@@ -77,7 +77,7 @@ mod tests {
 
     fn state() -> AppState {
         let loc = |url: &str| Location::parse(url).expect("test url parses");
-        AppState::new(loc("file:///l/"), loc("file:///r/"), Encryption::Off).0
+        AppState::at(loc("file:///l/"), loc("file:///r/"), Encryption::Off)
     }
 
     fn loaded(entries: Vec<Entry>) -> AppState {

@@ -23,17 +23,17 @@ remotely. No extra system packages are needed.
 ## Launch
 
 ```bash
-osc-gui                                         # both panels on the current directory
-osc-gui s3://my-bucket/photos/ ~/Pictures       # left and right panel
-osc-gui --profile dev s3://my-bucket/           # credentials from the AWS profile "dev"
-osc-gui --keyring keyring s3://my-bucket/ .     # copies encrypt and decrypt
+osc-gui                                         # both panels on Local, the current directory
+osc-gui --keyring keyring                       # copies encrypt and decrypt
 ```
+
+Both panels start on Local. The panels' connections are chosen in the app, not
+on the command line.
 
 The options are the ones `osc` takes:
 
 | Option                 | Environment              | Meaning                                                   |
 |------------------------|--------------------------|-----------------------------------------------------------|
-| `--profile NAME`       |                          | AWS profile for `s3://` ([details](CONFIGURATION.md#aws-profiles-and-sso)) |
 | `--keyring FILE`       | `OSC_KEYRING_FILE`       | Keyring file; enables encryption                          |
 |                        | `OSC_KEYRING_COMMAND`    | A command that prints the keyring (instead of a file)     |
 | `--require-encryption` | `OSC_REQUIRE_ENCRYPTION` | Refuse to start without a key source                      |
@@ -42,15 +42,43 @@ Keys are loaded once, at launch. The toolbar shows whether encryption is on and
 where the keys came from. With encryption on, every copy and move encrypts
 what it writes and decrypts what it reads, as `osc cp` and `osc mv` do.
 
-If the keys or the profile cannot be loaded, `osc-gui` prints the error and
+If the keys cannot be loaded, `osc-gui` prints the error and
 shows it in a small window, then exits with status 1.
 
 ## Using it
 
+The selector at the left of each panel's address bar picks the panel's
+connection. It lists Local and what `osc-gui` finds on this machine. It reads
+local files and variables and never asks you to log in; for Azure it also asks
+`az` for a token and lists the storage accounts of each subscription:
+
+- AWS profiles from `~/.aws/config` and `~/.aws/credentials`, and the
+  `AWS_*` variables;
+- gcloud configurations and Google application default credentials;
+- Azure CLI subscriptions (the storage accounts of each are looked up through
+  Azure while the selector shows "Searching…") and the `AZURE_STORAGE_*`
+  variables.
+
+Anything it could not use is listed under the connections as a small grey
+note. "Rescan" searches again. A connection uses only its
+own settings, so one panel can use another account than the other, and copies
+between panels stream through the app.
+
 Type an address into a panel's address bar and press Enter: any URL `osc`
-accepts (`s3://`, `gs://`, `az://`, `http(s)://`, `file://`) or a local path.
-The address is always opened as a folder. Buckets are not listed: type the
-bucket's URL. Going up stops at the bucket root (or the file-system root).
+accepts, or a local path. The scheme must match the panel's connection: Local
+takes `file://`, `http(s)://` and paths, S3 `s3://`, GCS `gs://`, Azure `az://`
+and its aliases; otherwise pick a matching connection. The address is always
+opened as a folder. Selecting a cloud connection opens its root, which lists
+the buckets (or containers) as folders; open one to browse it. Going up from a
+bucket returns to that list. Copy, move, rename and delete are refused at the
+list itself.
+
+If a connection cannot authenticate, the error banner says so. For an AWS SSO
+profile it has a "Log in" button: it shows a code, "Open browser" opens the
+approval page, and the token is written to `~/.aws/sso/cache` like the AWS CLI
+does, so both share it. For gcloud and Azure the banner shows the command to run
+in a terminal (`gcloud auth application-default login`, `az login`); run it, then press
+"Rescan" in the selector.
 
 | Key                               | Action                                         |
 |-----------------------------------|------------------------------------------------|
@@ -127,7 +155,8 @@ and Shift-click select entries; double-click opens a folder.
   starts again at the first page; the other keeps its loaded pages, selection
   and cursor.
 - Sizes of encrypted objects are their stored sizes, as in `osc ls`.
-- Nothing is saved between runs: no settings, history or credentials.
+- Nothing is saved between runs: no settings or history. The only file written
+  is the SSO token cache of a login, in `~/.aws/sso/cache`.
 
 ## Closing
 

@@ -16,6 +16,25 @@ pub fn origin(url: &Url) -> &str {
     &url[..Position::AfterPort]
 }
 
+/// Whether `scheme` names a bucket or container store.
+#[cfg(feature = "gui")]
+pub fn is_bucket_scheme(scheme: &str) -> bool {
+    matches!(
+        scheme,
+        "s3" | "gs" | "gcs" | "az" | "wasb" | "wasbs" | "abfs" | "abfss"
+    )
+}
+
+/// The scheme of `url` if it is a provider root: a bucket scheme with no
+/// bucket and no path (`s3://`, `s3:///`). Only a bucket listing accepts it.
+#[cfg(feature = "gui")]
+pub fn provider_root(url: &Url) -> Option<&str> {
+    (is_bucket_scheme(url.scheme())
+        && url.host_str().is_none_or(str::is_empty)
+        && matches!(url.path(), "" | "/"))
+    .then(|| url.scheme())
+}
+
 /// The object a URL names: its percent-decoded path. A bucket-only URL (e.g.
 /// `s3://bucket`) has an empty path, which yields the root path.
 pub fn object_path(url: &Url) -> Result<ObjectPath> {
@@ -138,8 +157,19 @@ impl StoreRegistry {
         Ok((first, self.resolve(to)?))
     }
 
+    /// The names of all buckets or containers that this registry's credentials
+    /// for `scheme` can list, sorted. Nothing is cached.
+    ///
+    /// # Errors
+    ///
+    /// As [`backend::list_buckets`].
+    #[cfg(feature = "gui")]
+    pub async fn list_buckets(&self, scheme: &str) -> Result<Vec<String>> {
+        backend::list_buckets(scheme, &self.vars, self.profile.as_deref(), &self.shared).await
+    }
+
     /// Caches `backend` as the one for the origin of `url`.
-    #[cfg(all(test, any(feature = "cli", feature = "encryption")))]
+    #[cfg(all(test, any(feature = "cli", feature = "encryption", feature = "gui")))]
     pub(crate) fn preload(&self, url: &Url, backend: Arc<dyn Backend>) {
         self.keep(origin(url), backend);
     }
@@ -176,7 +206,20 @@ impl StoreRegistry {
     /// A registry whose backends read configuration from `vars` instead of the
     /// process environment.
     pub fn with_vars(vars: HashMap<String, String>) -> Self {
-        Self::with_capacity(MAX_CACHED_STORES, Vars::Map(Arc::new(vars)))
+        Self::with_capacity(MAX_CACHED_STORES, Vars::map(vars))
+    }
+
+    /// Like [`Self::with_vars`], but the backends honour the system proxy
+    /// setting.
+    #[cfg(feature = "gui")]
+    pub(crate) fn isolated(vars: HashMap<String, String>) -> Self {
+        Self::with_capacity(
+            MAX_CACHED_STORES,
+            Vars::Map {
+                vars: Arc::new(vars),
+                system_proxy: true,
+            },
+        )
     }
 
     /// A new, empty registry with this registry's configuration whose S3
@@ -308,6 +351,50 @@ mod tests {
         assert_eq!(child_url("s3://b/", ["d", "e.txt"]), "s3://b/d/e.txt");
     }
 
+    #[cfg(feature = "gui")]
+    #[test]
+    fn an_isolated_registry_honours_the_system_proxy() {
+        let proxy = |r: &StoreRegistry| {
+            matches!(
+                r.vars,
+                Vars::Map {
+                    system_proxy: true,
+                    ..
+                }
+            )
+        };
+        let isolated = StoreRegistry::isolated(HashMap::new());
+        assert!(proxy(&isolated));
+        assert!(proxy(&isolated.with_profile("p".into())));
+        assert!(!proxy(&StoreRegistry::with_vars(HashMap::new())));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn provider_roots_are_bucket_schemes_without_a_bucket() {
+        let root = |u: &str| provider_root(&Url::parse(u).expect("url")).map(str::to_owned);
+        for (url, scheme) in [
+            ("s3://", "s3"),
+            ("s3:///", "s3"),
+            ("gs:///", "gs"),
+            ("gcs://", "gcs"),
+            ("az:///", "az"),
+            ("abfss:///", "abfss"),
+        ] {
+            assert_eq!(root(url).as_deref(), Some(scheme), "{url}");
+        }
+        for url in [
+            "s3://b",
+            "s3://b/",
+            "s3:///x",
+            "file:///",
+            "http://h/",
+            "ftp://h/",
+        ] {
+            assert_eq!(root(url), None, "{url}");
+        }
+    }
+
     fn parts(url: &str) -> Result<Vec<String>> {
         let url = Url::parse(url).expect("url");
         let (_, path) = StoreRegistry::default().resolve(&url)?;
@@ -432,11 +519,11 @@ mod tests {
     #[test]
     fn credentials_survive_eviction_and_belong_to_one_registry() {
         let vars = || {
-            Vars::Map(Arc::new(HashMap::from([
+            Vars::map(HashMap::from([
                 ("AWS_REGION".to_owned(), "eu-west-1".to_owned()),
                 ("AWS_ACCESS_KEY_ID".to_owned(), "k".to_owned()),
                 ("AWS_SECRET_ACCESS_KEY".to_owned(), "s".to_owned()),
-            ])))
+            ]))
         };
         let registry = StoreRegistry::with_capacity(1, vars());
         let first = s3(&registry, "a").s3_signing().expect("s3 backend");
@@ -454,8 +541,7 @@ mod tests {
     fn profile_files_are_read_once_per_registry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (path, vars) = profile_vars(&dir);
-        let registry =
-            StoreRegistry::with_capacity(1, Vars::Map(Arc::new(vars))).with_profile("p".into());
+        let registry = StoreRegistry::with_capacity(1, Vars::map(vars)).with_profile("p".into());
         let first = s3(&registry, "a").s3_signing().expect("s3 backend");
         assert_eq!(registry.len(), 1);
         std::fs::remove_file(&path).expect("remove");
@@ -487,7 +573,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_one_origin_shares_a_backend_in_a_full_cache() {
-        let registry = StoreRegistry::with_capacity(1, Vars::Map(Arc::new(HashMap::new())));
+        let registry = StoreRegistry::with_capacity(1, Vars::map(HashMap::new()));
         let url = |u: &str| Url::parse(u).expect("url");
         registry.resolve(&url("http://full/x")).expect("fill");
 
@@ -508,7 +594,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_the_least_recently_used_backend() {
-        let registry = StoreRegistry::with_capacity(2, Vars::Map(Arc::new(HashMap::new())));
+        let registry = StoreRegistry::with_capacity(2, Vars::map(HashMap::new()));
         let resolve = |url: &str| {
             registry
                 .resolve(&Url::parse(url).expect("url"))

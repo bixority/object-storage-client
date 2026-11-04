@@ -13,51 +13,37 @@ mod startup;
 mod view;
 mod worker;
 
+use crate::connection::Connection;
 use app::{App, StartupErrorApp};
 use args::Args;
-use location::Location;
 use model::{AppState, Encryption};
-use startup::Opened;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
-use worker::Repaint;
+use worker::{Factory, Repaint};
 
 /// How long the runtime may take to stop once the window has closed.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Starts the GUI: opens the client, then the window. Returns 1 when the
-/// client or the window could not be opened.
+/// Starts the GUI: opens the key source, then the window. Returns 1 when the
+/// keys or the window could not be opened.
 #[must_use]
-pub fn run(args: Args) -> ExitCode {
+pub fn run(args: &Args) -> ExitCode {
     let runtime = match crate::cli::build_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
             return startup_error(&format!("failed to start the async runtime: {err}"));
         }
     };
-    let opened = match runtime.block_on(startup::open_client(&args)) {
-        Ok(opened) => opened,
+    let keys = match runtime.block_on(startup::open_keys(args)) {
+        Ok(keys) => keys,
         Err(err) => {
             drop(runtime);
             return startup_error(&err.to_string());
         }
     };
-    let Args { left, right, .. } = args;
-    let (left, right) = match (initial(left.as_deref()), initial(right.as_deref())) {
-        (Ok(left), Ok(right)) => (left, right),
-        (Err(err), _) | (_, Err(err)) => {
-            drop(runtime);
-            return startup_error(&err);
-        }
-    };
-    let encryption = match &opened {
-        Opened::Plain(_) => Encryption::Off,
-        Opened::Encrypted(_, encryption) => *encryption,
-    };
-    let (mut state, commands) = AppState::new(left.0, right.0, encryption);
-    state.panels[0].address_error = left.1;
-    state.panels[1].address_error = right.1;
+    let encryption = keys.as_ref().map_or(Encryption::Off, |(_, kind)| *kind);
+    let (state, commands) = AppState::new(encryption);
     let handle = runtime.handle().clone();
     let result = eframe::run_native(
         "osc-gui",
@@ -65,9 +51,19 @@ pub fn run(args: Args) -> ExitCode {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let repaint: Repaint = Arc::new(move || ctx.request_repaint());
-            let worker = match opened {
-                Opened::Plain(client) => worker::spawn(&handle, client, repaint, true),
-                Opened::Encrypted(client, _) => worker::spawn(&handle, client, repaint, true),
+            let host = crate::connection::Host::real();
+            let worker = match keys {
+                None => {
+                    let factory: Factory<crate::codec::Plain> = Box::new(Connection::client);
+                    worker::spawn(&handle, factory, host, repaint, true)
+                }
+                Some((config, _)) => {
+                    let factory: Factory<crate::encryption::Envelope> = Box::new(move |conn| {
+                        conn.client()
+                            .map(|client| client.with_encryption(config.clone()))
+                    });
+                    worker::spawn(&handle, factory, host, repaint, true)
+                }
             };
             Ok(Box::new(App::new(state, worker, commands)))
         }),
@@ -80,18 +76,6 @@ pub fn run(args: Args) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// A panel's first folder: `arg`, or the current directory with the parse
-/// error of `arg` to show under its address bar.
-fn initial(arg: Option<&str>) -> Result<(Location, Option<String>), String> {
-    let Some(arg) = arg else {
-        return Location::parse(".").map(|location| (location, None));
-    };
-    Location::parse(arg).map_or_else(
-        |err| Location::parse(".").map(|location| (location, Some(err))),
-        |location| Ok((location, None)),
-    )
 }
 
 /// Reports a startup failure on stderr and in a small window; returns 1.

@@ -4,6 +4,8 @@ use super::{
     Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response, create_failed,
     default_timeouts, error_body, ms_error_code, send_signed, send_with_retry,
 };
+#[cfg(feature = "gui")]
+use super::{collect_pages, encode, xml_listing_page};
 use crate::client::{Error, Result};
 use http::Method;
 use object_store::ClientConfigKey;
@@ -212,6 +214,30 @@ impl AzureBackend {
             self.container
         );
         self.signed_request(method, &uri, &account, &[]).await
+    }
+
+    /// `List Containers` (`GET /?comp=list` on the account endpoint): the names
+    /// of all containers of the account, sorted, following `NextMarker`.
+    #[cfg(feature = "gui")]
+    pub async fn list_buckets(&self) -> Result<Vec<String>> {
+        collect_pages(|marker| async move {
+            let (account, endpoint) = self.account_and_endpoint()?;
+            let mut uri = format!("{}/?comp=list", endpoint.trim_end_matches('/'));
+            if let Some(marker) = marker {
+                uri = format!("{uri}&marker={}", encode(&marker));
+            }
+            let request = self
+                .signed_request(Method::GET, &uri, &account, &[])
+                .await?;
+            xml_listing_page(
+                self.http.get()?,
+                request,
+                "Azure List Containers",
+                "NextMarker",
+            )
+            .await
+        })
+        .await
     }
 
     /// A blob-level request for `path`, built and authorized like
@@ -505,7 +531,7 @@ impl Backend for AzureBackend {
 fn configured(container: &str, vars: &Vars) -> MicrosoftAzureBuilder {
     let mut builder = match vars {
         Vars::Env => MicrosoftAzureBuilder::from_env(),
-        Vars::Map(_) => vars
+        Vars::Map { .. } => vars
             .config_entries::<AzureConfigKey>("AZURE_")
             .into_iter()
             .fold(MicrosoftAzureBuilder::new(), |b, (k, v)| {
@@ -770,6 +796,7 @@ mod tests {
             let path = ObjectPath::from_url_path(url.path()).expect("path");
             Resolved {
                 backend: Arc::clone(&backend),
+                registry: 0,
                 loc: Location { url, path },
             }
         };
@@ -1137,6 +1164,7 @@ mod tests {
             let path = ObjectPath::from_url_path(url.path()).expect("path");
             Resolved {
                 backend: Arc::new(backend),
+                registry: 0,
                 loc: Location { url, path },
             }
         };
@@ -1246,5 +1274,68 @@ mod tests {
             .await;
         assert!(!done.expect("refused"));
         assert!(stub.requests().is_empty());
+    }
+
+    #[cfg(feature = "gui")]
+    mod list_buckets {
+        use super::*;
+        use crate::backend::stub::Request;
+
+        fn page(names: &[&str], marker: &str) -> Reply {
+            let containers = names
+                .iter()
+                .map(|n| format!("<Container><Name>{n}</Name><Properties /></Container>"))
+                .collect::<Vec<_>>()
+                .concat();
+            let marker = if marker.is_empty() {
+                "<NextMarker />".to_owned()
+            } else {
+                format!("<NextMarker>{marker}</NextMarker>")
+            };
+            Reply::new(
+                200,
+                format!(
+                    "\u{feff}<?xml version=\"1.0\"?><EnumerationResults ServiceEndpoint=\"e\">\
+                     <Prefix /><Containers>{containers}</Containers>{marker}</EnumerationResults>"
+                ),
+            )
+        }
+
+        async fn list(replies: Vec<Reply>) -> (Result<Vec<String>>, Vec<Request>) {
+            let stub = serve(replies).await;
+            let endpoint = format!("{}/acct", stub.base);
+            let result = backend(&[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
+                ("AZURE_STORAGE_ENDPOINT", &endpoint),
+                ("AZURE_ALLOW_HTTP", "true"),
+            ])
+            .list_buckets()
+            .await;
+            (result, stub.requests())
+        }
+
+        #[tokio::test]
+        async fn pages_are_followed_and_the_names_sorted() {
+            let (names, requests) = list(vec![
+                page(&["zeta", "alpha"], "1!8!Zm9v/+=="),
+                page(&["mid"], ""),
+            ])
+            .await;
+            assert_eq!(names.expect("list"), ["alpha", "mid", "zeta"]);
+            assert_eq!(requests[0].line, "GET /acct/?comp=list HTTP/1.1");
+            assert_eq!(
+                requests[1].line,
+                "GET /acct/?comp=list&marker=1%218%21Zm9v%2F%2B%3D%3D HTTP/1.1"
+            );
+            assert!(
+                requests[0]
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: sharedkey acct:"),
+                "{}",
+                requests[0].headers
+            );
+        }
     }
 }

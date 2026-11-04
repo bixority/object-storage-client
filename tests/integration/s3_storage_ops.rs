@@ -4,6 +4,8 @@
 //! `cargo test --test integration -- --ignored`.
 
 use crate::common::{BUCKET, garage_client, unique_prefix};
+#[cfg(feature = "gui")]
+use crate::common::{assert_root_lists, unique_bucket};
 use object_storage_client::{Error, SignMethod, SignOptions};
 use std::time::Duration;
 
@@ -89,4 +91,16 @@ async fn test_s3_presigned_put_with_bound_headers() -> Result<(), Box<dyn std::e
     client.delete(&file_url).await?;
 
     Ok(())
+}
+
+/// A provider root lists the account's buckets.
+#[cfg(feature = "gui")]
+#[tokio::test]
+#[ignore = "needs a container runtime (docker or podman)"]
+async fn test_s3_provider_root_lists_buckets() -> Result<(), Box<dyn std::error::Error>> {
+    let client = garage_client();
+    let (a, b) = (unique_bucket(), unique_bucket());
+    client.create_bucket(&a).await?;
+    client.create_bucket(&b).await?;
+    assert_root_lists(&client, "s3://", &[&a, &b]).await
 }

@@ -127,11 +127,75 @@ async fn list_page_error_is_display_text() {
     assert!(!err.chars().any(char::is_control), "{err:?}");
 }
 
+/// Two clients that share nothing, as two connections do.
+fn two_clients() -> (ObjectStorageClient, ObjectStorageClient) {
+    (
+        ObjectStorageClient::isolated(std::collections::HashMap::default()),
+        ObjectStorageClient::isolated(std::collections::HashMap::default()),
+    )
+}
+
+#[tokio::test]
+async fn folders_are_listed_through_the_source_and_checked_through_the_destination() {
+    let (from, to) = two_clients();
+    for (client, keys) in [
+        (&from, ["f/1", "f/2"].as_slice()),
+        (&to, ["f/1"].as_slice()),
+    ] {
+        client.preload_store("s3://b/", Arc::new(object_store::memory::InMemory::new()));
+        for key in keys {
+            client
+                .put(&format!("s3://b/{key}"), key.as_bytes().to_vec())
+                .await
+                .expect("put");
+        }
+    }
+    let at = Location::parse("s3://b/").expect("parses");
+    let plan = plan(&from, &to, batch(OpKind::Copy, &at, vec![folder("f")], &at)).await;
+    let exists: Vec<_> = plan
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Transfer { rel, exists, .. } => (rel.as_str(), *exists),
+            other => panic!("unexpected item {other:?}"),
+        })
+        .collect();
+    assert_eq!(exists, [("f/1", Some(true)), ("f/2", Some(false))]);
+    // A move onto the same name through two clients is refused, source kept.
+    let moved = Plan {
+        kind: OpKind::Move,
+        ..plan.clone()
+    };
+    let outcome = execute(
+        &from,
+        &to,
+        moved,
+        OnExisting::Overwrite,
+        &Progress::default(),
+        &quiet,
+    )
+    .await;
+    assert_eq!((outcome.done, outcome.failures.len()), (0, 2));
+    assert!(from.exists("s3://b/f/1").await.expect("exists"));
+    let outcome = execute(
+        &from,
+        &to,
+        plan,
+        OnExisting::Overwrite,
+        &Progress::default(),
+        &quiet,
+    )
+    .await;
+    assert_eq!((outcome.done, outcome.failures), (2, vec![]));
+    assert_eq!(to.get("s3://b/f/2").await.expect("get").as_ref(), b"f/2");
+}
+
 #[tokio::test]
 async fn plan_expands_folders() {
     let (_dir, src, dst) = fixture();
     let client = ObjectStorageClient::new();
     let plan = plan(
+        &client,
         &client,
         batch(OpKind::Copy, &src, vec![folder("a"), object("b.txt")], &dst),
     )
@@ -167,6 +231,7 @@ async fn plan_marks_existing_destinations() {
     let client = ObjectStorageClient::new();
     let plan = plan(
         &client,
+        &client,
         batch(OpKind::Copy, &src, vec![folder("a"), object("b.txt")], &dst),
     )
     .await;
@@ -187,7 +252,7 @@ async fn plan_rename_targets_new_name() {
     let client = ObjectStorageClient::new();
     let mut renaming = batch(OpKind::Rename, &src, vec![folder("a")], &src);
     renaming.rename_to = Some("z".to_owned());
-    let plan = plan(&client, renaming).await;
+    let plan = plan(&client, &client, renaming).await;
     let dsts: Vec<_> = transfers(&plan)
         .into_iter()
         .map(|(_, dst, _)| dst)
@@ -207,6 +272,7 @@ async fn plan_delete_has_no_io() {
     let src = loc(&dir.path().join("missing"));
     let client = ObjectStorageClient::new();
     let plan = plan(
+        &client,
         &client,
         batch(OpKind::Delete, &src, vec![folder("f"), object("o")], &src),
     )
@@ -234,6 +300,7 @@ async fn execute_copies_and_skips() {
     let client = ObjectStorageClient::new();
     let plan = plan(
         &client,
+        &client,
         batch(OpKind::Copy, &src, vec![folder("a"), object("b.txt")], &dst),
     )
     .await;
@@ -245,7 +312,7 @@ async fn execute_copies_and_skips() {
             .push((processed, total, current.to_owned()));
     };
     let progress = Progress::default();
-    let outcome = execute(&client, plan, OnExisting::Skip, &progress, &notify).await;
+    let outcome = execute(&client, &client, plan, OnExisting::Skip, &progress, &notify).await;
     assert_eq!(outcome.done, 2);
     assert!(!outcome.cancelled);
     assert_eq!(outcome.failures, []);
@@ -266,6 +333,7 @@ async fn execute_collects_failures_and_continues() {
     let client = ObjectStorageClient::new();
     let mut plan = plan(
         &client,
+        &client,
         batch(OpKind::Copy, &src, vec![object("b.txt"), folder("a")], &dst),
     )
     .await;
@@ -279,7 +347,15 @@ async fn execute_collects_failures_and_continues() {
         exists: Some(false),
     });
     let progress = Progress::default();
-    let outcome = execute(&client, plan, OnExisting::Overwrite, &progress, &quiet).await;
+    let outcome = execute(
+        &client,
+        &client,
+        plan,
+        OnExisting::Overwrite,
+        &progress,
+        &quiet,
+    )
+    .await;
     assert_eq!(outcome.done, 2);
     assert_eq!(outcome.failures.len(), 1);
     assert_eq!(outcome.failures[0].name, "gone");
@@ -311,7 +387,15 @@ async fn execute_lists_seeded_plan_failures_first() {
         name: "planned".to_owned(),
         error: "listing failed".to_owned(),
     }]);
-    let outcome = execute(&client, plan, OnExisting::Overwrite, &progress, &quiet).await;
+    let outcome = execute(
+        &client,
+        &client,
+        plan,
+        OnExisting::Overwrite,
+        &progress,
+        &quiet,
+    )
+    .await;
     let names: Vec<_> = outcome.failures.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, vec!["planned", "gone"]);
     assert_eq!(outcome.done, 0);
@@ -321,8 +405,14 @@ async fn execute_lists_seeded_plan_failures_first() {
 async fn move_folder_removes_sources() {
     let (dir, src, dst) = fixture();
     let client = ObjectStorageClient::new();
-    let plan = plan(&client, batch(OpKind::Move, &src, vec![folder("a")], &dst)).await;
+    let plan = plan(
+        &client,
+        &client,
+        batch(OpKind::Move, &src, vec![folder("a")], &dst),
+    )
+    .await;
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -344,6 +434,7 @@ async fn delete_folder_and_object() {
     let client = ObjectStorageClient::new();
     let plan = plan(
         &client,
+        &client,
         batch(
             OpKind::Delete,
             &src,
@@ -353,6 +444,7 @@ async fn delete_folder_and_object() {
     )
     .await;
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -378,7 +470,12 @@ async fn copy_folder_with_awkward_names() {
     let src = loc(&dir.path().join("src"));
     let dst = loc(&dir.path().join("dst"));
     let client = ObjectStorageClient::new();
-    let plan = plan(&client, batch(OpKind::Copy, &src, vec![folder("f")], &dst)).await;
+    let plan = plan(
+        &client,
+        &client,
+        batch(OpKind::Copy, &src, vec![folder("f")], &dst),
+    )
+    .await;
     assert_eq!(plan.failures, []);
     let mut rels: Vec<_> = transfers(&plan)
         .into_iter()
@@ -387,6 +484,7 @@ async fn copy_folder_with_awkward_names() {
     rels.sort();
     assert_eq!(rels, vec!["f/a b", "f/c%d", "f/é#"]);
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -424,10 +522,12 @@ async fn encrypted_copy_round_trips() {
         .expect("put");
     let plan = plan(
         &client,
+        &client,
         batch(OpKind::Copy, &src, vec![object("s.bin")], &dst),
     )
     .await;
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -460,7 +560,11 @@ fn futures_are_send() {
     let dir = Location::parse("file:///nowhere/").expect("parses");
     let progress = Progress::default();
     send(&list_page(&client, &dir, None));
-    send(&plan(&client, batch(OpKind::Copy, &dir, vec![], &dir)));
+    send(&plan(
+        &client,
+        &client,
+        batch(OpKind::Copy, &dir, vec![], &dir),
+    ));
     let empty = Plan {
         kind: OpKind::Copy,
         items: vec![],
@@ -468,6 +572,7 @@ fn futures_are_send() {
         failures: vec![],
     };
     send(&execute(
+        &client,
         &client,
         empty,
         OnExisting::Skip,
@@ -482,6 +587,7 @@ async fn plan_failed_check_counts_as_existing() {
     let dst = Location::parse("http://127.0.0.1:1/d/").expect("parses");
     let client = ObjectStorageClient::new();
     let plan = plan(
+        &client,
         &client,
         batch(OpKind::Copy, &src, vec![object("b.txt")], &dst),
     )
@@ -501,7 +607,12 @@ async fn plan_failed_check_counts_as_existing() {
 async fn plan_rejects_dot_segment_names() {
     let (_dir, src, dst) = fixture();
     let client = ObjectStorageClient::new();
-    let plan = plan(&client, batch(OpKind::Copy, &src, vec![folder("..")], &dst)).await;
+    let plan = plan(
+        &client,
+        &client,
+        batch(OpKind::Copy, &src, vec![folder("..")], &dst),
+    )
+    .await;
     assert_eq!(plan.items, []);
     assert_eq!(
         plan.failures,
@@ -573,12 +684,14 @@ mod symlinks {
         let client = ObjectStorageClient::new();
         let plan = plan(
             &client,
+            &client,
             batch(OpKind::Delete, &src, vec![link("data")], &src),
         )
         .await;
         assert_eq!(plan.failures, []);
         assert!(matches!(plan.items.as_slice(), [Item::DeleteObject { .. }]));
         let outcome = execute(
+            &client,
             &client,
             plan,
             OnExisting::Overwrite,
@@ -598,6 +711,7 @@ mod symlinks {
         let client = ObjectStorageClient::new();
         let plan = plan(
             &client,
+            &client,
             batch(OpKind::Copy, &src, vec![folder("proj")], &dst),
         )
         .await;
@@ -605,6 +719,7 @@ mod symlinks {
         let rels: Vec<_> = transfers(&plan).into_iter().map(|t| t.2).collect();
         assert_eq!(rels, ["proj/real.txt"]);
         execute(
+            &client,
             &client,
             plan,
             OnExisting::Overwrite,
@@ -624,11 +739,13 @@ mod symlinks {
         let client = ObjectStorageClient::new();
         let plan = plan(
             &client,
+            &client,
             batch(OpKind::Move, &src, vec![folder("proj")], &dst),
         )
         .await;
         assert_eq!(plan.items.len(), 1, "{plan:?}");
         execute(
+            &client,
             &client,
             plan,
             OnExisting::Overwrite,
@@ -648,9 +765,10 @@ mod symlinks {
         let client = ObjectStorageClient::new();
         let mut renaming = batch(OpKind::Rename, &src, vec![folder("proj")], &src);
         renaming.rename_to = Some("proj2".to_owned());
-        let plan = plan(&client, renaming).await;
+        let plan = plan(&client, &client, renaming).await;
         assert_eq!(plan.items.len(), 1, "{plan:?}");
         execute(
+            &client,
             &client,
             plan,
             OnExisting::Overwrite,
@@ -668,6 +786,7 @@ mod symlinks {
         let (dir, src, dst) = linked();
         let client = ObjectStorageClient::new();
         let plan = plan(
+            &client,
             &client,
             batch(
                 OpKind::Copy,
@@ -687,6 +806,7 @@ mod symlinks {
         assert_eq!(plan.items.len(), 1);
         execute(
             &client,
+            &client,
             plan,
             OnExisting::Overwrite,
             &Progress::default(),
@@ -703,6 +823,7 @@ mod symlinks {
         let other = Location::parse("s3://bucket/").expect("parses");
         let plan = plan(
             &ObjectStorageClient::new(),
+            &ObjectStorageClient::new(),
             batch(OpKind::Move, &src, vec![link("data")], &other),
         )
         .await;
@@ -714,7 +835,12 @@ mod symlinks {
     async fn a_selected_link_moved_to_a_file_folder_is_renamed() {
         let (dir, src, dst) = linked();
         let client = ObjectStorageClient::new();
-        let plan = plan(&client, batch(OpKind::Move, &src, vec![link("data")], &dst)).await;
+        let plan = plan(
+            &client,
+            &client,
+            batch(OpKind::Move, &src, vec![link("data")], &dst),
+        )
+        .await;
         assert_eq!(plan.failures, []);
         assert!(matches!(
             plan.items.as_slice(),
@@ -724,6 +850,7 @@ mod symlinks {
             }]
         ));
         let outcome = execute(
+            &client,
             &client,
             plan,
             OnExisting::Overwrite,
@@ -743,9 +870,15 @@ mod symlinks {
         let (dir, src, dst) = linked();
         write(&dir.path().join("dst/data"), "mine");
         let client = ObjectStorageClient::new();
-        let plan = plan(&client, batch(OpKind::Move, &src, vec![link("data")], &dst)).await;
+        let plan = plan(
+            &client,
+            &client,
+            batch(OpKind::Move, &src, vec![link("data")], &dst),
+        )
+        .await;
         assert_eq!(plan.existing(), 1);
         let outcome = execute(
+            &client,
             &client,
             plan,
             OnExisting::Skip,
@@ -764,10 +897,16 @@ mod symlinks {
         let existing = dir.path().join("dst/data");
         std::os::unix::fs::symlink(dir.path().join("nowhere"), &existing).expect("link");
         let client = ObjectStorageClient::new();
-        let plan = plan(&client, batch(OpKind::Move, &src, vec![link("data")], &dst)).await;
+        let plan = plan(
+            &client,
+            &client,
+            batch(OpKind::Move, &src, vec![link("data")], &dst),
+        )
+        .await;
         // `head` would follow the dangling link and see nothing there.
         assert_eq!(plan.existing(), 1);
         let outcome = execute(
+            &client,
             &client,
             plan,
             OnExisting::Skip,
@@ -789,9 +928,10 @@ mod symlinks {
         let client = ObjectStorageClient::new();
         let mut renaming = batch(OpKind::Rename, &src, vec![link("data")], &src);
         renaming.rename_to = Some("moved".to_owned());
-        let plan = plan(&client, renaming).await;
+        let plan = plan(&client, &client, renaming).await;
         assert_eq!(plan.failures, []);
         let outcome = execute(
+            &client,
             &client,
             plan,
             OnExisting::Overwrite,
@@ -812,6 +952,7 @@ async fn plan_carries_the_listed_size() {
     let (_dir, src, dst) = fixture();
     let client = ObjectStorageClient::new();
     let plan = plan(
+        &client,
         &client,
         batch(OpKind::Copy, &src, vec![folder("a"), object("b.txt")], &dst),
     )
@@ -844,7 +985,7 @@ async fn plan_caps_the_total_across_folders() {
     let client = ObjectStorageClient::new();
     let both = || batch(OpKind::Move, &src, vec![folder("f"), folder("g")], &dst);
     // Each folder fits on its own; the two together do not.
-    let plan = plan_with(&client, both(), 3).await;
+    let plan = plan_with(&client, &client, both(), 3).await;
     assert_eq!(plan.items, []);
     assert_eq!(plan.failures.len(), 1);
     assert_eq!(plan.failures[0].name, src.display());
@@ -853,7 +994,7 @@ async fn plan_caps_the_total_across_folders() {
         "more than 3 objects; select a deeper folder"
     );
     // Exactly at the cap is fine.
-    let plan = plan_with(&client, both(), 4).await;
+    let plan = plan_with(&client, &client, both(), 4).await;
     assert_eq!(plan.failures, []);
     assert_eq!(plan.items.len(), 4);
 }
@@ -951,10 +1092,16 @@ async fn folder_markers_are_skipped_not_failed() {
         .expect("put");
     let src = Location::parse("s3://b/").expect("parses");
     let dst = Location::parse("s3://b/q/").expect("parses");
-    let plan = plan(&client, batch(OpKind::Copy, &src, vec![folder("p")], &dst)).await;
+    let plan = plan(
+        &client,
+        &client,
+        batch(OpKind::Copy, &src, vec![folder("p")], &dst),
+    )
+    .await;
     // Both the marker and the object are planned.
     assert_eq!(plan.items.len(), 2);
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -1119,6 +1266,7 @@ async fn selected_objects_are_deleted_with_one_batched_call() {
     let (client, spy) = spy_client(SpyStore::default()).await;
     let outcome = execute(
         &client,
+        &client,
         deletes(&["a", "b", "c", "d"]),
         OnExisting::Overwrite,
         &Progress::default(),
@@ -1143,6 +1291,7 @@ async fn a_batched_delete_reports_each_failure_and_forgives_a_missing_key() {
     let calls = StdMutex::new(0_usize);
     let notify = |_: usize, _: usize, _: &str| *calls.lock().expect("lock") += 1;
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -1175,6 +1324,7 @@ async fn an_unresolvable_url_fails_alone_in_a_batched_delete() {
     );
     let outcome = execute(
         &client,
+        &client,
         plan,
         OnExisting::Overwrite,
         &Progress::default(),
@@ -1199,7 +1349,7 @@ async fn a_same_store_copy_does_not_head_the_source_for_its_size() {
             modified: chrono::DateTime::default(),
         })
         .to_vec();
-    let mut plan = plan(&client, batch(OpKind::Copy, &src, entries, &dst)).await;
+    let mut plan = plan(&client, &client, batch(OpKind::Copy, &src, entries, &dst)).await;
     let checks = SpyStore::count(&spy.heads);
     assert_eq!(checks, 4, "one existence check per destination");
     for item in &mut plan.items {
@@ -1208,6 +1358,7 @@ async fn a_same_store_copy_does_not_head_the_source_for_its_size() {
         }
     }
     let outcome = execute(
+        &client,
         &client,
         plan,
         OnExisting::Overwrite,
@@ -1236,7 +1387,7 @@ async fn folders_are_listed_together_and_planned_in_selection_order() {
     // Virtual time: the delays are tokio sleeps, so a busy machine cannot
     // make the timing flaky.
     let started = tokio::time::Instant::now();
-    let plan = plan(&client, batch(OpKind::Copy, &src, entries, &dst)).await;
+    let plan = plan(&client, &client, batch(OpKind::Copy, &src, entries, &dst)).await;
     assert_eq!(plan.failures, []);
     let rels: Vec<_> = plan
         .items

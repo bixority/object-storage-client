@@ -28,6 +28,8 @@ use crate::sign::{SignMethod, SignOptions};
 pub use aws_profile::AwsProfile;
 pub use body::FILE_BUF;
 pub use body::body_stream;
+#[cfg(feature = "gui")]
+pub use connector::http_client;
 use connector::{BoundedConnector, BucketClient, ClientCache, SharedConnector, Transport};
 pub use local::fs_path;
 use object_store::aws::AwsCredentialProvider;
@@ -75,32 +77,44 @@ impl Shared {
 /// Where backend configuration is read from.
 ///
 /// Production clients use [`Vars::Env`], the process environment. [`Vars::Map`]
-/// is an injected, fixed set of variables used by tests so parallel tests never
-/// share (or mutate) global environment state.
+/// is an injected, fixed set of variables, so clients never share (or mutate)
+/// global environment state. Such a client ignores the system proxy setting
+/// unless `system_proxy` is set.
 #[derive(Clone, Default)]
 pub enum Vars {
     #[default]
     Env,
-    Map(Arc<HashMap<String, String>>),
+    Map {
+        vars: Arc<HashMap<String, String>>,
+        system_proxy: bool,
+    },
 }
 
 impl Vars {
     /// An injected variable set, for tests.
     #[cfg(test)]
     pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
-        Self::Map(Arc::new(
+        Self::map(
             pairs
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
-        ))
+        )
+    }
+
+    /// An injected variable set that ignores the system proxy setting.
+    pub fn map(vars: HashMap<String, String>) -> Self {
+        Self::Map {
+            vars: Arc::new(vars),
+            system_proxy: false,
+        }
     }
 
     /// The value of `key`, if set.
     pub fn get(&self, key: &str) -> Option<String> {
         match self {
             Self::Env => std::env::var(key).ok(),
-            Self::Map(map) => map.get(key).cloned(),
+            Self::Map { vars, .. } => vars.get(key).cloned(),
         }
     }
 
@@ -111,7 +125,7 @@ impl Vars {
     fn config_entries<K: FromStr>(&self, prefix: &str) -> Vec<(K, String)> {
         match self {
             Self::Env => Vec::new(),
-            Self::Map(map) => map
+            Self::Map { vars, .. } => vars
                 .iter()
                 .filter(|(k, _)| k.starts_with(prefix))
                 .filter_map(|(k, v)| Some((k.to_ascii_lowercase().parse().ok()?, v.clone())))
@@ -382,8 +396,8 @@ pub async fn bucket_exists_from_response(
     }
 }
 
-/// The error for a bucket creation `what` that the provider answered with
-/// `status` and the error text `text`. HTTP 401 and 403 are [`Error::Denied`],
+/// The error for a bucket call `what` (creation, listing) that the provider
+/// answered with `status` and the error text `text`. HTTP 401 and 403 are [`Error::Denied`],
 /// every other status [`Error::Generic`].
 pub fn create_failed(what: &str, status: reqwest::StatusCode, text: &str) -> Error {
     if matches!(status.as_u16(), 401 | 403) {
@@ -440,6 +454,188 @@ pub async fn read_document(mut response: reqwest::Response) -> Result<String> {
     }
     body.truncate(DOCUMENT_LIMIT);
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The name a backend gets when it is built only to list buckets. No request
+/// names it, and the backend is never cached or used for objects.
+#[cfg(feature = "gui")]
+const LISTING_ONLY: &str = "listing-only";
+
+/// The names of all buckets (S3, GCS) or containers (Azure) that the
+/// credentials for `scheme` can list, sorted. Reads configuration like
+/// [`build`].
+///
+/// # Errors
+///
+/// Returns an error if the scheme has no buckets, the backend cannot be built,
+/// or the provider refuses or fails the listing (a refusal is
+/// [`Error::Denied`]).
+#[cfg(feature = "gui")]
+pub async fn list_buckets(
+    scheme: &str,
+    vars: &Vars,
+    profile: Option<&AwsProfile>,
+    shared: &Shared,
+) -> Result<Vec<String>> {
+    let host = Some(LISTING_ONLY);
+    match scheme {
+        "s3" => {
+            s3::S3Backend::with_shared(host, vars, profile, shared)?
+                .list_buckets()
+                .await
+        }
+        "gs" | "gcs" => {
+            gcs::GcsBackend::with_shared(scheme, host, vars, shared)?
+                .list_buckets()
+                .await
+        }
+        "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
+            azure::AzureBackend::with_shared(scheme, host, vars, shared)?
+                .list_buckets()
+                .await
+        }
+        _ => Err(Error::UnsupportedScheme(scheme.to_string())),
+    }
+}
+
+/// The most of a listing answer that [`read_listing`] keeps.
+#[cfg(feature = "gui")]
+const LISTING_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The body of a successful listing `response` (else an error naming `what`),
+/// at most 16 MiB.
+///
+/// # Errors
+///
+/// Returns an error if reading the body fails or it is longer than the limit.
+#[cfg(feature = "gui")]
+pub async fn read_listing(mut response: reqwest::Response, what: &str) -> Result<Vec<u8>> {
+    let status = response.status();
+    if !status.is_success() {
+        let text = error_body(response).await;
+        return Err(create_failed(what, status, &text));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| request_failed("Reading the answer", e))?
+    {
+        if body.len() + chunk.len() > LISTING_LIMIT {
+            return Err(Error::Generic("the bucket listing is too large".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// One page of an XML bucket listing: the `Name` texts and the text of
+/// `next_tag` (`None` when empty or absent).
+///
+/// # Errors
+///
+/// As [`read_listing`], or if sending the request fails.
+#[cfg(feature = "gui")]
+async fn xml_listing_page(
+    http: &reqwest::Client,
+    request: HttpRequest,
+    what: &str,
+    next_tag: &str,
+) -> Result<(Vec<String>, Option<String>)> {
+    let body = read_listing(send_signed(http, request).await?, what).await?;
+    let xml = String::from_utf8_lossy(&body);
+    let next = xml_texts(&xml, next_tag).pop().filter(|t| !t.is_empty());
+    Ok((xml_texts(&xml, "Name"), next))
+}
+
+/// Collects the names of all pages, sorted. `fetch` gets the token of the page
+/// to read (`None` for the first) and returns its names and the next token.
+///
+/// # Errors
+///
+/// Returns the error of `fetch`, or one if a page repeats its own token.
+#[cfg(feature = "gui")]
+async fn collect_pages<F, Fut>(mut fetch: F) -> Result<Vec<String>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<String>, Option<String>)>>,
+{
+    let mut names = Vec::new();
+    let mut token = None;
+    loop {
+        let (page, next) = fetch(token.clone()).await?;
+        names.extend(page);
+        match next {
+            None => break,
+            Some(next) if token.as_ref() == Some(&next) => {
+                return Err(Error::Generic("the bucket listing does not advance".into()));
+            }
+            Some(next) => token = Some(next),
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// `text` as one path segment or query value: everything but unreserved
+/// characters is percent-encoded.
+pub fn encode(text: &str) -> String {
+    percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// The text of every `<tag>` element of `xml` (one without attributes), in
+/// document order, with the predefined and numeric entities resolved. An empty
+/// element (`<tag />`) has no text and is skipped.
+#[cfg(feature = "gui")]
+fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut texts = Vec::new();
+    let mut rest = xml;
+    while let Some((_, after)) = rest.split_once(&open) {
+        let Some((text, tail)) = after.split_once(&close) else {
+            break;
+        };
+        texts.push(xml_unescape(text));
+        rest = tail;
+    }
+    texts
+}
+
+/// `text` with `&lt;`, `&gt;`, `&amp;`, `&quot;`, `&apos;` and numeric
+/// character references resolved; any other `&` is kept.
+#[cfg(feature = "gui")]
+fn xml_unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((before, after)) = rest.split_once('&') {
+        out.push_str(before);
+        let entity = after.split_once(';').and_then(|(name, tail)| {
+            let c = match name {
+                "lt" => '<',
+                "gt" => '>',
+                "amp" => '&',
+                "quot" => '"',
+                "apos" => '\'',
+                _ => {
+                    let digits = name.strip_prefix('#')?;
+                    let code = digits
+                        .strip_prefix(['x', 'X'])
+                        .map_or_else(|| digits.parse(), |hex| u32::from_str_radix(hex, 16));
+                    char::from_u32(code.ok()?)?
+                }
+            };
+            Some((c, tail))
+        });
+        if let Some((c, tail)) = entity {
+            out.push(c);
+            rest = tail;
+        } else {
+            out.push('&');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// How many times a copy request is sent at most.
@@ -611,6 +807,17 @@ impl Backend for TestBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn xml_text_is_found_and_unescaped() {
+        let xml = "<a><Name>x&amp;y</Name><Name/><Name>&#x1F600;&#65;&bogus;&amp</Name><Name>cut";
+        assert_eq!(xml_texts(xml, "Name"), ["x&y", "\u{1F600}A&bogus;&amp"]);
+        assert_eq!(
+            xml_texts("<NextMarker />", "NextMarker"),
+            Vec::<String>::new()
+        );
+    }
 
     #[tokio::test]
     async fn transport_errors_never_carry_the_query() {

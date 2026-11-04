@@ -1,5 +1,20 @@
 # Upgrading
 
+## From 0.4.1 to 0.5.0
+
+### `osc-gui`
+
+- The `--profile`, `left` and `right` arguments are removed. Both panels start
+  on Local, the current directory. Pick a connection (an AWS profile, gcloud
+  configuration or Azure storage account) in the selector at the left of each
+  panel's address bar, then type the address. Scripts that passed those
+  arguments must drop them.
+- Buckets are now listed: a cloud connection opens at its root, which shows the
+  buckets as folders. Typing a bucket's URL still works.
+- The scheme of a typed address must match the panel's connection.
+- "Log in" on an AWS SSO error banner writes `~/.aws/sso/cache`, like the AWS
+  CLI, so osc-gui now writes that one file.
+
 ## From 0.3.0 to 0.4.0
 
 This release contains breaking changes; read every section below before

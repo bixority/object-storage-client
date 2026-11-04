@@ -4,6 +4,8 @@
 
 use crate::common::azurite::azurite_client;
 use crate::common::provider::{Provider, base};
+#[cfg(feature = "gui")]
+use crate::common::{assert_root_lists, unique_container};
 use crate::support::TestResult;
 use object_storage_client::{SignMethod, SignOptions};
 use std::time::Duration;
@@ -50,4 +52,16 @@ async fn test_azure_metadata_content_type() -> TestResult {
     assert_eq!(meta.content_type.as_deref(), Some("application/x-test"));
     assert!(meta.e_tag.is_some());
     Ok(())
+}
+
+/// A provider root lists the account's containers.
+#[cfg(feature = "gui")]
+#[tokio::test]
+#[ignore = "needs a container runtime (docker or podman)"]
+async fn test_azure_provider_root_lists_containers() -> TestResult {
+    let client = azurite_client();
+    let (a, b) = (unique_container(), unique_container());
+    client.create_bucket(&a).await?;
+    client.create_bucket(&b).await?;
+    assert_root_lists(&client, "az://", &[&a, &b]).await
 }

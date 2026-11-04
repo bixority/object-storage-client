@@ -48,6 +48,8 @@ pub(crate) mod sealed {
     pub struct Resolved {
         pub backend: Arc<dyn Backend>,
         pub loc: Location,
+        /// Identity of the registry (client) that resolved it.
+        pub registry: usize,
     }
 
     /// The seam methods of a [`Codec`](super::Codec).
@@ -235,7 +237,7 @@ impl Plain {
     ) -> Result<()> {
         // A copy or move onto itself is a no-op: a rename of an object onto
         // itself is copy-then-delete on cloud stores and would destroy it.
-        if same_object(&src.loc, &dst.loc).await {
+        if same_object(src, dst).await {
             return Ok(());
         }
         refuse_special_source(src).await?;
@@ -524,28 +526,30 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 /// Whether two locations carry the same name in the same store, without
-/// looking at the file system.
+/// looking at the file system or the registry.
 pub(crate) fn same_name(a: &Location, b: &Location) -> bool {
     same_store(&a.url, &b.url) && a.path == b.path
 }
 
-/// Whether two locations name the same object: the same path in the same
-/// store, or, for `file`, two paths that reach one existing file.
-/// The file system is read on a blocking thread.
-pub(crate) async fn same_object(a: &Location, b: &Location) -> bool {
-    if !same_store(&a.url, &b.url) {
+/// Whether two resolved locations name the same object: the same path in the
+/// same store of one registry, or, for `file`, two paths that reach one
+/// existing file. The file system is read on a blocking thread.
+pub(crate) async fn same_object(a: &Resolved, b: &Resolved) -> bool {
+    // Two registries (clients) may hold different credentials or reach
+    // different stores under the same URL.
+    if a.registry != b.registry || !same_store(&a.loc.url, &b.loc.url) {
         return false;
     }
-    if a.path == b.path {
+    if a.loc.path == b.loc.path {
         return true;
     }
-    if a.url.scheme() != "file" {
+    if a.loc.url.scheme() != "file" {
         return false;
     }
     // A path with no file system mapping is never the same object.
     let (Ok(a), Ok(b)) = (
-        crate::backend::fs_path(&a.path),
-        crate::backend::fs_path(&b.path),
+        crate::backend::fs_path(&a.loc.path),
+        crate::backend::fs_path(&b.loc.path),
     ) else {
         return false;
     };
@@ -754,6 +758,8 @@ mod tests {
                 .expect("file URL")
                 .to_string()
         };
+        let (_, backend) = memory_backend();
+        let at = |url: &str| resolved(&backend, url);
         let x = file("x");
         let (a, b) = (at(&x), at(&x.replacen("file://", "file://127.0.0.1", 1)));
         assert!(same_object(&a, &b).await);
@@ -860,7 +866,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn equal_urls_on_two_backends_are_not_the_same_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let url = url::Url::from_file_path(tmp.path().join("x"))
+            .expect("file URL")
+            .to_string();
+        for url in [url.as_str(), "s3://b/x"] {
+            let (one, two) = (memory_backend().1, memory_backend().1);
+            let (a, b) = (resolved(&one, url), resolved(&two, url));
+            assert!(!same_object(&a, &b).await, "{url}");
+            assert!(same_object(&a, &resolved(&one, url)).await, "{url}");
+        }
+        // Aliases on two registries are two objects too.
+        let (one, two) = (memory_backend().1, memory_backend().1);
+        let (a, b) = (resolved(&one, "gs://b/x"), resolved(&two, "gcs://b/x"));
+        assert!(!same_object(&a, &b).await);
+    }
+
+    #[tokio::test]
     async fn aliased_urls_name_the_same_object() {
+        let (_, backend) = memory_backend();
+        let at = |url: &str| resolved(&backend, url);
         assert!(same_object(&at("gs://b/x"), &at("gcs://b/x")).await);
         assert!(!same_object(&at("gs://b/x"), &at("gcs://b/y")).await);
     }
@@ -868,6 +894,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn file_paths_through_a_symlink_are_the_same_object() {
+        let (_, backend) = memory_backend();
+        let at = |url: &str| resolved(&backend, url);
         let dir = tempfile::tempdir().expect("tempdir");
         let real = dir.path().join("real");
         std::fs::create_dir(&real).expect("mkdir");
@@ -883,9 +911,11 @@ mod tests {
     use crate::codec::sealed::CodecImpl as _;
     use object_store::memory::InMemory;
 
+    /// One backend stands for one registry.
     fn resolved(backend: &Arc<dyn Backend>, url: &str) -> Resolved {
         Resolved {
             backend: Arc::clone(backend),
+            registry: Arc::as_ptr(backend).cast::<()>() as usize,
             loc: at(url),
         }
     }
@@ -916,6 +946,7 @@ mod tests {
         let src = resolved(&memory, "test://b/a");
         let dst = Resolved {
             backend: local,
+            registry: 0,
             loc: Location { url, path },
         };
 

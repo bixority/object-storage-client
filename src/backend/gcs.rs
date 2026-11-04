@@ -2,8 +2,10 @@
 
 use super::{
     Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response, create_failed,
-    default_timeouts, error_body, request_failed, send_with_retry,
+    default_timeouts, encode, error_body, request_failed, send_with_retry,
 };
+#[cfg(feature = "gui")]
+use super::{collect_pages, read_listing};
 use crate::client::{Error, Result};
 use crate::sign::{SignMethod, SignOptions};
 use bytes::Bytes;
@@ -117,14 +119,58 @@ impl GcsBackend {
 
     /// `buckets.get` (`GET /storage/v1/b/<bucket>`) with the bearer token.
     async fn get_bucket(&self, bearer: &str) -> Result<reqwest::Response> {
-        let encoded_bucket: String =
-            percent_encoding::utf8_percent_encode(&self.bucket, percent_encoding::NON_ALPHANUMERIC)
-                .collect();
-        let uri = format!("{}/storage/v1/b/{encoded_bucket}", self.base_url);
+        let uri = format!("{}/storage/v1/b/{}", self.base_url, encode(&self.bucket));
         with_bearer(self.http.get()?.get(uri), &self.base_url, bearer)
             .send()
             .await
             .map_err(|e| request_failed("GCS buckets.get request", e))
+    }
+
+    /// `buckets.list` for the project: the names of all its buckets, sorted,
+    /// following `nextPageToken`.
+    #[cfg(feature = "gui")]
+    pub async fn list_buckets(&self) -> Result<Vec<String>> {
+        let project = self.project.as_deref().ok_or_else(|| {
+            Error::Generic(
+                "listing GCS buckets requires GOOGLE_CLOUD_PROJECT (or GCS_PROJECT_ID); \
+                 a bucket can still be opened by its URL, gs://bucket"
+                    .into(),
+            )
+        })?;
+        let bearer = self.bearer().await?;
+        collect_pages(|token| {
+            let (bearer, project) = (&bearer, project);
+            async move {
+                let mut uri = format!(
+                    "{}/storage/v1/b?project={}&fields=items/name,nextPageToken",
+                    self.base_url,
+                    encode(project)
+                );
+                if let Some(token) = token {
+                    uri = format!("{uri}&pageToken={}", encode(&token));
+                }
+                let response = with_bearer(self.http.get()?.get(uri), &self.base_url, bearer)
+                    .send()
+                    .await
+                    .map_err(|e| request_failed("GCS buckets.list request", e))?;
+                let body = read_listing(response, "GCS buckets.list").await?;
+                let page: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+                    Error::Generic("GCS buckets.list answered a document that is not JSON".into())
+                })?;
+                let names = page["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item["name"].as_str().map(str::to_owned))
+                    .collect();
+                let next = page["nextPageToken"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned);
+                Ok((names, next))
+            }
+        })
+        .await
     }
 
     /// `source` as the backend an `objects.rewrite` into this bucket may read
@@ -146,9 +192,6 @@ impl GcsBackend {
     /// is the first item when it is in the project. Anything else, a failed
     /// answer included, is an error.
     async fn check_owned(&self, bearer: &str, project: &str) -> Result<()> {
-        let encode = |s: &str| -> String {
-            percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).collect()
-        };
         let uri = format!(
             "{}/storage/v1/b?project={}&prefix={}&maxResults=1&fields=items/name",
             self.base_url,
@@ -185,12 +228,6 @@ impl GcsBackend {
 /// destination object, because GCS creates it only when the rewrite is done.
 const REWRITE_CALLS_MAX: usize = 1000;
 
-/// `text` as one path segment or query value: everything but unreserved
-/// characters is percent-encoded.
-fn encode(text: &str) -> String {
-    percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
-}
-
 /// The most of a `buckets.list` answer that is read. A longer one is cut and
 /// then fails to parse. The request asks for one item, so a real answer is
 /// small; an emulator that ignores `maxResults` may send more.
@@ -215,7 +252,7 @@ const DEFAULT_BASE_URL: &str = "https://storage.googleapis.com";
 fn configured(bucket: &str, vars: &Vars) -> GoogleCloudStorageBuilder {
     let mut builder = match vars {
         Vars::Env => GoogleCloudStorageBuilder::from_env(),
-        Vars::Map(_) => vars
+        Vars::Map { .. } => vars
             .config_entries::<GoogleConfigKey>("GOOGLE_")
             .into_iter()
             .fold(GoogleCloudStorageBuilder::new(), |b, (k, v)| {
@@ -292,10 +329,7 @@ impl Backend for GcsBackend {
 
         let bearer = self.bearer().await?;
         let body = Bytes::from(format!("{{\"name\":\"{}\"}}", self.bucket));
-        let encoded_project: String =
-            percent_encoding::utf8_percent_encode(project, percent_encoding::NON_ALPHANUMERIC)
-                .collect();
-        let uri = format!("{}/storage/v1/b?project={encoded_project}", self.base_url);
+        let uri = format!("{}/storage/v1/b?project={}", self.base_url, encode(project));
 
         let request = self
             .http
@@ -950,5 +984,65 @@ mod tests {
         let (result, requests) = rewrite(vec![busy(), busy(), busy()], None).await;
         assert!(result.is_err());
         assert_eq!(requests.len(), 3);
+    }
+
+    #[cfg(feature = "gui")]
+    mod list_buckets {
+        use super::*;
+
+        fn backend(base: &str, extra: &[(&str, &str)]) -> GcsBackend {
+            let mut pairs = vec![("GCS_BASE_URL", base), ("GOOGLE_BEARER_TOKEN", "tok")];
+            pairs.extend_from_slice(extra);
+            GcsBackend::new("gs", Some("bkt"), &Vars::from_pairs(&pairs)).expect("build")
+        }
+
+        async fn list(replies: Vec<Reply>) -> (Result<Vec<String>>, Vec<Request>) {
+            let stub = serve(replies).await;
+            let result = backend(&stub.base, &[("GOOGLE_CLOUD_PROJECT", "my proj")])
+                .list_buckets()
+                .await;
+            (result, stub.requests())
+        }
+
+        #[tokio::test]
+        async fn pages_are_followed_and_the_names_sorted() {
+            let (names, requests) = list(vec![
+                Reply::new(
+                    200,
+                    r#"{"items":[{"name":"zeta"},{"name":"al\u0026pha"}],"nextPageToken":"p/1"}"#,
+                ),
+                Reply::new(200, "{\"items\":[{\"name\":\"mid\"}]}\n"),
+            ])
+            .await;
+            assert_eq!(names.expect("list"), ["al&pha", "mid", "zeta"]);
+            let query = "fields=items/name,nextPageToken";
+            assert_eq!(
+                requests[0].line,
+                format!("GET /storage/v1/b?project=my%20proj&{query} HTTP/1.1")
+            );
+            assert_eq!(
+                requests[1].line,
+                format!("GET /storage/v1/b?project=my%20proj&{query}&pageToken=p%2F1 HTTP/1.1")
+            );
+        }
+
+        #[tokio::test]
+        async fn no_buckets_is_an_empty_list() {
+            for body in ["{}", r#"{"items":[]}"#] {
+                let (names, _) = list(vec![Reply::new(200, body)]).await;
+                assert!(names.expect("list").is_empty(), "{body}");
+            }
+        }
+
+        #[tokio::test]
+        async fn without_a_project_no_request_is_sent() {
+            let stub = serve(vec![]).await;
+            let err = backend(&stub.base, &[])
+                .list_buckets()
+                .await
+                .expect_err("no project");
+            assert!(err.to_string().contains("GOOGLE_CLOUD_PROJECT"), "{err}");
+            assert!(stub.requests().is_empty());
+        }
     }
 }

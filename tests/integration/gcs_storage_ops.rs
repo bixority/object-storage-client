@@ -13,6 +13,8 @@
 //!   RSA service-account key, and the emulator setup uses an empty one
 //!   (`disable_oauth`), so there is nothing to sign or verify.
 
+#[cfg(feature = "gui")]
+use crate::common::assert_root_lists;
 use crate::common::gcs::{gcs_client, seed};
 use crate::common::unique_gcs_bucket;
 use crate::support::TestResult;
@@ -180,4 +182,14 @@ async fn test_gcs_xml_api_writes_are_rejected_by_the_emulator() -> TestResult {
         );
     }
     Ok(())
+}
+
+/// A provider root lists the project's buckets.
+#[cfg(feature = "gui")]
+#[tokio::test]
+#[ignore = "needs a container runtime (docker or podman)"]
+async fn test_gcs_provider_root_lists_buckets() -> TestResult {
+    let client = gcs_client();
+    let (a, b) = (new_bucket(&client).await?, new_bucket(&client).await?);
+    assert_root_lists(&client, "gs://", &[&a, &b]).await
 }

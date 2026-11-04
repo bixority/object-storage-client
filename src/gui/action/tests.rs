@@ -1,17 +1,42 @@
 use super::*;
 
 mod close;
+mod conn;
 mod jobs;
 mod nav;
+use crate::connection::{Provider, Source};
 use crate::gui::model::{Entry, Item, MAX_ENTRIES};
 use chrono::DateTime;
+use std::sync::Arc;
+
+fn local() -> Arc<Connection> {
+    Arc::new(Connection::local())
+}
+
+/// A connection with an S3 provider: `id` tells two of them apart.
+fn s3(id: &str) -> Arc<Connection> {
+    Arc::new(Connection {
+        id: id.to_owned(),
+        label: format!("AWS · {id}"),
+        provider: Provider::S3,
+        source: Source::Env,
+        login: None,
+    })
+}
+
+/// A state whose left panel is on the S3 connection `aws`.
+fn s3_state() -> AppState {
+    let mut s = state();
+    s.panels[0].connection = s3("aws");
+    s
+}
 
 fn loc(url: &str) -> Location {
     Location::parse(url).expect("test url parses")
 }
 
 fn state() -> AppState {
-    AppState::new(loc("file:///l/"), loc("file:///r/"), Encryption::Off).0
+    AppState::at(loc("file:///l/"), loc("file:///r/"), Encryption::Off)
 }
 
 fn obj(name: &str) -> Entry {
@@ -73,30 +98,32 @@ fn names(state: &AppState, side: Side) -> Vec<String> {
 }
 
 #[test]
-fn new_state_lists_both_panels() {
-    let (_, commands) = AppState::new(loc("file:///l/"), loc("file:///r/"), Encryption::Off);
+fn new_state_starts_both_panels_on_local_and_scans() {
+    let (s, commands) = AppState::new(Encryption::Off);
+    let here = Location::parse(".").expect("current directory");
+    let list = |side| Command::List {
+        side,
+        seq: 1,
+        conn: local(),
+        url: here.as_str().to_owned(),
+        token: None,
+    };
     assert_eq!(
         commands,
-        vec![
-            Command::List {
-                side: Side::Left,
-                seq: 1,
-                url: "file:///l/".to_owned(),
-                token: None
-            },
-            Command::List {
-                side: Side::Right,
-                seq: 1,
-                url: "file:///r/".to_owned(),
-                token: None
-            },
-        ]
+        vec![list(Side::Left), list(Side::Right), Command::Discover]
+    );
+    assert_eq!(s.connections, vec![local()]);
+    assert!(s.discovering && s.notes.is_empty());
+    assert!(
+        s.panels
+            .iter()
+            .all(|panel| *panel.connection == Connection::local())
     );
 }
 
 #[test]
 fn navigate_bumps_seq_and_lists() {
-    let mut s = state();
+    let mut s = s3_state();
     act(
         &mut s,
         Action::Select(Side::Left, SelectOp::Only(obj("x").key())),
@@ -105,6 +132,7 @@ fn navigate_bumps_seq_and_lists() {
     assert_eq!(
         commands,
         vec![Command::List {
+            conn: s3("aws"),
             side: Side::Left,
             seq: 2,
             url: "s3://b/p/".to_owned(),
@@ -156,6 +184,7 @@ fn load_more_appends_and_keeps_selection() {
     assert_eq!(
         commands,
         vec![Command::List {
+            conn: local(),
             side: Side::Left,
             seq: 1,
             url: "file:///l/".to_owned(),
@@ -251,9 +280,11 @@ fn first_page_error_clears() {
 }
 
 #[test]
-fn up_stops_at_root() {
-    let mut s = state();
+fn up_stops_at_the_provider_root() {
+    let mut s = s3_state();
     act(&mut s, Action::Navigate(Side::Left, "s3://b/".into()));
+    assert_eq!(act(&mut s, Action::Up(Side::Left)).len(), 1);
+    assert_eq!(s.panels[0].location, loc("s3://"));
     assert_eq!(act(&mut s, Action::Up(Side::Left)), vec![]);
     act(&mut s, Action::Navigate(Side::Left, "s3://b/p/q/".into()));
     let commands = act(&mut s, Action::Up(Side::Left));
@@ -369,13 +400,13 @@ fn assert_address_matches_after_error(s: &mut AppState, want: &Location) {
 
 #[test]
 fn address_text_follows_up_open_and_refresh() {
-    let mut s = state();
+    let mut s = s3_state();
     act(&mut s, Action::Navigate(Side::Left, "s3://b/p/q".into()));
     update(&mut s, page(Side::Left, 2, true, vec![dir("d")], None));
     act(&mut s, Action::Up(Side::Left));
     assert_address_matches_after_error(&mut s, &loc("s3://b/p/"));
 
-    let mut s = state();
+    let mut s = s3_state();
     act(&mut s, Action::Navigate(Side::Left, "s3://b/p/".into()));
     update(&mut s, page(Side::Left, 2, true, vec![dir("d")], None));
     act(&mut s, Action::Open(Side::Left, "d".into()));

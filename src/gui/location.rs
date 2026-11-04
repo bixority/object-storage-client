@@ -1,17 +1,9 @@
 //! The GUI's address model: always a folder URL.
 
 use super::display;
-use crate::registry::{child_url, origin, parse_url};
+use crate::registry::{child_url, is_bucket_scheme, origin, parse_url, provider_root};
 use percent_encoding::percent_decode_str;
 use url::Url;
-
-/// Whether `scheme` names a bucket or container store.
-fn is_bucket_scheme(scheme: &str) -> bool {
-    matches!(
-        scheme,
-        "s3" | "gs" | "gcs" | "az" | "wasb" | "wasbs" | "abfs" | "abfss"
-    )
-}
 
 /// Whether `segment` names an entry of its own: not empty, `.` or `..`.
 fn plain_segment(segment: &str) -> bool {
@@ -44,6 +36,17 @@ impl Location {
         Ok(Self { url })
     }
 
+    /// The URL scheme, lowercase.
+    pub(crate) fn scheme(&self) -> &str {
+        self.url.scheme()
+    }
+
+    /// Whether this is a provider root (`s3:///`), which lists the buckets or
+    /// containers of a connection.
+    pub(crate) fn is_provider_root(&self) -> bool {
+        provider_root(&self.url).is_some()
+    }
+
     /// The URL, for client calls.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -71,10 +74,17 @@ impl Location {
             && &bytes[2..] == b":/"
     }
 
-    /// The enclosing folder, or `None` at the root.
+    /// The enclosing folder, or `None` at the root. A bucket root's parent is
+    /// its provider root.
     pub(crate) fn parent(&self) -> Option<Self> {
-        if self.is_root() {
+        if self.is_provider_root() {
             return None;
+        }
+        if self.is_root() {
+            return is_bucket_scheme(self.url.scheme())
+                .then(|| Url::parse(&format!("{}:///", self.url.scheme())).ok())
+                .flatten()
+                .map(|url| Self { url });
         }
         let mut url = self.url.clone();
         let path = url.path().trim_end_matches('/');
@@ -102,6 +112,11 @@ impl Location {
     pub fn child_dir(&self, name: &str) -> Option<Self> {
         if !plain_segment(name) {
             return None;
+        }
+        if self.is_provider_root() {
+            // A bucket name is raw, as the listing gives it.
+            let url = Url::parse(&format!("{}://{name}/", self.url.scheme())).ok()?;
+            return (url.host_str() == Some(name)).then_some(Self { url });
         }
         // Built on the path, so it cannot fail: the segment is percent-encoded.
         let mut url = self.url.clone();
@@ -181,7 +196,38 @@ mod tests {
         let c = b.parent().expect("parent");
         assert_eq!(c.as_str(), "s3://b/");
         assert!(c.is_root());
-        assert_eq!(c.parent(), None);
+        assert!(!c.is_provider_root());
+        let root = c.parent().expect("provider root");
+        assert_eq!(root.as_str(), "s3:///");
+        assert_eq!(root.parent(), None);
+    }
+
+    #[test]
+    fn a_provider_root_is_a_location_that_opens_buckets() {
+        for (text, root) in [
+            ("s3://", "s3:///"),
+            ("gs:///", "gs:///"),
+            ("az://", "az:///"),
+        ] {
+            let at = loc(text);
+            assert_eq!(at.as_str(), root);
+            assert!(at.is_root() && at.is_provider_root());
+            assert_eq!(at.bucket(), None);
+            assert_eq!(at.parent(), None);
+        }
+        assert_eq!(loc("s3://").scheme(), "s3");
+        let bucket = loc("s3://").child_dir("My_bucket.1").expect("bucket");
+        assert_eq!(bucket.as_str(), "s3://My_bucket.1/");
+        assert_eq!(bucket.bucket().as_deref(), Some("My_bucket.1"));
+        assert_eq!(bucket.parent(), Some(loc("s3://")));
+        assert_eq!(
+            loc("gs://").child_dir("b").expect("bucket").as_str(),
+            "gs://b/"
+        );
+        assert_eq!(loc("s3://").child_dir("a/b"), None);
+        assert_eq!(loc("s3://").child_dir(".."), None);
+        assert!(!loc("file:///").is_provider_root());
+        assert_eq!(loc("file:///").parent(), None);
     }
 
     #[test]
@@ -251,8 +297,7 @@ mod tests {
             chain.push(up.as_str().to_owned());
             at = up;
         }
-        assert_eq!(chain, ["s3://b//p/", "s3://b//", "s3://b/"]);
-        assert!(at.is_root());
-        assert_eq!(at.bucket().as_deref(), Some("b"));
+        assert_eq!(chain, ["s3://b//p/", "s3://b//", "s3://b/", "s3:///"]);
+        assert!(at.is_provider_root());
     }
 }

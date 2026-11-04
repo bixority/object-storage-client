@@ -1,21 +1,24 @@
 //! Navigation, paging and selection rules.
 
 use super::{Command, Motion, SelectOp};
+use crate::gui::display;
 use crate::gui::location::Location;
 use crate::gui::model::{AppState, Entry, EntryKey, MAX_ENTRIES, Page, PanelState, Side};
+use std::sync::Arc;
 
 /// The listing command for `panel` at its current `seq`.
 pub(super) fn list(side: Side, panel: &PanelState, token: Option<String>) -> Command {
     Command::List {
         side,
         seq: panel.seq,
+        conn: Arc::clone(&panel.connection),
         url: panel.location.as_str().to_owned(),
         token,
     }
 }
 
 /// Starts a fresh listing of `location`.
-fn go(state: &mut AppState, side: Side, location: Location) -> Vec<Command> {
+pub(super) fn go(state: &mut AppState, side: Side, location: Location) -> Vec<Command> {
     let panel = &mut state.panels[side.index()];
     panel.seq += 1;
     panel.loading = true;
@@ -33,10 +36,22 @@ fn go(state: &mut AppState, side: Side, location: Location) -> Vec<Command> {
 }
 
 pub(super) fn navigate(state: &mut AppState, side: Side, text: &str) -> Vec<Command> {
-    match Location::parse(text) {
+    let panel = &mut state.panels[side.index()];
+    let parsed = Location::parse(text).and_then(|location| {
+        if panel.connection.provider.serves(location.scheme()) {
+            Ok(location)
+        } else {
+            Err(format!(
+                "{} cannot open `{}://` addresses: choose a matching connection in the list",
+                display::text(&panel.connection.label),
+                display::text(location.scheme())
+            ))
+        }
+    });
+    match parsed {
         Ok(location) => go(state, side, location),
         Err(err) => {
-            state.panels[side.index()].address_error = Some(err);
+            panel.address_error = Some(err);
             Vec::new()
         }
     }

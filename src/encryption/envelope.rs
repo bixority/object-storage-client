@@ -908,7 +908,7 @@ impl sealed::CodecImpl for Envelope {
     /// fails the stream before the upload commits. Onto itself, it does
     /// nothing.
     async fn copy(&self, src: &Resolved, dst: &Resolved, delete_source: bool) -> Result<()> {
-        let in_place = same_object(&src.loc, &dst.loc).await;
+        let in_place = same_object(src, dst).await;
         // Copying an object onto itself does nothing, whatever its key.
         if in_place && (!self.cfg.bind_object_key || src.loc.path == dst.loc.path) {
             return Ok(());

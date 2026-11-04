@@ -68,6 +68,15 @@ where
     F: std::future::Future<Output = PyResult<T>> + Send + 'static,
     T: for<'a> IntoPyObject<'a> + Send + 'static,
 {
+    let locals = preflight(py)?;
+    RUNTIME_CONFIG.call_once(configure_runtime);
+    pyo3_async_runtimes::tokio::future_into_py_with_locals(py, locals, fut)
+}
+
+/// The checks a call makes before it claims anything: a running event loop,
+/// and no fork since the runtime started. Run them before taking an argument
+/// apart (a piped `ByteStream`), so a refused call leaves it intact.
+fn preflight(py: Python<'_>) -> PyResult<pyo3_async_runtimes::TaskLocals> {
     // Fails without a running event loop, before anything is claimed.
     let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
     let pid = std::process::id();
@@ -79,8 +88,7 @@ where
              'forkserver' start method.",
         ));
     }
-    RUNTIME_CONFIG.call_once(configure_runtime);
-    pyo3_async_runtimes::tokio::future_into_py_with_locals(py, locals, fut)
+    Ok(locals)
 }
 
 /// [`spawn`] for a client call: its error becomes the matching Python
@@ -107,10 +115,7 @@ fn client_to_py_err(e: Error) -> PyErr {
         Error::Python(e) => e,
         // The matching `OSError` subclass (`FileNotFoundError`, ...).
         Error::Io(e) => e.into(),
-        Error::ObjectStore(
-            object_store::Error::PermissionDenied { .. }
-            | object_store::Error::Unauthenticated { .. },
-        ) => PyPermissionError::new_err(e.to_string()),
+        Error::Denied(_) => PyPermissionError::new_err(e.to_string()),
         Error::InvalidUrl(_) | Error::UnsupportedScheme(_) => PyValueError::new_err(e.to_string()),
         Error::Decryption(_) => DecryptionError::new_err(e.to_string()),
         Error::Key(KeyError::UnknownKey { .. }) => UnknownKeyError::new_err(e.to_string()),
@@ -150,7 +155,10 @@ fn ensure_main_interpreter(py: Python<'_>) -> PyResult<()> {
 /// multipart upload aborts in a detached task, and the runtime is a static that
 /// is never dropped, so a process exiting right after a cancellation (for
 /// example `asyncio.run` cancelling the remaining tasks on SIGTERM) would lose
-/// the abort. Bounded like the CLI's wait. Does nothing in a forked child, and
+/// the abort. It also waits for multipart uploads still running, because the
+/// cancellation of one may not have reached its worker yet; an upload that is
+/// still running at exit delays it by up to the bound. Bounded like the CLI's
+/// wait (10 s). Does nothing in a forked child, and
 /// builds no runtime when no call ever started one.
 #[pyfunction]
 fn _drain_aborts_at_exit(py: Python<'_>) {

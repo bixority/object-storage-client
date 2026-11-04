@@ -15,9 +15,10 @@ uv run --no-sync pytest
 The `oracle` group installs the AWS Encryption SDK. Without it the Python
 interop tests skip silently (`pytest.importorskip`).
 
-`cargo test` runs the library's unit tests, `tests/unit.rs`,
-`tests/functional.rs` (the client, encryption and `osc` on `file://` in
-temporary directories, plus the golden ciphertexts in `tests/vectors/golden/`)
+`cargo test` runs the library's unit tests,
+`tests/functional.rs` (the client, request signing, encryption and `osc` on
+`file://` in temporary directories, plus the golden ciphertexts in
+`tests/vectors/golden/`)
 and `tests/perf_guards.rs`. A plain `pytest` runs `tests/python/` without the
 container tests.
 
@@ -28,9 +29,12 @@ turn them off. The clients the crate builds itself ignore proxies in tests
 (injected variables).
 
 To check that the tests do not depend on your machine, run
-`scripts/hostile-env.sh`: it runs the library, unit and functional suites
-with a poisoned HOME and `~/.aws`, poisoned `AWS_*`, `S3_*` and `OSC_*`
-variables, a dead proxy and a dead IMDS endpoint. It is not run in CI.
+`scripts/hostile-env.sh`: it runs the library and functional suites
+twice, with a poisoned HOME and `~/.aws`, poisoned `AWS_*`, `S3_*` and `OSC_*`
+variables (`OSC_KEYRING_FILE`, `OSC_REQUIRE_ENCRYPTION`), a dead proxy and a
+dead IMDS endpoint. In the first pass the SDK reads the poisoned `~/.aws`
+files; in the second `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` point
+at `/nonexistent`. It is not run in CI.
 
 ## Integration tests
 
@@ -136,4 +140,5 @@ first run, or one after the cache expired, has nothing to compare with.
 
 ## Fuzzing
 
-See [Development](DEVELOPMENT.md#fuzzing).
+See [Development](DEVELOPMENT.md#fuzzing). The fuzz crate has its own committed
+`fuzz/Cargo.lock`; CI builds it with `--locked`.

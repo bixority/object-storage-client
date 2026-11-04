@@ -1,6 +1,6 @@
 //! Functional tests of the encrypted client over `file://` stores.
 
-use crate::support::{chunked, drain, pattern};
+use crate::support::{chunked, config_for, drain, pattern};
 use bytes::Bytes;
 use chrono::NaiveDate;
 use futures::StreamExt;
@@ -27,10 +27,6 @@ fn keyring_named(prefix: &str) -> Keyring {
 /// different keys also get different prefixes.
 fn config_named(prefix: &str) -> EncryptionConfig {
     EncryptionConfig::new(Arc::new(keyring_named(prefix)))
-}
-
-fn config_for(text: &str) -> EncryptionConfig {
-    EncryptionConfig::new(Arc::new(Keyring::parse(text).expect("parse")))
 }
 
 /// A standalone encrypted client over a fresh keyring.
@@ -535,7 +531,7 @@ async fn copy_and_move_keep_a_large_caller_context() -> Result<()> {
 }
 
 #[tokio::test]
-async fn move_without_binding_is_a_byte_move() -> Result<()> {
+async fn move_without_binding_reencrypts() -> Result<()> {
     let dir = tempdir()?;
     let client = EncryptedObjectStorageClient::new(config_in().bind_object_key(false));
     client.put(&url_of(&dir, "a"), &b"data"[..]).await?;
@@ -544,8 +540,36 @@ async fn move_without_binding_is_a_byte_move() -> Result<()> {
         .move_object(&url_of(&dir, "a"), &url_of(&dir, "b"))
         .await?;
     assert!(!dir.path().join("a").exists());
-    assert_eq!(std::fs::read(dir.path().join("b"))?, before);
+    assert_ne!(std::fs::read(dir.path().join("b"))?, before);
     assert_eq!(client.get(&url_of(&dir, "b")).await?.as_ref(), b"data");
+    Ok(())
+}
+
+#[tokio::test]
+async fn plain_client_does_not_copy_a_bound_object_to_another_name() -> Result<()> {
+    let dir = tempdir()?;
+    let client = secure();
+    let plain = client.without_encryption();
+    client.put(&url_of(&dir, "a"), &b"data"[..]).await?;
+    for delete in [false, true] {
+        let (from, to) = (url_of(&dir, "a"), url_of(&dir, "b"));
+        let err = if delete {
+            plain.move_object(&from, &to).await
+        } else {
+            plain.copy(&from, &to).await
+        };
+        assert!(matches!(err, Err(Error::InvalidInput(_))), "{err:?}");
+        assert!(!dir.path().join("b").exists());
+        assert_eq!(client.get(&from).await?.as_ref(), b"data");
+    }
+    // Under its own name in another directory it stays readable.
+    std::fs::create_dir(dir.path().join("sub"))?;
+    let unbound = EncryptedObjectStorageClient::new(config_in().bind_object_key(false));
+    unbound.put(&url_of(&dir, "u"), &b"free"[..]).await?;
+    plain
+        .copy(&url_of(&dir, "u"), &url_of(&dir, "sub/v"))
+        .await?;
+    assert_eq!(unbound.get(&url_of(&dir, "sub/v")).await?.as_ref(), b"free");
     Ok(())
 }
 
@@ -568,9 +592,15 @@ async fn tiny_objects_are_not_encrypted_objects() -> Result<()> {
     let dir = tempdir()?;
     let client = secure();
     let plain = client.without_encryption();
-    for (i, body) in [&[0x01u8][..], &[0x02, 0x04], &[0x55]]
-        .into_iter()
-        .enumerate()
+    for (i, body) in [
+        &[0x01u8][..],
+        &[0x02, 0x04],
+        &[0x55],
+        &[0x02, 0x9a, 0x11, 0x00, 0x01, 0x02],
+        &[0x01, 0x00, 0x00, 0x00],
+    ]
+    .into_iter()
+    .enumerate()
     {
         let url = url_of(&dir, &format!("t{i}"));
         plain.put(&url, body.to_vec()).await?;
@@ -786,7 +816,7 @@ async fn pipe_multi_gb_bounded_memory() -> Result<()> {
 /// and must keep it, and say so.
 #[tokio::test]
 async fn move_between_two_names_of_one_origin_keeps_the_encrypted_object() -> Result<()> {
-    let server = crate::client::mini_http::Server::start().await;
+    let server = crate::support::mini_http::Server::start().await;
     let client = secure();
     let (ip, name) = (
         format!("http://127.0.0.1:{}/x", server.port),
@@ -828,7 +858,7 @@ async fn copy_onto_itself_does_not_rewrite_an_old_key_object() -> Result<()> {
 /// same origin the source is kept too.
 #[tokio::test]
 async fn reencrypting_move_between_two_names_of_one_origin_keeps_the_object() -> Result<()> {
-    let server = crate::client::mini_http::Server::start().await;
+    let server = crate::support::mini_http::Server::start().await;
     let today = NaiveDate::from_ymd_opt(2026, 10, 26).expect("date");
     let first = new_keyring("old", today).expect("keyring");
     let old = EncryptedObjectStorageClient::new(config_for(&first));

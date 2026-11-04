@@ -4,10 +4,11 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::mpsc::{RecvTimeoutError, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 use clap::Subcommand;
 use zeroize::Zeroizing;
@@ -15,7 +16,9 @@ use zeroize::Zeroizing;
 use super::CliError;
 use super::output::{sanitize, write_stdout};
 use crate::encryption::keys::keyring::MAX_KEYRING_LEN;
-use crate::encryption::{Keyring, activate_key, add_key, new_keyring, retire_key, rotate_keyring};
+use crate::encryption::{
+    Keyring, activate_key, add_key_with_id, new_keyring, retire_key, rotate_keyring,
+};
 
 /// How long `OSC_KEYRING_COMMAND` may run.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,20 +91,21 @@ pub(super) enum KeyringCommand {
 /// The configured key sources: `--keyring` (`OSC_KEYRING_FILE`) and the
 /// command of `OSC_KEYRING_COMMAND`. The binary reads the environment; this
 /// code never does.
-#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
 pub struct KeySources {
     pub file: Option<PathBuf>,
     pub command: Option<OsString>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Source {
+pub enum Source {
     File(PathBuf),
     Command(OsString),
 }
 
 /// The one configured key source, if any. An empty command counts as unset.
-fn source(sources: KeySources) -> Result<Option<Source>, CliError> {
+/// Runs nothing: it only rejects a conflicting pair. Every command checks it
+/// first, so a conflict fails them all alike.
+pub fn source(sources: KeySources) -> Result<Option<Source>, CliError> {
     let KeySources { file, command } = sources;
     let command = command.filter(|c| !c.is_empty());
     match (file, command) {
@@ -112,35 +116,24 @@ fn source(sources: KeySources) -> Result<Option<Source>, CliError> {
     }
 }
 
-/// Whether a key source is configured (which enables encryption).
-#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
-pub fn is_configured(sources: KeySources) -> Result<bool, CliError> {
-    source(sources).map(|s| s.is_some())
-}
-
-/// The configured keyring, or `None` for plain operation.
-#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
-pub async fn open(sources: KeySources) -> Result<Option<Arc<Keyring>>, CliError> {
-    let ring = match source(sources)? {
-        None => return Ok(None),
-        Some(Source::File(path)) => Keyring::from_file(path)?,
-        Some(Source::Command(command)) => {
-            // Blocking, so off the thread that waits for signals.
-            tokio::task::spawn_blocking(move || run_command(&command, COMMAND_TIMEOUT))
-                .await
-                .map_err(CliError::Task)??
-        }
+/// The configured keyring.
+pub async fn open(source: Source) -> Result<Arc<Keyring>, CliError> {
+    let ring = match source {
+        Source::File(path) => Keyring::from_file(path)?,
+        Source::Command(command) => run_command(&command, COMMAND_TIMEOUT).await?,
     };
-    Ok(Some(Arc::new(ring)))
+    Ok(Arc::new(ring))
 }
 
 /// Runs `command` through the shell and parses its standard output.
 ///
 /// Standard input is the null device and standard error is inherited. The
-/// output is captured into a zeroizing buffer of at most 64 KiB; a command
-/// that is still running after `timeout` is killed.
-pub(super) fn run_command(command: &OsStr, timeout: Duration) -> Result<Keyring, CliError> {
-    let deadline = Instant::now() + timeout;
+/// output is captured into a zeroizing buffer of at most 64 KiB. A command
+/// that is still running after `timeout`, or when this future is dropped, is
+/// killed: the shell is killed, but processes it started (such as the stages
+/// of a pipeline) may keep running.
+pub(super) async fn run_command(command: &OsStr, timeout: Duration) -> Result<Keyring, CliError> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut shell = if cfg!(windows) {
         let mut c = Command::new("cmd");
         c.arg("/C");
@@ -155,58 +148,31 @@ pub(super) fn run_command(command: &OsStr, timeout: Duration) -> Result<Keyring,
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .map_err(CliError::KeyringCommandStart)?;
-    let kill = |child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = child.wait();
-    };
-
     let mut pipe = child
         .stdout
         .take()
         .ok_or_else(|| CliError::KeyringCommandStart(std::io::Error::other("no stdout pipe")))?;
-    let (tx, rx) = channel();
-    // Not joined: a grandchild holding the pipe open would block a join past
-    // the timeout. The buffer is zeroized wherever it ends up.
-    std::thread::spawn(move || {
+    // Leaving early drops the child, which kills the shell.
+    let finished = async {
         let cap = MAX_KEYRING_LEN as u64;
         let mut out = Zeroizing::new(Vec::with_capacity(MAX_KEYRING_LEN + 1));
-        let read = (&mut pipe).take(cap + 1).read_to_end(&mut out);
-        let _ = tx.send(read.map(|_| out));
-    });
-    let output = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            kill(&mut child);
-            return Err(CliError::KeyringCommandStart(e));
+        (&mut pipe)
+            .take(cap + 1)
+            .read_to_end(&mut out)
+            .await
+            .map_err(CliError::KeyringCommandStart)?;
+        if out.len() > MAX_KEYRING_LEN {
+            return Err(CliError::KeyringCommandTooLarge);
         }
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-            kill(&mut child);
-            return Err(CliError::KeyringCommandTimeout(timeout));
-        }
+        let status = child.wait().await.map_err(CliError::KeyringCommandStart)?;
+        Ok((out, status))
     };
-    if output.len() > MAX_KEYRING_LEN {
-        kill(&mut child);
-        return Err(CliError::KeyringCommandTooLarge);
-    }
-    // The output is complete; the exit status may still be pending.
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(None) => {
-                kill(&mut child);
-                return Err(CliError::KeyringCommandTimeout(timeout));
-            }
-            Err(e) => {
-                kill(&mut child);
-                return Err(CliError::KeyringCommandStart(e));
-            }
-        }
-    };
+    let (output, status) = tokio::time::timeout_at(deadline, finished)
+        .await
+        .map_err(|_| CliError::KeyringCommandTimeout(timeout))??;
     if !status.success() {
         return Err(CliError::KeyringCommandStatus(status.to_string()));
     }
@@ -251,51 +217,60 @@ fn check_terminal(force: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Refuses a terminal on standard input: the command would wait with no
+/// prompt, and a pasted keyring would land in the scrollback.
+const fn require_piped_stdin(stdin_is_terminal: bool) -> Result<(), CliError> {
+    if stdin_is_terminal {
+        Err(CliError::KeyringStdinTerminal)
+    } else {
+        Ok(())
+    }
+}
+
+/// The keyring on standard input, never from a terminal.
+async fn read_keyring_stdin() -> Result<Zeroizing<String>, CliError> {
+    require_piped_stdin(std::io::stdin().is_terminal())?;
+    read_stdin_text().await
+}
+
 fn today() -> chrono::NaiveDate {
     chrono::Utc::now().date_naive()
 }
 
 /// `osc keyring ...`.
-pub(super) async fn run(cmd: KeyringCommand, sources: KeySources) -> Result<(), CliError> {
+pub(super) async fn run(cmd: KeyringCommand, source: Option<Source>) -> Result<(), CliError> {
     match cmd {
         KeyringCommand::New { prefix, force } => {
             check_terminal(force)?;
-            write_stdout(&new_keyring(&prefix, today())?)
+            write_stdout(&new_keyring(&prefix, today())?).await
         }
         KeyringCommand::Add { prefix, force } => {
             check_terminal(force)?;
-            let input = read_stdin_text().await?;
-            let added = add_key(&input, &prefix, today())?;
-            // The new key is the last one; only its ID is reported.
-            let id = Keyring::parse(&added)?
-                .status()
-                .keys
-                .pop()
-                .map(|k| k.id)
-                .unwrap_or_default();
-            write_stdout(&added)?;
+            let input = read_keyring_stdin().await?;
+            let (added, id) = add_key_with_id(&input, &prefix, today())?;
+            write_stdout(&added).await?;
             errln!("added inactive key {id}");
             Ok(())
         }
         KeyringCommand::Activate { id, force } => {
             check_terminal(force)?;
-            let input = read_stdin_text().await?;
-            write_stdout(&activate_key(&input, &id)?)
+            let input = read_keyring_stdin().await?;
+            write_stdout(&activate_key(&input, &id)?).await
         }
         KeyringCommand::Rotate { prefix, force } => {
             check_terminal(force)?;
-            let input = read_stdin_text().await?;
-            write_stdout(&rotate_keyring(&input, &prefix, today())?)
+            let input = read_keyring_stdin().await?;
+            write_stdout(&rotate_keyring(&input, &prefix, today())?).await
         }
         KeyringCommand::Retire { id, force } => {
             check_terminal(force)?;
-            let input = read_stdin_text().await?;
-            write_stdout(&retire_key(&input, &id)?)
+            let input = read_keyring_stdin().await?;
+            write_stdout(&retire_key(&input, &id)?).await
         }
         KeyringCommand::Status {
             max_age_days,
             configured,
-        } => status(sources, max_age_days, configured).await,
+        } => status(source, max_age_days, configured).await,
     }
 }
 
@@ -319,9 +294,13 @@ const fn status_input(configured: bool, stdin_is_terminal: bool) -> Result<Statu
     }
 }
 
-async fn status(sources: KeySources, max_age_days: i64, configured: bool) -> Result<(), CliError> {
+async fn status(
+    source: Option<Source>,
+    max_age_days: i64,
+    configured: bool,
+) -> Result<(), CliError> {
     let ring = match status_input(configured, std::io::stdin().is_terminal())? {
-        StatusInput::Configured => open(sources).await?.ok_or(CliError::KeyringNotConfigured)?,
+        StatusInput::Configured => open(source.ok_or(CliError::KeyringNotConfigured)?).await?,
         StatusInput::Stdin => Arc::new(Keyring::parse(&read_stdin_text().await?)?),
     };
     let today = today();
@@ -348,7 +327,7 @@ async fn status(sources: KeySources, max_age_days: i64, configured: bool) -> Res
         table.push_str(line.trim_end());
         table.push('\n');
     }
-    write_stdout(&table)?;
+    write_stdout(&table).await?;
     if status.active_age_days > max_age_days {
         return Err(CliError::KeyOverdue {
             id: sanitize(&status.active),
@@ -389,6 +368,15 @@ mod tests {
             status_input(false, true),
             Err(CliError::KeyringStatusTerminal)
         ));
+    }
+
+    #[test]
+    fn a_terminal_stdin_is_refused() {
+        assert!(matches!(
+            require_piped_stdin(true),
+            Err(CliError::KeyringStdinTerminal)
+        ));
+        assert!(require_piped_stdin(false).is_ok());
     }
 
     #[test]

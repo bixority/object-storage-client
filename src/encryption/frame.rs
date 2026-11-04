@@ -16,7 +16,7 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use super::context::{CallerContext, EncryptionContext};
 use super::header::{
-    DecodeLimits, EncryptedDataKey, FormatError, Header, HeaderCodec, HeaderParse,
+    CLASSIFY_LEN, DecodeLimits, EncryptedDataKey, FormatError, Header, HeaderCodec, HeaderParse,
 };
 use super::keys::{DataKey, KeyProvider};
 use super::suite::{DecryptError, MessageKeys, derive, header_tag, verify_header};
@@ -544,7 +544,7 @@ impl Decryptor {
     pub fn finish(self) -> Result<(), DecryptError> {
         match self.state {
             State::Done => Ok(()),
-            State::Header if self.buf.len() < 3 => Err(FormatError::NotOsc.into()),
+            State::Header if self.buf.len() < CLASSIFY_LEN => Err(FormatError::NotOsc.into()),
             State::Header => Err(FormatError::Truncated.into()),
             State::AwaitKey | State::Frames => Err(DecryptError::MissingFinalFrame),
             State::Failed => Err(DecryptError::Failed),
@@ -632,18 +632,18 @@ impl Decryptor {
         let mut frame = self.buf.split_to(o.total);
         frame.advance(o.prefix);
         frame.truncate(o.content_len);
-        self.commit(&o)?;
+        self.commit(&o);
         Ok(Some(frame.freeze()))
     }
 
     /// Records a verified frame: the next sequence number, or the end.
-    fn commit(&mut self, o: &Opened) -> Result<(), DecryptError> {
+    const fn commit(&mut self, o: &Opened) {
         if o.is_final {
             self.state = State::Done;
         } else {
-            self.next_seq = next_seq_after(o)?;
+            // A regular frame's seq is never FINAL_MARKER (u32::MAX).
+            self.next_seq = o.seq + 1;
         }
-        Ok(())
     }
 
     /// Whole-object counterpart of the streaming loop: opens every complete
@@ -666,7 +666,7 @@ impl Decryptor {
             self.buf.copy_within(content, cursor.write);
             cursor.write += o.content_len;
             cursor.read += o.total;
-            self.commit(&o)?;
+            self.commit(&o);
         }
         if self.state == State::Done && cursor.read != self.buf.len() {
             return Err(DecryptError::TrailingBytes);
@@ -713,14 +713,6 @@ struct Opened {
     /// Prefix, content and tag.
     total: usize,
     is_final: bool,
-}
-
-/// The sequence number after the verified non-final frame `o`.
-fn next_seq_after(o: &Opened) -> Result<u32, DecryptError> {
-    o.seq.checked_add(1).ok_or(DecryptError::BadSequence {
-        expected: o.seq,
-        got: o.seq,
-    })
 }
 
 /// Validates the frame at the start of `buf` (sequence, final marker and

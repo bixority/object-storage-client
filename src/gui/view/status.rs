@@ -13,7 +13,7 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action
                 if state.closing == Closing::Open
                     && matches!(job.phase, JobPhase::Planning | JobPhase::Running) =>
             {
-                ui.spinner();
+                super::busy(ui);
                 if job.phase == JobPhase::Planning {
                     ui.label(format!("{}: preparing…", verb(job.kind)));
                 } else {
@@ -35,7 +35,7 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action
             }
             _ => {
                 if state.closing != Closing::Open {
-                    ui.spinner();
+                    super::busy(ui);
                 }
                 ui.label(&state.status);
             }

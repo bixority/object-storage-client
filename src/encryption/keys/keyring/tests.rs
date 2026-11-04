@@ -434,12 +434,19 @@ fn new_rotate_and_retire_round_trip() {
 #[tokio::test]
 async fn add_then_activate_is_safe_to_roll_out() {
     let today = day(2026, 10, 28);
-    let added = add_key(&sample(), "kek", today).expect("add");
+    let (added, new) = add_key_with_id(&sample(), "kek", today).expect("add");
     let before = Keyring::parse(&sample()).expect("parse").status();
     let after_add = Keyring::parse(&added).expect("parse").status();
     assert_eq!(after_add.active, before.active);
     assert_eq!(after_add.keys.len(), before.keys.len() + 1);
-    let new = after_add.keys.last().expect("new key").id.clone();
+    // `status()` lists newest first, so the new key is the one ID not there before.
+    let fresh: Vec<_> = after_add
+        .keys
+        .iter()
+        .filter(|k| !before.keys.iter().any(|b| b.id == k.id))
+        .collect();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].id, new);
 
     let activated = activate_key(&added, &new).expect("activate");
     assert_eq!(
@@ -544,6 +551,41 @@ fn replace(path: &Path, text: &str) {
 
 fn ring_at(path: &Path) -> Keyring {
     Keyring::from_file_with(path, Duration::ZERO, Duration::ZERO).expect("open")
+}
+
+#[test]
+fn active_key_name_and_holds_key_see_a_rotation_on_disk() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("keyring");
+    write_private(
+        &path,
+        &format!(
+            "{MAGIC}\nactive={}\n{}\n",
+            old_id(),
+            key_line(&old_id(), "2025-10-20", &OLD)
+        ),
+    );
+    let ring = ring_at(&path);
+    assert_eq!(ring.active_key_name(), old_id());
+    assert!(!ring.holds_key(&new_id()));
+
+    // No wrap or unwrap in between: the answer itself looks at the file.
+    replace(&path, &sample());
+    assert_eq!(ring.active_key_name(), new_id());
+    assert!(ring.holds_key(&new_id()));
+    assert!(ring.holds_key(&old_id()));
+    assert!(!ring.holds_key("nope"));
+
+    // The passive accessor never looks.
+    replace(
+        &path,
+        &format!(
+            "{MAGIC}\nactive={}\n{}\n",
+            old_id(),
+            key_line(&old_id(), "2025-10-20", &OLD)
+        ),
+    );
+    assert_eq!(ring.active_id(), new_id());
 }
 
 #[cfg(unix)]
@@ -956,4 +998,58 @@ mod unix {
             .created;
         assert_eq!(created, day(2026, 10, 27));
     }
+}
+
+#[test]
+fn status_does_not_wait_for_a_reload_in_progress() {
+    use std::sync::mpsc;
+
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("keyring");
+    write_private(&path, &sample());
+    let ring = Arc::new(ring_at(&path));
+    let (entered_tx, entered_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        entered_tx.send(()).expect("entered");
+        let _ = release_rx.lock().expect("rx").recv();
+    });
+    *ring
+        .source
+        .as_ref()
+        .expect("source")
+        .io_hook
+        .lock()
+        .expect("hook") = Some(hook);
+
+    // A reload that is stuck in file I/O.
+    let reloader = {
+        let ring = Arc::clone(&ring);
+        std::thread::spawn(move || ring.active_key_name())
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("reload started");
+
+    // Status and the other readers answer from the current snapshot.
+    let (done_tx, done_rx) = mpsc::channel();
+    let probe = {
+        let ring = Arc::clone(&ring);
+        std::thread::spawn(move || {
+            let status = ring.status();
+            done_tx
+                .send((status.active, ring.holds_key(&old_id())))
+                .expect("done");
+        })
+    };
+    let (active, holds) = done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("status waited for the reload");
+    assert_eq!(active, new_id());
+    assert!(holds);
+
+    release_tx.send(()).expect("release");
+    assert_eq!(reloader.join().expect("reloader"), new_id());
+    probe.join().expect("probe");
 }

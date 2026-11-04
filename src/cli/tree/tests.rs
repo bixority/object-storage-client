@@ -29,7 +29,7 @@ fn destination_url_encodes_each_component_and_rejects_escapes() {
 }
 
 #[cfg(unix)]
-fn assert_refused(res: &Result<tokio::fs::File, CliError>) {
+fn assert_refused(res: &Result<OpenedFile, CliError>) {
     assert!(matches!(res, Err(CliError::UnsafePath { .. })), "{res:?}");
 }
 
@@ -76,7 +76,14 @@ async fn scan_lists_a_nested_tree_and_opens_its_files() {
     );
     for f in &files {
         let mut got = Vec::new();
-        let mut file = tree.open(f).expect("open");
+        let opened = tree.open(f).expect("open");
+        let meta = std::fs::metadata(src.join(&f.rel)).expect("meta");
+        assert_eq!(opened.size, meta.len());
+        assert_eq!(
+            opened.mode,
+            std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777
+        );
+        let mut file = tokio::fs::File::from_std(opened.file);
         file.read_to_end(&mut got).await.expect("read");
         assert_eq!(got, std::fs::read(src.join(&f.rel)).expect("expected"));
     }

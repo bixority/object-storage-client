@@ -5,10 +5,9 @@
 use crate::support::Osc;
 use crate::support::mock::{Mock, Request, Response};
 use std::fmt::Write as _;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Output;
+use std::time::Duration;
 
 const CACHED_TOKEN: &str = "cached-token";
 const REGION: &str = "eu-west-3";
@@ -125,41 +124,8 @@ fn write_sso_cache(home: &Path, identifier: &str, expires_at: &str) {
 
 /// Runs the child to the end. Fails, instead of hanging, after 30 s.
 fn run(mut osc: Osc, args: &[&str]) -> Output {
-    osc.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = osc.spawn().expect("spawn osc");
-    // Drained on threads so a full pipe cannot stall the child.
-    let mut out_pipe = child.stdout.take().expect("stdout");
-    let mut err_pipe = child.stderr.take().expect("stderr");
-    let out_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = out_pipe.read_to_end(&mut v);
-        v
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err_pipe.read_to_end(&mut v);
-        v
-    });
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("try_wait") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("osc did not finish within 30 s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    Output {
-        status,
-        stdout: out_reader.join().expect("stdout reader"),
-        stderr: err_reader.join().expect("stderr reader"),
-    }
+    osc.args(args);
+    osc.output_within(Duration::from_secs(30))
 }
 
 fn text(bytes: &[u8]) -> String {

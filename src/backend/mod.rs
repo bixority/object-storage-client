@@ -21,25 +21,56 @@ mod http;
 mod local;
 mod s3;
 #[cfg(test)]
-mod stub;
+pub mod stub;
 
 use crate::client::{Error, Result};
 use crate::sign::{SignMethod, SignOptions};
 pub use aws_profile::AwsProfile;
+pub use body::FILE_BUF;
 pub use body::body_stream;
-use bytes::Bytes;
-use connector::BoundedConnector;
+use connector::{BoundedConnector, BucketClient, ClientCache, SharedConnector, Transport};
 pub use local::fs_path;
+use object_store::aws::AwsCredentialProvider;
+use object_store::azure::AzureCredentialProvider;
 use object_store::client::HttpRequest;
+use object_store::gcp::{GcpCredentialProvider, GcpSigningCredentialProvider};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
-use object_store::{ClientConfigKey, ObjectStore};
+use object_store::{ClientConfigKey, ObjectMeta, ObjectStore};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use url::Url;
+
+/// What the backends of one registry share: HTTP clients and credential
+/// providers. A registry owns one, so its stores share connections and
+/// tokens, and registries stay apart.
+///
+/// Sharing a credential provider is safe because the variables are fixed for
+/// the registry's life: every store of a family would build the same provider,
+/// whatever its bucket. A store that skips signing never takes part, because
+/// its builder holds a provider that must not be called. The AWS profile
+/// provider has its own sharing, see [`AwsProfile`].
+///
+/// The first store built stores its providers (`object_store` does not let the
+/// crate build them), and later stores are given them. They are kept for the
+/// registry's life, so evicting a store does not drop a warm token.
+#[derive(Default)]
+pub struct Shared {
+    clients: Arc<ClientCache>,
+    aws: OnceLock<AwsCredentialProvider>,
+    gcs: OnceLock<(GcpCredentialProvider, GcpSigningCredentialProvider)>,
+    azure: OnceLock<AzureCredentialProvider>,
+}
+
+impl Shared {
+    /// A connector for a store's HTTP clients, drawn from the shared cache.
+    fn connector(&self) -> BoundedConnector<SharedConnector> {
+        BoundedConnector::shared(&self.clients)
+    }
+}
 
 /// Where backend configuration is read from.
 ///
@@ -89,8 +120,10 @@ impl Vars {
     }
 }
 
-/// How long a stalled object request may stay silent: the time to the response
-/// headers (including sending the request body) and every gap between body reads.
+/// How long an object request may stay silent: the time to the response
+/// headers and every gap between body reads. The first covers sending the
+/// request body, so each upload request (one put or one part) must be sent and
+/// answered within this time, even while bytes flow steadily.
 pub const READ_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// The longest an object request may take in total (an effectively unlimited
@@ -163,11 +196,22 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
+    /// Whether `path` names a collection (a directory) whose deletion would
+    /// remove everything in it. Only the http(s) backend can say so; the
+    /// default is `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot tell.
+    async fn is_collection(&self, _path: &ObjectPath) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Create the bucket / container identified by `url`.
     ///
     /// Defaults to [`Error::BucketCreationUnsupported`]; providers that support
     /// it override this.
-    async fn create_bucket(&self, _client: &reqwest::Client, _url: &Url) -> Result<()> {
+    async fn create_bucket(&self, _url: &Url) -> Result<()> {
         Err(Error::BucketCreationUnsupported(self.scheme().to_string()))
     }
 
@@ -175,8 +219,58 @@ pub trait Backend: Send + Sync {
     ///
     /// Defaults to [`Error::BucketExistenceUnsupported`]; providers that support
     /// it override this.
-    async fn bucket_exists(&self, _client: &reqwest::Client, _url: &Url) -> Result<bool> {
+    async fn bucket_exists(&self, _url: &Url) -> Result<bool> {
         Err(Error::BucketExistenceUnsupported(self.scheme().to_string()))
+    }
+
+    /// Waits until the server-side copy that wrote `path` is complete.
+    /// `server_side_copy` calls it after every copy and before a move deletes
+    /// its source. Defaults to doing nothing: most stores copy atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the copy failed or did not finish in time.
+    async fn finish_copy(&self, _path: &ObjectPath) -> Result<()> {
+        Ok(())
+    }
+
+    /// This backend as [`Any`](std::any::Any), for the backends that can copy
+    /// from another one of their own type (see [`Backend::copies_from`]).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Whether [`Backend::copy_from`] may copy from `src` server-side: the same
+    /// provider type, reached through the same endpoint and region, with the
+    /// very same credential provider, and neither side skipping signatures.
+    /// Defaults to `false`.
+    fn copies_from(&self, _src: &dyn Backend) -> bool {
+        false
+    }
+
+    /// Copies `src_path` of `src` to `dst_path` of this backend inside the
+    /// provider, for a source in another bucket or container. `known` is the
+    /// source's metadata when the caller has it: its e-tag (S3, Azure) or
+    /// generation (GCS) makes the copy fail if the source has changed.
+    ///
+    /// Returns `false` when nothing was copied and the caller must stream:
+    /// [`Backend::copies_from`] refuses `src`, or the server cannot do it.
+    /// `server_side_copy` calls [`Backend::finish_copy`] afterwards, and a move
+    /// deletes its source only after that. Defaults to `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider refused or failed the copy, and
+    /// [`Error::SourceChanged`] (with an empty URL, which the caller fills in)
+    /// if the source no longer matches `known`.
+    async fn copy_from(
+        &self,
+        _src: &dyn Backend,
+        _src_path: &ObjectPath,
+        _dst_path: &ObjectPath,
+        _known: Option<&ObjectMeta>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// The `object_store` signer for host-only pre-signing, if the store has one.
@@ -225,17 +319,22 @@ pub trait Backend: Send + Sync {
 ///
 /// Returns an error if the scheme is unsupported, required URL components are
 /// missing, or the underlying `object_store` fails to build.
-pub fn build(url: &Url, vars: &Vars, profile: Option<&AwsProfile>) -> Result<Arc<dyn Backend>> {
+pub fn build(
+    url: &Url,
+    vars: &Vars,
+    profile: Option<&AwsProfile>,
+    shared: &Shared,
+) -> Result<Arc<dyn Backend>> {
     let scheme = url.scheme();
     let host = url.host_str();
 
     let backend: Arc<dyn Backend> = match scheme {
-        "s3" => Arc::new(s3::S3Backend::new(host, vars, profile)?),
-        "gs" | "gcs" => Arc::new(gcs::GcsBackend::new(scheme, host, vars)?),
-        "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
-            Arc::new(azure::AzureBackend::new(scheme, host, vars)?)
-        }
-        "http" | "https" => Arc::new(http::HttpBackend::new(scheme, url)?),
+        "s3" => Arc::new(s3::S3Backend::with_shared(host, vars, profile, shared)?),
+        "gs" | "gcs" => Arc::new(gcs::GcsBackend::with_shared(scheme, host, vars, shared)?),
+        "az" | "wasb" | "wasbs" | "abfs" | "abfss" => Arc::new(azure::AzureBackend::with_shared(
+            scheme, host, vars, shared,
+        )?),
+        "http" | "https" => Arc::new(http::HttpBackend::with_shared(scheme, url, shared)?),
         "file" => Arc::new(local::LocalBackend::new()),
         _ => return Err(Error::UnsupportedScheme(scheme.to_string())),
     };
@@ -267,18 +366,9 @@ pub async fn bucket_exists_from_response(
         404 => Ok(false),
         401 | 403 => {
             // HEAD responses carry no body; Azure names the reason in a header.
-            let code = response
-                .headers()
-                .get("x-ms-error-code")
-                .and_then(|v| v.to_str().ok())
-                .map(|c| {
-                    c.chars()
-                        .filter(|c| !c.is_control())
-                        .take(64)
-                        .collect::<String>()
-                })
-                .map_or_else(String::new, |c| format!(", {c}"));
-            Err(Error::Generic(format!(
+            let code = ms_error_code(response.headers())
+                .map_or_else(String::new, |c| format!(", {}", crate::text::escape(c, 64)));
+            Err(Error::Denied(format!(
                 "{scheme} bucket existence check was denied (HTTP {status}{code}); \
                  existence is unknown, check the credentials and permissions"
             )))
@@ -289,6 +379,17 @@ pub async fn bucket_exists_from_response(
                 "{scheme} bucket existence check failed (HTTP {status}): {text}"
             )))
         }
+    }
+}
+
+/// The error for a bucket creation `what` that the provider answered with
+/// `status` and the error text `text`. HTTP 401 and 403 are [`Error::Denied`],
+/// every other status [`Error::Generic`].
+pub fn create_failed(what: &str, status: reqwest::StatusCode, text: &str) -> Error {
+    if matches!(status.as_u16(), 401 | 403) {
+        Error::Denied(format!("{what} was denied (HTTP {status}): {text}"))
+    } else {
+        Error::Generic(format!("{what} failed (HTTP {status}): {text}"))
     }
 }
 
@@ -306,6 +407,72 @@ pub async fn error_body(mut response: reqwest::Response) -> String {
     }
     body.truncate(LIMIT);
     crate::text::escape(&redact_error_body(&String::from_utf8_lossy(&body)), LIMIT)
+}
+
+/// The most of an answer's document that [`read_document`] keeps.
+const DOCUMENT_LIMIT: usize = 64 * 1024;
+
+/// The body of a successful `response` as text: the start of its document,
+/// after any leading white space, at most 64 KiB. A body that fails midway
+/// (a reset, a read timeout) is an error, so a cut-off answer is never taken
+/// for an empty one. The white space some servers send to keep a long request
+/// alive is not counted, and is not kept.
+///
+/// # Errors
+///
+/// Returns an error if reading the body fails.
+pub async fn read_document(mut response: reqwest::Response) -> Result<String> {
+    let mut body = Vec::new();
+    while body.len() < DOCUMENT_LIMIT {
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| request_failed("Reading the answer", e))?
+        else {
+            break;
+        };
+        let chunk = if body.is_empty() {
+            chunk.trim_ascii_start()
+        } else {
+            &chunk[..]
+        };
+        body.extend_from_slice(chunk);
+    }
+    body.truncate(DOCUMENT_LIMIT);
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// How many times a copy request is sent at most.
+const COPY_ATTEMPTS: u32 = 3;
+/// The pause before the second attempt; it doubles after each.
+const COPY_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// Sends the copy request `send` builds, again after a pause when it fails
+/// before any answer (a connection error) or is answered `429`, `500`, `502`,
+/// `503` or `504`, up to three attempts in all. Any other answer, and the last
+/// one, is returned. A request that was answered `2xx` is never sent again.
+///
+/// # Errors
+///
+/// Returns the error of the last attempt if none was answered.
+pub async fn send_with_retry<F, Fut>(mut send: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<reqwest::Response>>,
+{
+    let mut pause = COPY_RETRY_PAUSE;
+    for attempt in 1..=COPY_ATTEMPTS {
+        let last = attempt == COPY_ATTEMPTS;
+        match send().await {
+            Ok(response)
+                if !last && matches!(response.status().as_u16(), 429 | 500 | 502 | 503 | 504) => {}
+            Err(_) if !last => {}
+            done => return done,
+        }
+        tokio::time::sleep(pause).await;
+        pause *= 2;
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// The elements of an XML error document that are kept.
@@ -327,15 +494,28 @@ const KEPT_ELEMENTS: [&str; 7] = [
 /// from the [`KEPT_ELEMENTS`] only, so `CanonicalRequest`, `StringToSign`,
 /// `Token-N` and every other element are dropped, and so is an element whose
 /// closing tag was cut off. `Code` stays, which the bucket-creation checks
-/// need. Any other text (a JSON error, plain text) is returned unchanged.
+/// need. A leading byte order mark and attributes on the root are accepted. Any
+/// other text (a JSON error, an HTML page, plain text) is returned unchanged.
 pub fn redact_error_body(text: &str) -> String {
-    let mut rest = text.trim_start();
+    // Azure starts its documents with a byte order mark, which is not white space.
+    fn skip(s: &str) -> &str {
+        s.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
+    }
+    let mut rest = skip(text);
     if rest.starts_with("<?xml")
         && let Some(end) = rest.find("?>")
     {
-        rest = rest[end + 2..].trim_start();
+        rest = skip(&rest[end + 2..]);
     }
-    let Some(mut rest) = rest.strip_prefix("<Error>") else {
+    // The root is `<Error>`, or `<Error` followed by white space and attributes.
+    let root = rest
+        .strip_prefix("<Error")
+        .and_then(|after| match after.chars().next() {
+            Some('>') => Some(&after[1..]),
+            Some(c) if c.is_whitespace() => after.find('>').map(|end| &after[end + 1..]),
+            _ => None,
+        });
+    let Some(mut rest) = root else {
         return text.to_owned();
     };
     let mut out = String::from("<Error>");
@@ -363,17 +543,26 @@ pub fn redact_error_body(text: &str) -> String {
     out
 }
 
+/// The `x-ms-error-code` header of an Azure response, raw. Escape it before
+/// it goes into a message.
+pub fn ms_error_code(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers.get("x-ms-error-code")?.to_str().ok()
+}
+
 /// Sends a request already signed by an `object_store` authorizer.
 ///
 /// The authorizer mutates an [`HttpRequest`] (method, URI and the signed
-/// headers); this transfers those onto the shared `reqwest` client and
-/// dispatches them, re-attaching the body the signature was computed over.
+/// headers); this transfers those onto the backend's bucket-call `reqwest`
+/// client and dispatches them with the body the signature was computed over.
 pub async fn send_signed(
     client: &reqwest::Client,
     request: HttpRequest,
-    body: Bytes,
 ) -> Result<reqwest::Response> {
-    let (parts, _) = request.into_parts();
+    let (parts, body) = request.into_parts();
+    let body = body
+        .as_bytes()
+        .cloned()
+        .ok_or_else(|| Error::Generic("signed request has a streaming body".into()))?;
     client
         .request(parts.method, parts.uri.to_string())
         .headers(parts.headers)
@@ -422,17 +611,11 @@ impl Backend for TestBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn transport_errors_never_carry_the_query() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let port = stub::closed_port();
+        let client = stub::client();
         let e = client
             .get(format!(
                 "http://127.0.0.1:{port}/c?restype=container&sig=TOPSECRET"
@@ -448,26 +631,11 @@ mod tests {
     }
 
     async fn error_body_of(body: Vec<u8>) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let (mut conn, _) = listener.accept().await.expect("accept");
-            let _ = conn.read(&mut [0; 1024]).await;
-            let head = format!(
-                "HTTP/1.1 500 Oops\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
-            let _ = conn.write_all(head.as_bytes()).await;
-            let _ = conn.write_all(&body).await;
-        });
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let body = String::from_utf8(body).expect("utf-8 body");
+        let stub = stub::serve(vec![stub::Reply::new(500, body)]).await;
+        let client = stub::client();
         let response = client
-            .get(format!("http://{addr}/"))
+            .get(format!("{}/", stub.base))
             .send()
             .await
             .expect("get");
@@ -477,10 +645,7 @@ mod tests {
     /// `bucket_exists_from_response` on a HEAD answered with `reply`.
     async fn probe(reply: stub::Reply) -> Result<bool> {
         let stub = stub::serve(vec![reply]).await;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let client = stub::client();
         let response = client.head(&stub.base).send().await.expect("head");
         bucket_exists_from_response(response, "Azure").await
     }
@@ -488,7 +653,12 @@ mod tests {
     #[tokio::test]
     async fn denied_probes_are_errors() {
         let err = probe(stub::Reply::new(401, "")).await.expect_err("401");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
         assert!(err.to_string().contains("401"), "{err}");
+        let err = probe(stub::Reply::new(403, "")).await.expect_err("403");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let err = probe(stub::Reply::new(500, "")).await.expect_err("500");
+        assert!(matches!(err, Error::Generic(_)), "{err:?}");
 
         let err =
             probe(stub::Reply::new(403, "").header("x-ms-error-code", "AuthenticationFailed"))
@@ -528,6 +698,24 @@ mod tests {
         assert_eq!(text, "a\\u{202e}b\\u{2066}");
 
         assert_eq!(error_body_of(b"short".to_vec()).await, "short");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_never_gets_an_answer_is_sent_three_times() {
+        let port = stub::closed_port();
+        let client = stub::client();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = send_with_retry(|| async {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            client
+                .put(format!("http://127.0.0.1:{port}/"))
+                .send()
+                .await
+                .map_err(|e| request_failed("Copy", e))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
     const SENTINEL: &str = "SENTINEL-TOKEN-0123";
@@ -579,6 +767,62 @@ mod tests {
         assert!(text.contains("<Code>AuthenticationFailed</Code>"), "{text}");
     }
 
+    fn azure_authentication_error() -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Error><Code>AuthenticationFailed</Code>\
+             <Message>Server failed to authenticate the request.</Message>\
+             <AuthenticationErrorDetail>String-to-Sign: x-ms-encryption-key:{SENTINEL}\
+             </AuthenticationErrorDetail></Error>"
+        )
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_does_not_bypass_redaction() {
+        let body = azure_authentication_error();
+        for text in [
+            format!("\u{feff}{body}"),
+            format!("\u{feff} \n\u{feff}{body}"),
+            body.replace("?>\r\n", "?>\u{feff}\r\n"),
+            body.replace("<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n", "\u{feff}"),
+        ] {
+            let text = redact_error_body(&text);
+            assert!(!text.contains(SENTINEL), "{text}");
+            assert_eq!(
+                text,
+                "<Error><Code>AuthenticationFailed</Code>\
+                 <Message>Server failed to authenticate the request.</Message></Error>"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_with_attributes_is_redacted() {
+        let body = azure_authentication_error()
+            .replace("<Error>", "<Error xmlns=\"urn:x\"\n note=\"a&gt;b\">");
+        let text = redact_error_body(&body);
+        assert!(!text.contains(SENTINEL), "{text}");
+        assert!(
+            text.starts_with("<Error><Code>AuthenticationFailed</Code>"),
+            "{text}"
+        );
+        // A different root, or a longer name, is not an `Error` document.
+        for other in [
+            "<Errors><Code>x</Code></Errors>",
+            "<html><body>502</body></html>",
+        ] {
+            assert_eq!(redact_error_body(other), other);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_byte_order_mark_does_not_bypass_error_body_redaction() {
+        let mut body = b"\xEF\xBB\xBF".to_vec();
+        body.extend_from_slice(azure_authentication_error().as_bytes());
+        let text = error_body_of(body).await;
+        assert!(!text.contains(SENTINEL), "{text}");
+        assert!(text.contains("<Code>AuthenticationFailed</Code>"), "{text}");
+    }
+
     #[test]
     fn a_body_cut_mid_element_stays_clean() {
         let body = s3_signature_error();
@@ -597,5 +841,18 @@ mod tests {
         assert_eq!(redact_error_body(json), json);
         assert_eq!(redact_error_body("plain <text>"), "plain <text>");
         assert_eq!(redact_error_body(""), "");
+    }
+
+    #[test]
+    fn a_failed_creation_is_denied_only_for_401_and_403() {
+        let status = |c| reqwest::StatusCode::from_u16(c).expect("status");
+        for code in [401, 403] {
+            let err = create_failed("S3 CreateBucket", status(code), "AccessDenied");
+            assert!(matches!(err, Error::Denied(_)), "{err:?}");
+            assert!(err.to_string().contains("AccessDenied"), "{err}");
+        }
+        let err = create_failed("S3 CreateBucket", status(500), "boom");
+        assert!(matches!(err, Error::Generic(_)), "{err:?}");
+        assert!(err.to_string().contains("HTTP 500"), "{err}");
     }
 }

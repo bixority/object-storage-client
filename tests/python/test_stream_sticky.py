@@ -4,9 +4,7 @@ import asyncio
 import random
 
 import pytest
-
 from object_storage_client import DecryptionError
-
 from test_stream_leak import _tampered
 
 

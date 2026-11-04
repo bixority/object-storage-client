@@ -159,10 +159,9 @@ fn motion_ignores_empty_and_stale_panels() {
     assert_eq!(panel.cursor_moves, 0);
 
     let mut s = listed(3);
-    go(&mut s, Motion::Down);
+    act(&mut s, Action::Select(Side::Left, SelectOp::Only(row(2))));
     act(&mut s, Action::Refresh(Side::Left));
     assert!(s.panels[0].stale());
-    act(&mut s, Action::Select(Side::Left, SelectOp::Only(row(2))));
     let moves = s.panels[0].cursor_moves;
     let selection = s.panels[0].selection.clone();
     let cursor = s.panels[0].cursor.clone();
@@ -172,6 +171,47 @@ fn motion_ignores_empty_and_stale_panels() {
     assert_eq!(panel.selection, selection);
     assert_eq!(panel.cursor, cursor);
     assert_eq!(panel.cursor_moves, moves);
+}
+
+#[test]
+fn stale_rows_cannot_be_selected() {
+    let mut s = listed(3);
+    act(&mut s, Action::Up(Side::Left));
+    assert!(s.panels[0].stale());
+    act(&mut s, Action::Select(Side::Left, SelectOp::All));
+    assert_eq!(s.panels[0].selection, BTreeSet::new());
+    act(&mut s, Action::Select(Side::Left, SelectOp::Toggle(row(1))));
+    act(&mut s, Action::Select(Side::Left, SelectOp::Range(row(1))));
+    assert_eq!(s.panels[0].selection, BTreeSet::new());
+    assert_eq!(s.panels[0].cursor, None);
+}
+
+#[test]
+fn stale_rows_cannot_be_opened() {
+    let mut s = state();
+    crate::gui::action::update(&mut s, page(Side::Left, 1, true, vec![dir("d")], None));
+    act(&mut s, Action::Up(Side::Left));
+    let parent = s.panels[0].location.clone();
+    assert_eq!(
+        act(&mut s, Action::Open(Side::Left, "d".to_owned())),
+        vec![]
+    );
+    assert_eq!(s.panels[0].location, parent);
+}
+
+#[test]
+fn opening_twice_in_one_frame_stays_in_the_first_folder() {
+    let mut s = state();
+    crate::gui::action::update(&mut s, page(Side::Left, 1, true, vec![dir("d")], None));
+    assert_eq!(
+        act(&mut s, Action::Open(Side::Left, "d".to_owned())).len(),
+        1
+    );
+    assert_eq!(
+        act(&mut s, Action::Open(Side::Left, "d".to_owned())),
+        vec![]
+    );
+    assert_eq!(s.panels[0].location.as_str(), "file:///l/d/");
 }
 
 #[test]

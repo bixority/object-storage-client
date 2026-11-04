@@ -26,6 +26,16 @@ pub(super) struct TreeFile {
     dirs: Vec<FileId>,
 }
 
+/// A file opened by [`SourceTree::open`], with what the descriptor reports.
+#[derive(Debug)]
+pub(super) struct OpenedFile {
+    pub file: fs::File,
+    /// Its size now.
+    pub size: u64,
+    /// Its permission bits (`0` where the platform has none to copy).
+    pub mode: u32,
+}
+
 /// A source directory tree walked for a recursive upload.
 ///
 /// On Unix the walk goes through directory file descriptors: the root is
@@ -164,7 +174,7 @@ impl SourceTree {
     ///
     /// [`CliError::UnsafePath`] when the tree changed since the scan,
     /// [`CliError::ReadFile`] when it cannot be opened.
-    pub fn open(&self, file: &TreeFile) -> Result<tokio::fs::File, CliError> {
+    pub fn open(&self, file: &TreeFile) -> Result<OpenedFile, CliError> {
         use rustix::fs::{Mode, OFlags, openat};
         use std::os::fd::{AsFd, OwnedFd};
         let path = self.display_path(file);
@@ -207,7 +217,13 @@ impl SourceTree {
         if stat_id(&st) != file.id {
             return Err(changed("file changed after the directory scan"));
         }
-        Ok(tokio::fs::File::from_std(fs::File::from(fd)))
+        #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+        let (size, mode) = (st.st_size as u64, (st.st_mode & 0o777) as u32);
+        Ok(OpenedFile {
+            file: fs::File::from(fd),
+            size,
+            mode,
+        })
     }
 }
 
@@ -360,17 +376,22 @@ impl SourceTree {
     ///
     /// [`CliError::UnsafePath`] when the path is no longer a regular file,
     /// [`CliError::ReadFile`] when it cannot be opened.
-    pub fn open(&self, file: &TreeFile) -> Result<tokio::fs::File, CliError> {
+    pub fn open(&self, file: &TreeFile) -> Result<OpenedFile, CliError> {
         let path = self.display_path(file);
         let read_err = read_err(&path);
         let opened = fs::File::open(&path).map_err(&read_err)?;
-        if !opened.metadata().map_err(read_err)?.is_file() {
+        let meta = opened.metadata().map_err(read_err)?;
+        if !meta.is_file() {
             return Err(CliError::UnsafePath {
                 path: path.display().to_string(),
                 reason: "path is no longer a regular file",
             });
         }
-        Ok(tokio::fs::File::from_std(opened))
+        Ok(OpenedFile {
+            file: opened,
+            size: meta.len(),
+            mode: 0,
+        })
     }
 }
 

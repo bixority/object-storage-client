@@ -21,9 +21,10 @@ from pathlib import Path
 
 MIB = 1 << 20
 # Peak RSS budgets in MB, from the performance plan: a get or get-stream stays
-# near the baseline whatever the size, a single upload holds about
-# (4 + 1) x 8 MiB of parts plus slack.
-RSS_BUDGET_MB = {"get": 16.0, "get-stream": 16.0, "put": 40.0}
+# near the baseline whatever the size, and a put to file:// streams the source
+# in 512 KiB reads into a staging file (it never takes the multipart path), so
+# it gets the same budget.
+RSS_BUDGET_MB = {"get": 16.0, "get-stream": 16.0, "put": 16.0}
 CPU_RATIO_WARN = 2.5
 THROUGHPUT_REGRESSION_WARN = 0.25
 
@@ -102,7 +103,13 @@ def main():
         shutil.rmtree(work, ignore_errors=True)
 
     Path(args.out).write_text(json.dumps(results, indent=2) + "\n")
-    sys.exit(report(results, args))
+    code, warned = report(results, args)
+    # Lets the workflow keep a run that warned from becoming the next baseline.
+    github_output = os.environ.get("GITHUB_OUTPUT")
+    if github_output:
+        with open(github_output, "a") as f:
+            f.write(f"warned={'true' if warned else 'false'}\n")
+    sys.exit(code)
 
 
 def measure(osc, work, args):
@@ -163,7 +170,9 @@ def measure(osc, work, args):
 
 
 def report(results, args):
+    """Prints the findings; returns (exit code, whether any warning fired)."""
     failed = False
+    warned = False
     for r in results:
         budget = RSS_BUDGET_MB[r["op"]]
         if r["max_rss_mb_worst"] > budget:
@@ -176,6 +185,7 @@ def report(results, args):
     for op in RSS_BUDGET_MB:
         plain, enc = by[(op, "plain")], by[(op, "enc")]
         if plain["cpu_s"] > 0 and enc["cpu_s"] / plain["cpu_s"] > CPU_RATIO_WARN:
+            warned = True
             print(
                 f"::warning::{op}: encrypted CPU is {enc['cpu_s'] / plain['cpu_s']:.1f}x "
                 f"plain ({enc['cpu_s']} s vs {plain['cpu_s']} s)"
@@ -185,11 +195,12 @@ def report(results, args):
         for r in results:
             was = old.get(r["scenario"])
             if was and r["throughput_mb_s"] < was["throughput_mb_s"] * (1 - THROUGHPUT_REGRESSION_WARN):
+                warned = True
                 print(
                     f"::warning::{r['scenario']}: {r['throughput_mb_s']} MB/s is more than "
                     f"{THROUGHPUT_REGRESSION_WARN:.0%} below the baseline {was['throughput_mb_s']} MB/s"
                 )
-    return 1 if failed else 0
+    return (1 if failed else 0), warned
 
 
 if __name__ == "__main__":

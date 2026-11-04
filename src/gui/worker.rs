@@ -14,8 +14,7 @@ use crate::upload::drain_pending_aborts;
 use crate::{Client, Codec};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
@@ -125,22 +124,21 @@ impl<C: Codec> Worker<C> {
             } => self.list(side, seq, url, token),
             Command::Plan { job, batch } => {
                 let client = Arc::clone(&self.client);
-                self.start(job, None, Vec::new(), async move {
+                self.start(job, None, async move {
                     let plan = ops::plan(&client, batch).await;
                     Event::Planned { job, plan }
                 });
             }
             Command::Execute {
                 job,
-                plan,
+                mut plan,
                 on_existing,
             } => {
                 let client = Arc::clone(&self.client);
-                let progress = Arc::new(Progress::default());
+                let progress = Arc::new(Progress::new(std::mem::take(&mut plan.failures)));
                 let counters = Arc::clone(&progress);
-                let planned = plan.failures.clone();
                 let sink = self.sink.clone();
-                self.start(job, Some(progress), planned, async move {
+                self.start(job, Some(progress), async move {
                     let notify = move |done: usize, total: usize, current: &str| {
                         sink.send(Event::Progress {
                             job,
@@ -188,13 +186,8 @@ impl<C: Codec> Worker<C> {
 
     /// Runs `work` as job `id`. A supervisor reports its event, or a
     /// `Finished` built from `progress` when it was aborted or panicked.
-    fn start<F>(
-        &mut self,
-        id: JobId,
-        progress: Option<Arc<Progress>>,
-        planned: Vec<Failure>,
-        work: F,
-    ) where
+    fn start<F>(&mut self, id: JobId, progress: Option<Arc<Progress>>, work: F)
+    where
         F: Future<Output = Event> + Send + 'static,
     {
         self.jobs
@@ -206,7 +199,8 @@ impl<C: Codec> Worker<C> {
             let event = match task.await {
                 Ok(event) => event,
                 Err(err) => {
-                    let mut outcome = interrupted_outcome(progress.as_deref(), planned);
+                    let mut outcome =
+                        progress.map_or_else(Outcome::default, |progress| progress.outcome());
                     if err.is_cancelled() {
                         outcome.cancelled = true;
                     } else {
@@ -248,29 +242,6 @@ impl<C: Codec> Worker<C> {
             drain_pending_aborts(DRAIN_TIMEOUT).await;
         };
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, drained).await;
-    }
-}
-
-/// What an aborted or failed job got done, from its counters.
-fn interrupted_outcome(progress: Option<&Progress>, mut failures: Vec<Failure>) -> Outcome {
-    let Some(progress) = progress else {
-        return Outcome {
-            failures,
-            ..Outcome::default()
-        };
-    };
-    failures.extend(
-        progress
-            .failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .cloned(),
-    );
-    Outcome {
-        done: progress.succeeded.load(Ordering::SeqCst),
-        cancelled: false,
-        failures,
     }
 }
 

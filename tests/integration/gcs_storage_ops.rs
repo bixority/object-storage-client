@@ -117,6 +117,44 @@ async fn test_gcs_metadata() -> TestResult {
     Ok(())
 }
 
+/// A copy or move between two buckets is done server-side by `objects.rewrite`
+/// (a streamed copy would need the XML API write the emulator rejects), keeps
+/// the content type, and a move removes the source only afterwards.
+#[tokio::test]
+#[ignore = "needs a container runtime (docker or podman)"]
+async fn test_gcs_copy_and_move_across_buckets() -> TestResult {
+    let client = gcs_client();
+    let (one, two) = (new_bucket(&client).await?, new_bucket(&client).await?);
+    let data: Vec<u8> = (0..(3u32 << 20))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    seed(&one, "dir/src.bin", "application/x-test", data.clone()).await?;
+    let src = format!("{one}dir/src.bin");
+
+    let copied = format!("{two}copied/a b.bin");
+    client.copy(&src, &copied).await?;
+    assert!(
+        client.get(&copied).await?.as_ref() == data.as_slice(),
+        "copied content"
+    );
+    assert!(client.exists(&src).await?, "copy keeps the source");
+    let meta = client.get_object_metadata(&copied).await?;
+    assert_eq!(meta.content_type.as_deref(), Some("application/x-test"));
+
+    let moved = format!("{two}moved.bin");
+    client.move_object(&src, &moved).await?;
+    assert!(!client.exists(&src).await?, "move removes the source");
+    assert!(
+        client.get(&moved).await?.as_ref() == data.as_slice(),
+        "moved content"
+    );
+
+    // A missing source fails and writes nothing.
+    assert!(client.copy(&src, &format!("{two}never")).await.is_err());
+    assert!(!client.exists(&format!("{two}never")).await?);
+    Ok(())
+}
+
 /// Evidence for the limitation described in the module docs: when this fails
 /// because writes succeed, the emulator gained XML API support and the
 /// write-path tests (put, `put_stream`, multipart, copy, move) can be added.

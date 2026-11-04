@@ -13,6 +13,7 @@
 
 - **Rust library**: `cargo build --release`
 - **CLI**: `cargo build --release --bin osc`
+- **Desktop browser**: `cargo build --release --features gui --bin osc-gui`
 - **Python wheel**: `maturin build --release`
 - **Python bindings into the project's virtualenv**:
   `uv sync --group dev --no-install-project`, then
@@ -25,14 +26,15 @@ The committed `.cargo/config.toml` also drives the PyPI wheels, the sdist and th
 | Feature                | Purpose                                                          |
 |------------------------|------------------------------------------------------------------|
 | `encryption` (default) | Client-side encryption                                           |
-| `cli` (default)        | The `osc` binary and its `clap` dependency                       |
+| `cli` (default)        | The `osc` binary and its `clap` dependency; implies `encryption` |
+| `gui`                  | The `osc-gui` binary; implies `cli` and `encryption`             |
 | `python`               | The pyo3 bindings, built by maturin                              |
 | `fuzzing`              | Exposes `encryption::fuzzing` entry points for the `fuzz/` crate |
 
 AWS profile and SSO support is always compiled in; do not gate it behind a
-feature. It adds 37 crates to every build, the wheel and the
-`default-features = false` library builds included (`Cargo.lock` grows from 333
-to 370 packages; there is still no `ring`). The direct dependencies are
+feature. It is part of every build, the wheel and the
+`default-features = false` library builds included (there is still no `ring`).
+The direct dependencies are
 `aws-config` (with `sso`, `rt-tokio`, `default-https-client` and
 `credentials-process`), `aws-credential-types`, `aws-runtime`, `aws-types` and
 `tracing`; `aws-smithy-runtime-api` and `aws-smithy-types` are dev-dependencies
@@ -57,11 +59,18 @@ CI runs these on every pull request, alongside the tests:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
-cargo clippy --locked --all-targets --no-default-features -- -D warnings -W clippy::pedantic
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --all-targets --no-default-features -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --features encryption -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --features python -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --features cli -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --features gui -- -D warnings
 cargo check --locked --no-default-features --features python
 cargo check --locked --features fuzzing
-cargo check --manifest-path fuzz/Cargo.toml
+cargo check --locked --no-default-features --lib
+cargo check --locked --no-default-features --features encryption --lib
+cargo check --locked --no-default-features --features gui --bins
+cargo check --locked --manifest-path fuzz/Cargo.toml --target-dir target
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
@@ -82,23 +91,29 @@ are working directories and stay ignored. To keep a crash, minimise it with
 add the output to `fuzz/seeds/<target>/` in the commit that fixes it. There is
 no scheduled fuzzing job.
 
+`fuzz/Cargo.lock` is committed, so CI builds the fuzz crate with `--locked`
+and `cargo deny` checks it (`manifest-path: fuzz/Cargo.toml`); Dependabot
+watches `/fuzz` too. It started as a copy of the root `Cargo.lock`, so shared
+crates have the same versions. After a root dependency change, refresh it with
+`cargo update --manifest-path fuzz/Cargo.toml` and commit it.
+
 ## Layout
 
 - `src/client.rs`, `src/codec.rs`: the `Client` API and the plain codec
 - `src/backend/`: one module per storage provider
 - `src/encryption/`: message format, framing, keyrings and the encrypting codec
 - `src/cli.rs`, `src/cli/`, `src/main.rs`: the `osc` binary
+- `src/gui.rs`, `src/gui/`, `src/bin/osc-gui.rs`: the `osc-gui` binary
 - `src/python/`, `python/object_storage_client/`: the bindings and their type stubs
 - `tests/`, `benches/`, `fuzz/`, `scripts/`: see [Testing](TESTING.md)
 - `compose.yml`: Garage and Azurite for manual exploration (`docker compose up`)
-- `docs/superpowers/specs/`: design documents
 
 ## Workflows
 
 - `tests.yaml`: tests, lints, a `cargo deny` check (advisories, bans, sources;
   see `deny.toml`), feature builds, Python tests and the AWS Encryption SDK
   interop check, on pushes to `main` and on pull requests. Every cargo call
-  on the root crate passes `--locked`, so a `Cargo.toml` change without its
+  on the root crate and the fuzz crate passes `--locked`, so a `Cargo.toml` change without its
   lockfile fails the PR. Further jobs:
   - `msrv` runs `cargo check --locked --all-features --all-targets` with Rust
     1.99, the `rust-version` in `Cargo.toml`.
@@ -109,10 +124,13 @@ no scheduled fuzzing job.
   Runs on `main` are never cancelled. Its last job,
   `dependabot-merge`, runs after every other job and merges only Dependabot
   cargo patch updates of crates outside the reviewed list; everything else
-  stays open for review.
+  stays open for review. After a merge it dispatches `tests.yaml` on `main`
+  (`workflow_dispatch`), because a merge made with `GITHUB_TOKEN` starts no
+  push run, so the merged commit would otherwise go untested.
 - `perf.yaml`: benchmarks and the memory smoke test, nightly or on demand.
-- `ci.yaml`: when a release is published, tests (stable Rust only, so a
-  beta or nightly problem cannot block a release), then builds wheels for
+- `ci.yaml`: when a release is published, tests and a `cargo deny` check
+  (stable Rust only, so a beta or nightly problem cannot block a release;
+  both publish jobs wait for the deny check), then builds wheels for
   Python 3.13, 3.14 and 3.15 and the sdist. `test-wheels` installs every
   wheel into a fresh environment on its own platform (Linux x86_64, macOS,
   Windows, and the aarch64 Linux wheel under QEMU in its manylinux image;

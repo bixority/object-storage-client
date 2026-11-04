@@ -9,14 +9,15 @@ use zeroize::Zeroizing;
 use super::context::EncryptionContext;
 use super::header::{FormatError, short_debug};
 
-pub use super::header::EncryptedDataKey;
+pub(crate) use super::header::EncryptedDataKey;
 
 pub mod keyring;
 #[expect(clippy::redundant_pub_crate)]
 pub(crate) mod raw_aes;
 
 pub use keyring::{
-    KeyInfo, Keyring, KeyringStatus, activate_key, add_key, new_keyring, retire_key, rotate_keyring,
+    KeyInfo, Keyring, KeyringStatus, activate_key, add_key, add_key_with_id, new_keyring,
+    retire_key, rotate_keyring,
 };
 
 /// A 32-byte data encryption key. Zeroized on drop; deliberately not `Clone`,
@@ -24,7 +25,7 @@ pub use keyring::{
 ///
 /// The bytes live in a zeroing heap box, so moving a `DataKey` moves a pointer
 /// and leaves no unwiped stack copy behind.
-pub struct DataKey(Box<Zeroizing<[u8; 32]>>);
+pub(crate) struct DataKey(Box<Zeroizing<[u8; 32]>>);
 
 impl DataKey {
     /// A fresh random key, written straight into its zeroizing buffer.
@@ -60,7 +61,7 @@ pub enum KeyError {
     /// None of the EDKs names a key this provider holds. `key_ids` are the key
     /// names of the EDKs in this provider's namespace; `foreign_provider_ids`
     /// are the namespaces of the EDKs that belong to other providers. Both come
-    /// from the unauthenticated header.
+    /// from the unauthenticated header: print them only through `listed`.
     #[error("{}", unknown_key_message(.key_ids, .foreign_provider_ids))]
     UnknownKey {
         key_ids: Vec<String>,
@@ -86,7 +87,7 @@ pub enum KeyError {
     IdMismatch { id: String },
     /// Random generation failed. AWS-LC aborts the process on an internal
     /// RNG failure instead of reporting it, so the built-in key paths do not
-    /// return this; custom [`KeyProvider`]s may.
+    /// return this; it is kept for key providers that can fail.
     #[error("the random number generator failed")]
     Rng,
     /// The encryption context cannot be serialized.
@@ -158,9 +159,10 @@ impl std::fmt::Debug for KeyError {
                 .field("key_ids", &Names(key_ids))
                 .field("foreign_provider_ids", &Names(foreign_provider_ids))
                 .finish(),
+            // The keyring's own key name, not header text.
             Self::UnwrapFailed { key_id } => f
                 .debug_struct("UnwrapFailed")
-                .field("key_id", &format_args!("{}", short_debug(key_id)))
+                .field("key_id", key_id)
                 .finish(),
             Self::Permissions { path, mode } => f
                 .debug_struct("Permissions")
@@ -232,19 +234,23 @@ fn unknown_key_message(key_ids: &[String], foreign: &[String]) -> String {
     }
 }
 
-/// Source of data-key wrapping keys.
-///
-/// Implementations outside this crate are not supported in Phase 1: the
-/// [`DataKey`] constructors and accessors are crate-private, so a foreign
-/// implementation cannot create or read data keys.
+/// Source of data-key wrapping keys. Crate-private: [`Keyring`] is the only
+/// provider the public API takes.
 #[async_trait]
-pub trait KeyProvider: Send + Sync + std::fmt::Debug {
+pub(crate) trait KeyProvider: Send + Sync + std::fmt::Debug {
     /// Provider ID written into EDKs (`osc-file`).
     fn namespace(&self) -> &str;
 
     /// Name of the key new messages are wrapped with (owned: a reloadable
-    /// provider cannot lend a name from a snapshot that may be swapped).
+    /// provider cannot lend a name from a snapshot that may be swapped). A
+    /// reloadable provider may refresh before it answers.
     fn active_key_name(&self) -> String;
+
+    /// Whether this provider holds the key `id`, so it can unwrap data keys
+    /// wrapped by it. A reloadable provider may refresh before it answers.
+    fn holds_key(&self, _id: &str) -> bool {
+        true
+    }
 
     /// Wraps `dek` under the active key, binding `ctx`.
     ///
@@ -329,7 +335,7 @@ mod tests {
         let cases: Vec<(KeyError, &str)> = vec![
             (
                 KeyError::UnwrapFailed {
-                    key_id: "y".repeat(500),
+                    key_id: "kek-a".into(),
                 },
                 "UnwrapFailed",
             ),

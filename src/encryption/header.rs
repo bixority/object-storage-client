@@ -10,6 +10,10 @@ const CONTENT_FRAMED: u8 = 0x02;
 /// `content_type | frame_length | suite_data | auth_tag`
 const TAIL_LEN: usize = 1 + 4 + 32 + 16;
 
+/// Bytes needed to classify an object (version byte and suite id); with fewer
+/// the object is `NotOsc`, with enough but an incomplete header `Truncated`.
+pub const CLASSIFY_LEN: usize = 3;
+
 /// Longest attacker-controlled string echoed into an error message.
 const MAX_ECHO_CHARS: usize = 64;
 
@@ -35,13 +39,13 @@ pub fn short_debug_tail(s: &str) -> String {
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FormatError {
-    /// Not an OSC/ESDK message (first byte is not `0x01` or `0x02`).
+    /// Not an OSC/ESDK message (the first three bytes match no known prefix).
     #[error("not an encrypted object")]
     NotOsc,
     /// ESDK message version other than 2.
     #[error("unsupported message version")]
     UnsupportedVersion,
-    /// Algorithm suite other than `0x0478`.
+    /// Algorithm suite `0x0578` (signed variant); other values are `NotOsc`.
     #[error("unsupported algorithm suite 0x{0:04x}")]
     UnsupportedSuite(u16),
     /// Content type other than framed.
@@ -59,7 +63,8 @@ pub enum FormatError {
     /// Context lacks the `osc:fmt` marker.
     #[error("missing osc:fmt marker")]
     MissingFormatMarker,
-    /// `osc:fmt` has an unknown value.
+    /// `osc:fmt` has an unknown value. Unauthenticated header text: print it
+    /// through `short_debug` in `Display` and `Debug` alike.
     #[error("unknown osc format {}", short_debug(.0))]
     UnknownFormat(String),
     /// Caller context uses a reserved key.
@@ -91,10 +96,8 @@ impl std::fmt::Debug for FormatError {
                 .debug_tuple("UnknownFormat")
                 .field(&format_args!("{}", short_debug(v)))
                 .finish(),
-            Self::ReservedContextKey(k) => f
-                .debug_tuple("ReservedContextKey")
-                .field(&format_args!("{}", short_debug(k)))
-                .finish(),
+            // The caller's own context key, not header text.
+            Self::ReservedContextKey(k) => f.debug_tuple("ReservedContextKey").field(k).finish(),
             Self::Truncated => f.write_str("Truncated"),
             Self::Malformed(m) => f.debug_tuple("Malformed").field(m).finish(),
         }
@@ -126,7 +129,8 @@ impl Default for DecodeLimits {
 }
 
 impl DecodeLimits {
-    /// Checks a frame length about to be written: not zero, within the limits.
+    /// Checks a frame length being read or about to be written: not zero, within
+    /// the limits.
     pub(crate) fn check_frame_length(&self, n: u32) -> Result<(), FormatError> {
         if (self.min_frame_length.max(1)..=self.max_frame_length).contains(&n) {
             Ok(())
@@ -274,23 +278,23 @@ impl HeaderCodec {
     fn parse_inner(buf: &[u8], limits: &DecodeLimits) -> Result<HeaderParse, Stop> {
         // Classification (not OSC, old version) needs three bytes; with fewer
         // every reader sees the same thing: an object too short to judge.
-        if buf.len() < 3 {
-            return Err(Stop::More(3));
+        if buf.len() < CLASSIFY_LEN {
+            return Err(Stop::More(CLASSIFY_LEN));
         }
         let mut c = Cursor {
             buf,
             pos: 0,
             max: limits.max_header_len,
         };
-        match c.u8()? {
-            VERSION_2 => {}
-            0x01 => return Err(FormatError::UnsupportedVersion.into()),
+        // Classify on the whole prefix so a plain object that merely starts
+        // with 0x01 or 0x02 is not mistaken for a damaged envelope.
+        match (buf[0], buf[1], buf[2]) {
+            (VERSION_2, 0x04, 0x78) => {}
+            (VERSION_2, 0x05, 0x78) => return Err(FormatError::UnsupportedSuite(0x0578).into()),
+            (0x01, 0x80, _) => return Err(FormatError::UnsupportedVersion.into()),
             _ => return Err(FormatError::NotOsc.into()),
         }
-        let suite = c.u16()?;
-        if suite != SUITE_0478 {
-            return Err(FormatError::UnsupportedSuite(suite).into());
-        }
+        c.take(3)?;
         let message_id = c.array::<32>()?;
 
         let aad_len = usize::from(c.u16()?);
@@ -329,9 +333,7 @@ impl HeaderCodec {
             return Err(FormatError::NotFramed.into());
         }
         let frame_length = c.u32()?;
-        if frame_length < limits.min_frame_length || frame_length > limits.max_frame_length {
-            return Err(FormatError::FrameLengthOutOfRange(frame_length).into());
-        }
+        limits.check_frame_length(frame_length)?;
         let commitment = c.array::<32>()?;
         let auth_tag = c.array::<16>()?;
 
@@ -406,8 +408,6 @@ mod tests {
         let d = format!("{:?}", FormatError::UnknownFormat("x".repeat(10_000)));
         assert!(d.len() < 300, "{}", d.len());
         assert!(d.starts_with("UnknownFormat"), "{d}");
-        let d = format!("{:?}", FormatError::ReservedContextKey("k".repeat(10_000)));
-        assert!(d.len() < 300, "{}", d.len());
     }
 
     #[test]
@@ -559,8 +559,12 @@ mod tests {
         let mut b = ser(&sample());
         b[0] = 0x55;
         assert_eq!(parse_err(&b), FormatError::NotOsc);
+        // Only the whole prefix counts: a bare 0x01 or 0x02 is not an envelope.
         b[0] = 0x01;
+        assert_eq!(parse_err(&b), FormatError::NotOsc);
+        b[1] = 0x80;
         assert_eq!(parse_err(&b), FormatError::UnsupportedVersion);
+        assert_eq!(parse_err(&[0x02, 0x9a, 0x11, 0, 0]), FormatError::NotOsc);
         // Classified from three bytes; fewer always need more.
         for bad in [0x55, 0x01] {
             let limits = DecodeLimits::default();
@@ -575,10 +579,10 @@ mod tests {
     #[test]
     fn unsupported_suite() {
         let mut b = ser(&sample());
-        b[1..3].copy_from_slice(&0x0378u16.to_be_bytes());
-        assert_eq!(parse_err(&b), FormatError::UnsupportedSuite(0x0378));
+        b[1..3].copy_from_slice(&0x0578u16.to_be_bytes());
+        assert_eq!(parse_err(&b), FormatError::UnsupportedSuite(0x0578));
         // rejected from the first three bytes alone
-        assert_eq!(parse_err(&b[..3]), FormatError::UnsupportedSuite(0x0378));
+        assert_eq!(parse_err(&b[..3]), FormatError::UnsupportedSuite(0x0578));
     }
 
     #[test]
@@ -613,6 +617,17 @@ mod tests {
             h.frame_length = bad;
             assert_eq!(parse_err(&ser(&h)), FormatError::FrameLengthOutOfRange(bad));
         }
+        // A reader with `min_frame_length: 0` still refuses zero, as the writer does.
+        let mut h = sample();
+        h.frame_length = 0;
+        let limits = DecodeLimits {
+            min_frame_length: 0,
+            ..DecodeLimits::default()
+        };
+        assert_eq!(
+            parse_err_with(&ser(&h), &limits),
+            FormatError::FrameLengthOutOfRange(0)
+        );
         for ok in [4096u32, 4 * 1024 * 1024] {
             let mut h = sample();
             h.frame_length = ok;

@@ -14,6 +14,7 @@ use pyo3::types::{PyBytes, PyList};
 use pyo3::types::{PyTuple, PyType};
 use pyo3_async_runtimes::TaskLocals;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -178,6 +179,35 @@ impl<T: Item> Shared<T> {
         drop(stream);
     }
 
+    /// Pops the parked batch without Python: the buffered items, `None` at
+    /// EOF, or the error. Buffered items come first. An error is yielded
+    /// once; `failed` stays set, and the owner is detached from Python, so no
+    /// reader can observe the slot afterwards. The one exception is a failure
+    /// a Python reader already raised before the hand-off: it is raised again
+    /// (this takes the GIL), never turned into a clean end.
+    fn take_native(&self) -> crate::Result<Option<VecDeque<T>>> {
+        let terminal = {
+            let mut slot = self.lock_slot();
+            if !slot.chunks.is_empty() {
+                slot.buffered = 0;
+                return Ok(Some(std::mem::take(&mut slot.chunks)));
+            }
+            slot.terminal.take()
+        };
+        // The slot lock is released first: `take` holds the GIL while it
+        // locks the slot, so taking the GIL under the lock could deadlock.
+        match terminal {
+            Some(Terminal::Err(e)) => Err(e),
+            Some(Terminal::Failed(ty, args)) => Err(crate::Error::Python(Python::attach(|py| {
+                ty.bind(py).call1(args.bind(py)).map_or_else(
+                    |_| PyRuntimeError::new_err(format!("{}: {}", ty.bind(py), args.bind(py))),
+                    PyErr::from_value,
+                )
+            }))),
+            Some(Terminal::Eof) | None => Ok(None),
+        }
+    }
+
     /// Pops the parked batch and converts it with `convert` (given the items
     /// and their total size): `None` at EOF, or the error. Buffered items come
     /// first; the error or EOF behind them is reported by the next call.
@@ -268,16 +298,38 @@ impl RawByteStream {
     /// call raises it again; EOF is never reported.
     fn take<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
         self.shared.take(py, "ByteStream", |py, chunks, total| {
-            PyBytes::new_with(py, total, |out| {
-                let mut at = 0;
+            // The writer does not zero-fill the buffer first.
+            PyBytes::new_with_writer(py, total, |out| {
                 for c in &chunks {
-                    out[at..at + c.len()].copy_from_slice(c);
-                    at += c.len();
+                    out.write_all(c)?;
                 }
                 Ok(())
             })
         })
     }
+}
+
+/// Adapts the native stream of a `ByteStream` to the crate's [`ByteStream`]
+/// without Python: no call per batch and no GIL while bytes move.
+///
+/// Chunks already parked (from an earlier cancelled read) come first. The
+/// stream ends after the first error.
+fn shared_to_stream(shared: Arc<Shared<Bytes>>) -> ByteStream {
+    futures::stream::unfold(Some((shared, VecDeque::new())), |state| async move {
+        let (shared, mut ready) = state?;
+        loop {
+            if let Some(b) = ready.pop_front() {
+                return Some((Ok(b), Some((shared, ready))));
+            }
+            shared.fill().await;
+            match shared.take_native() {
+                Ok(Some(batch)) => ready = batch,
+                Ok(None) => return None,
+                Err(e) => return Some((Err(e), None)),
+            }
+        }
+    })
+    .boxed()
 }
 
 /// Native half of `object_storage_client.ListStream` (private): the same
@@ -319,6 +371,9 @@ impl RawListStream {
     }
 }
 
+/// The Python module holding the wrappers of the native streams.
+const STREAM_MODULE: &str = "object_storage_client._stream";
+
 static BYTE_STREAM_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static LIST_STREAM_CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
@@ -350,6 +405,27 @@ impl<'py> IntoPyObject<'py> for ListStreamResult {
     }
 }
 
+/// Takes the native stream out of `obj` if it is a `ByteStream` (the exact
+/// class), closing that `ByteStream`. `None` for anything else. Raises
+/// `RuntimeError` if the stream is closed or a read is pending.
+pub fn take_byte_stream(obj: &Bound<'_, PyAny>) -> PyResult<Option<ByteStream>> {
+    let cls = BYTE_STREAM_CLS.import(obj.py(), STREAM_MODULE, "ByteStream")?;
+    if !obj.get_type().is(cls) {
+        return Ok(None);
+    }
+    // Only a native stream is piped; anything else keeps the generic path,
+    // and is checked before the stream is detached, so it is never half taken.
+    if !obj
+        .getattr(intern!(obj.py(), "_raw"))?
+        .is_instance_of::<RawByteStream>()
+    {
+        return Ok(None);
+    }
+    let raw = obj.call_method0(intern!(obj.py(), "_detach_native"))?;
+    let raw = raw.cast::<RawByteStream>()?.get();
+    Ok(Some(shared_to_stream(Arc::clone(&raw.shared))))
+}
+
 /// Wraps a native stream in the Python class `name` of `_stream`.
 fn wrap_stream<'py, T: PyTypeInfo>(
     py: Python<'py>,
@@ -357,14 +433,7 @@ fn wrap_stream<'py, T: PyTypeInfo>(
     name: &str,
     raw: Py<T>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let cls = cache.get_or_try_init(py, || {
-        PyResult::Ok(
-            py.import("object_storage_client._stream")?
-                .getattr(name)?
-                .unbind(),
-        )
-    })?;
-    cls.bind(py).call1((raw,))
+    cache.import(py, STREAM_MODULE, name)?.call1((raw,))
 }
 
 /// Converts one item yielded by a Python async iterator into bytes. `bytes`
@@ -420,24 +489,13 @@ fn schedule_batch(
     locals: &TaskLocals,
     tx: tokio::sync::oneshot::Sender<PyResult<(Vec<Bytes>, bool)>>,
 ) -> PyResult<CancelOnDrop> {
-    let anext_batch = ANEXT_BATCH.get_or_try_init(py, || {
-        PyResult::Ok(
-            py.import("object_storage_client._stream")?
-                .getattr("_anext_batch")?
-                .unbind(),
-        )
-    })?;
-    let run_threadsafe = RUN_COROUTINE_THREADSAFE.get_or_try_init(py, || {
-        PyResult::Ok(
-            py.import("asyncio")?
-                .getattr("run_coroutine_threadsafe")?
-                .unbind(),
-        )
-    })?;
-    let coro = anext_batch.bind(py).call1((it.bind(py), BATCH_BYTES))?;
+    let anext_batch = ANEXT_BATCH.import(py, STREAM_MODULE, "_anext_batch")?;
+    let run_threadsafe =
+        RUN_COROUTINE_THREADSAFE.import(py, "asyncio", "run_coroutine_threadsafe")?;
+    let coro = anext_batch.call1((it.bind(py), BATCH_BYTES))?;
     let cf = locals.context(py).call_method1(
         intern!(py, "run"),
-        (run_threadsafe.bind(py), coro, locals.event_loop(py)),
+        (run_threadsafe, coro, locals.event_loop(py)),
     )?;
     let tx = std::sync::Mutex::new(Some(tx));
     let done = PyCFunction::new_closure(py, None, None, move |args, _| {
@@ -602,6 +660,53 @@ mod tests {
         assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 2_000);
         assert_eq!(batches[0].len(), BATCH_BYTES / 1000);
         assert!(batches.iter().all(|b| b.len() <= BATCH_BYTES / 1000));
+    }
+
+    fn bytes_shared(items: Vec<crate::Result<Bytes>>) -> Arc<Shared<Bytes>> {
+        Arc::new(Shared::new(futures::stream::iter(items).boxed()))
+    }
+
+    fn collect(shared: Arc<Shared<Bytes>>) -> Vec<crate::Result<Bytes>> {
+        runtime().block_on(shared_to_stream(shared).collect())
+    }
+
+    #[test]
+    fn the_native_adapter_yields_chunks_then_ends() {
+        let shared = bytes_shared(vec![Ok(Bytes::from("ab")), Ok(Bytes::from("cd"))]);
+        let got = collect(shared);
+        let got: Vec<_> = got.into_iter().map(|r| r.expect("chunk")).collect();
+        assert_eq!(got, [Bytes::from("ab"), Bytes::from("cd")]);
+    }
+
+    #[test]
+    fn the_native_adapter_yields_an_error_once_then_ends() {
+        let shared = bytes_shared(vec![
+            Ok(Bytes::from("ab")),
+            Err(crate::Error::InvalidInput("boom".into())),
+            Ok(Bytes::from("never")),
+        ]);
+        let got = collect(Arc::clone(&shared));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].as_ref().expect("chunk"), &Bytes::from("ab"));
+        assert!(matches!(&got[1], Err(crate::Error::InvalidInput(m)) if m == "boom"));
+        assert!(shared.failed.load(Ordering::Acquire));
+        // A later take sees neither the error again nor a clean end.
+        assert!(matches!(shared.take_native(), Ok(None)));
+    }
+
+    #[test]
+    fn the_native_adapter_yields_parked_chunks_first() {
+        let shared = bytes_shared(vec![Ok(Bytes::from("rest"))]);
+        {
+            let mut slot = shared.lock_slot();
+            slot.buffered = 4;
+            slot.chunks.push_back(Bytes::from("park"));
+        }
+        let got: Vec<_> = collect(shared)
+            .into_iter()
+            .map(|r| r.expect("chunk"))
+            .collect();
+        assert_eq!(got, [Bytes::from("park"), Bytes::from("rest")]);
     }
 
     #[test]

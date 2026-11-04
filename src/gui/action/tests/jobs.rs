@@ -1,6 +1,6 @@
 //! Job and dialog rules.
 
-use super::{act, dir, loc, obj, page, state};
+use super::{act, dir, loc, obj, page, plan, planned, state};
 use crate::gui::action::{Action, Answer, Command, Event, Msg, SelectOp, update};
 use crate::gui::model::{
     AppState, Batch, Dialog, Encryption, Entry, Failure, Item, JobId, JobPhase, OnExisting, OpKind,
@@ -28,27 +28,9 @@ fn transfer(src: &str, dst: &str, exists: Option<bool>) -> Item {
         src: src.to_owned(),
         dst: dst.to_owned(),
         rel: "a".to_owned(),
+        size: 1,
         exists,
     }
-}
-
-fn plan(kind: OpKind, items: Vec<Item>, checked: bool) -> Plan {
-    Plan {
-        kind,
-        items,
-        checked,
-        failures: Vec::new(),
-    }
-}
-
-fn planned(s: &mut AppState, job: u64, plan: Plan) -> Vec<Command> {
-    update(
-        s,
-        Msg::Event(Event::Planned {
-            job: JobId(job),
-            plan,
-        }),
-    )
 }
 
 fn answer(s: &mut AppState, answer: Answer) -> Vec<Command> {
@@ -124,6 +106,28 @@ fn copy_into_same_folder_is_refused() {
     assert_eq!(s.job, None);
     assert_eq!(act(&mut s, Action::Move), vec![]);
     assert_eq!(s.job, None);
+}
+
+#[test]
+fn encoded_alike_folders_are_the_same_folder() {
+    let mut s = with_selection(
+        "file:///x/(a)/",
+        "file:///x/%28a%29/",
+        vec![obj("f")],
+        &["f"],
+    );
+    assert_eq!(act(&mut s, Action::Copy), vec![]);
+    assert!(s.status.contains("same folder"), "{}", s.status);
+}
+
+#[test]
+fn folder_into_itself_is_refused_whatever_the_encoding() {
+    for name in ["a (1)", "a+b"] {
+        let dst = format!("file:///x/{name}/b/");
+        let mut s = with_selection("file:///x/", &dst, vec![dir(name)], &[name]);
+        assert_eq!(act(&mut s, Action::Copy), vec![], "{name}");
+        assert_eq!(s.status, "Cannot copy a folder into itself", "{name}");
+    }
 }
 
 #[test]
@@ -522,20 +526,13 @@ fn finished_refreshes_and_reports_failures() {
     let commands = finished(&mut s, 1, outcome.clone());
     assert_eq!(
         commands,
-        vec![
-            Command::List {
-                side: Side::Left,
-                seq: 2,
-                url: "file:///l/".to_owned(),
-                token: None,
-            },
-            Command::List {
-                side: Side::Right,
-                seq: 2,
-                url: "file:///r/".to_owned(),
-                token: None,
-            },
-        ]
+        // A copy changes only its destination.
+        vec![Command::List {
+            side: Side::Right,
+            seq: 2,
+            url: "file:///r/".to_owned(),
+            token: None,
+        }]
     );
     assert_eq!(s.job, None);
     assert_eq!(
@@ -551,12 +548,18 @@ fn finished_refreshes_and_reports_failures() {
 #[test]
 fn finished_status_texts() {
     let cases = [
-        (Action::Copy, OpKind::Copy, false, "4 copied"),
-        (Action::Move, OpKind::Move, false, "4 moved"),
-        (Action::Delete, OpKind::Delete, false, "4 deleted"),
-        (Action::Copy, OpKind::Copy, true, "Cancelled after 4 of 9"),
+        (Action::Copy, OpKind::Copy, false, "4 copied", 1),
+        (Action::Move, OpKind::Move, false, "4 moved", 2),
+        (Action::Delete, OpKind::Delete, false, "4 deleted", 1),
+        (
+            Action::Copy,
+            OpKind::Copy,
+            true,
+            "Cancelled after 4 of 9",
+            1,
+        ),
     ];
-    for (action, kind, cancelled, want) in cases {
+    for (action, kind, cancelled, want, refreshed) in cases {
         let mut s = one_selected();
         act(&mut s, action);
         planned(&mut s, 1, plan(kind, vec![], true));
@@ -577,7 +580,7 @@ fn finished_status_texts() {
             cancelled,
             failures: Vec::new(),
         };
-        assert_eq!(finished(&mut s, 1, outcome).len(), 2);
+        assert_eq!(finished(&mut s, 1, outcome).len(), refreshed);
         assert_eq!(s.status, want);
         assert_eq!(s.dialog, None);
     }
@@ -592,6 +595,8 @@ fn cancel_job_sends_abort() {
         act(&mut s, Action::CancelJob),
         vec![Command::Abort(JobId(1))]
     );
+    let mut s = one_selected();
+    act(&mut s, Action::Copy);
     planned(&mut s, 1, copy_plan());
     assert_eq!(phase(&s), Some(&JobPhase::Running));
     assert_eq!(
@@ -673,4 +678,88 @@ fn rename_keeps_a_same_named_entry_of_the_other_kind() {
         panic!("expected one plan: {commands:?}");
     };
     assert_eq!(batch.entries, vec![obj("x")]);
+}
+
+#[test]
+fn typed_address_survives_the_refresh_after_a_job() {
+    let mut s = one_selected();
+    act(&mut s, Action::Copy);
+    planned(&mut s, 1, copy_plan());
+    act(
+        &mut s,
+        Action::AddressEdited(Side::Right, "s3://other/".into()),
+    );
+    s.panels[1].address_error = Some("bad".to_owned());
+    let outcome = Outcome {
+        done: 1,
+        cancelled: false,
+        failures: Vec::new(),
+    };
+    assert_eq!(finished(&mut s, 1, outcome).len(), 1);
+    assert_eq!(s.panels[1].address_text, "s3://other/");
+    assert_eq!(s.panels[1].address_error.as_deref(), Some("bad"));
+    assert!(s.panels[1].loading);
+}
+
+#[test]
+fn finished_refreshes_a_panel_above_or_below_the_changed_folder() {
+    // The copy lands in `file:///r/x/`; the right panel shows its parent, the
+    // left one an unrelated folder, so only the right one is listed again.
+    let mut s = one_selected();
+    s.panels[1].location = loc("file:///r/x/y/");
+    act(&mut s, Action::Copy);
+    planned(&mut s, 1, copy_plan());
+    s.job.as_mut().expect("job").dst_dir = loc("file:///r/x/");
+    let outcome = Outcome {
+        done: 1,
+        cancelled: false,
+        failures: Vec::new(),
+    };
+    let commands = finished(&mut s, 1, outcome);
+    assert!(matches!(
+        commands.as_slice(),
+        [Command::List {
+            side: Side::Right,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn a_panel_the_job_did_not_touch_keeps_its_pages() {
+    let mut s = one_selected();
+    s.panels[1].next = Some("more".to_owned());
+    act(&mut s, Action::Delete);
+    planned(&mut s, 1, plan(OpKind::Delete, vec![], true));
+    if s.dialog.is_some() {
+        answer(&mut s, Answer::Proceed);
+    }
+    let outcome = Outcome {
+        done: 1,
+        cancelled: false,
+        failures: Vec::new(),
+    };
+    let commands = finished(&mut s, 1, outcome);
+    assert!(matches!(
+        commands.as_slice(),
+        [Command::List {
+            side: Side::Left,
+            ..
+        }]
+    ));
+    assert_eq!(s.panels[1].next.as_deref(), Some("more"));
+}
+
+#[test]
+fn cancel_during_planning_drops_the_plan() {
+    let mut s = one_selected();
+    act(&mut s, Action::Copy);
+    assert_eq!(
+        act(&mut s, Action::CancelJob),
+        vec![Command::Abort(JobId(1))]
+    );
+    assert_eq!(planned(&mut s, 1, copy_plan()), vec![]);
+    assert_eq!(s.job, None);
+    assert_eq!(s.dialog, None);
+    assert_eq!(s.status, "Cancelled");
 }

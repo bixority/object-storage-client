@@ -48,7 +48,7 @@ pub(super) const fn default_answer(dialog: &Dialog) -> Answer {
         | Dialog::ConfirmMove { .. }
         | Dialog::ConfirmDelete { .. }
         | Dialog::ConfirmBucketDelete { .. }
-        | Dialog::Quit { .. } => Answer::Cancel,
+        | Dialog::Quit => Answer::Cancel,
     }
 }
 
@@ -109,22 +109,24 @@ fn body(
             typed,
         } => bucket_delete(ui, *n, *folders, bucket, typed, actions),
         Dialog::Failures { kind, outcome } => failures(ui, *kind, outcome),
-        Dialog::Quit { done, total } => {
-            let doing = state.job.as_ref().map_or("working", |job| doing(job.kind));
-            // The job keeps running behind the question: show its live count.
-            let (done, total) = state
-                .job
-                .as_ref()
-                .map_or((*done, *total), |job| (job.done, job.total));
-            ui.heading(format!("Quit while {doing}?"));
-            ui.label(format!(
-                "{done} of {} done. Quitting stops the job; finished items stay done.",
-                count(total, "item")
-            ));
-            buttons(
-                ui,
-                &[("Quit", Answer::Proceed), ("Keep running", Answer::Cancel)],
-            )
+        Dialog::Quit => {
+            if let Some(job) = &state.job {
+                // The job keeps running behind the question: show its live count.
+                ui.heading(format!("Quit while {}?", doing(job.kind)));
+                ui.label(format!(
+                    "{} of {} done. Quitting stops the job; finished items stay done.",
+                    job.done,
+                    count(job.total, "item")
+                ));
+                buttons(
+                    ui,
+                    &[("Quit", Answer::Proceed), ("Keep running", Answer::Cancel)],
+                )
+            } else {
+                ui.heading("The job has ended.");
+                ui.label("Quit now?");
+                buttons(ui, &[("Quit", Answer::Proceed), ("Stay", Answer::Cancel)])
+            }
         }
     }
 }
@@ -161,6 +163,18 @@ fn buttons(ui: &mut egui::Ui, choices: &[(&str, Answer)]) -> Option<Answer> {
     picked
 }
 
+/// The dialog's single-line text field, focused unless something else is.
+fn dialog_field(ui: &mut egui::Ui, value: &str, actions: &mut Vec<Action>) {
+    let mut text = value.to_owned();
+    let field = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
+    if ui.memory(|m| m.focused().is_none()) {
+        field.request_focus();
+    }
+    if field.changed() {
+        actions.push(Action::DialogText(text));
+    }
+}
+
 fn rename(
     ui: &mut egui::Ui,
     from: &str,
@@ -170,14 +184,7 @@ fn rename(
 ) -> Option<Answer> {
     ui.heading("Rename");
     ui.label(format!("New name for {}:", display::text(from)));
-    let mut text = to.to_owned();
-    let field = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
-    if ui.memory(|m| m.focused().is_none()) {
-        field.request_focus();
-    }
-    if field.changed() {
-        actions.push(Action::DialogText(text));
-    }
+    dialog_field(ui, to, actions);
     if let Some(error) = error {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
@@ -215,14 +222,7 @@ fn bucket_delete(
     ui.label(format!(
         "This is the root of the bucket {bucket}. Type its name to confirm:"
     ));
-    let mut text = typed.to_owned();
-    let field = ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
-    if ui.memory(|m| m.focused().is_none()) {
-        field.request_focus();
-    }
-    if field.changed() {
-        actions.push(Action::DialogText(text));
-    }
+    dialog_field(ui, typed, actions);
     ui.add_space(8.0);
     let mut picked = None;
     ui.horizontal(|ui| {

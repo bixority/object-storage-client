@@ -17,3 +17,5 @@ mod encryption;
 #[cfg(feature = "encryption")]
 #[path = "functional/golden.rs"]
 mod golden;
+#[path = "functional/sign.rs"]
+mod sign;

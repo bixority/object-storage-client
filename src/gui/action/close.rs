@@ -31,10 +31,7 @@ pub(super) fn close_requested(state: &mut AppState) -> Vec<Command> {
     }
     match &state.job {
         Some(job) if matches!(job.phase, JobPhase::Planning | JobPhase::Running) => {
-            state.dialog = Some(Dialog::Quit {
-                done: job.done,
-                total: job.total,
-            });
+            state.dialog = Some(Dialog::Quit);
             Vec::new()
         }
         // A job waiting for an answer has not started: nothing to lose.
@@ -86,7 +83,7 @@ pub(super) fn worker_gone(state: &mut AppState) -> Vec<Command> {
     if matches!(
         state.dialog,
         Some(
-            Dialog::Quit { .. }
+            Dialog::Quit
                 | Dialog::Overwrite { .. }
                 | Dialog::Unchecked { .. }
                 | Dialog::ConfirmMove { .. }

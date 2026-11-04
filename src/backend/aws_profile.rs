@@ -18,7 +18,10 @@
 //! Configuration errors show their cause; every other failure shows a fixed
 //! text, because a `credential_process` helper's stderr or a response body can
 //! carry secrets. A failed lookup drops the SDK provider, so the next call
-//! re-reads the profile files and reports the real reason.
+//! re-reads the profile files and reports the real reason. While the cached
+//! credential has at least a minute left, a slow or failed refresh is not an
+//! error: the cached credential is served and the refresh is retried after 30
+//! seconds.
 
 use super::{Vars, parse_bool};
 use crate::client::{Error, Result};
@@ -32,17 +35,30 @@ use aws_runtime::env_config::EnvConfigValue;
 use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
 use aws_types::os_shim_internal::{Env, Fs};
 use futures::FutureExt as _;
+use futures::future::{BoxFuture, Shared};
 use object_store::aws::AwsCredential;
 use object_store::{CredentialProvider, Error as StoreError};
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
-use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::instrument::WithSubscriber;
 use tracing::subscriber::NoSubscriber;
 
 /// Refresh credentials this long before they expire.
 const REFRESH_MARGIN: Duration = Duration::from_mins(5);
+
+/// A cached credential with less than this left is no longer served in place of
+/// a refresh, so a pre-signed URL never starts with a few seconds to live.
+const MIN_LEFT: Duration = Duration::from_mins(1);
+
+/// How long a failed refresh is not retried while the cached credential is
+/// still usable.
+const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+/// How long a lookup that nobody finished may still be joined. A helper that
+/// hangs forever then does not block a new lookup until the process restarts.
+const STALE_LOOKUP: Duration = Duration::from_mins(5);
 
 /// The longest one credential lookup may take, lock wait included. It equals
 /// the registry's request budget; the SDK clients have no read timeout.
@@ -88,6 +104,7 @@ pub fn env_region(vars: &Vars) -> Option<String> {
 }
 
 /// A resolved credential and when it stops being usable.
+#[derive(Clone)]
 struct Cached {
     credential: Arc<AwsCredential>,
     expires: Option<SystemTime>,
@@ -97,13 +114,58 @@ impl Cached {
     fn is_fresh(&self, now: SystemTime) -> bool {
         self.expires.is_none_or(|at| now + REFRESH_MARGIN < at)
     }
+
+    /// Whether it may stand in for a refresh that is slow or failed.
+    fn is_usable(&self, now: SystemTime) -> bool {
+        self.expires.is_none_or(|at| now + MIN_LEFT < at)
+    }
 }
 
-/// The SDK provider (dropped after any failure) and the last good credential.
+/// One credential lookup that every caller can await. The error is text, so
+/// the output is `Clone` and no SDK error escapes.
+type Lookup = Shared<BoxFuture<'static, std::result::Result<Cached, String>>>;
+
+/// A lookup that has started and not been finished by any caller.
+struct InFlight {
+    id: u64,
+    started: Instant,
+    lookup: Lookup,
+}
+
+/// What the lock guards. It is never held across an await.
 #[derive(Default)]
 struct State {
-    provider: Option<ProfileFileCredentialsProvider>,
+    /// The SDK provider, dropped after any failure.
+    provider: Option<Arc<ProfileFileCredentialsProvider>>,
+    /// The last good credential.
     cached: Option<Cached>,
+    in_flight: Option<InFlight>,
+    /// Ids for `in_flight`.
+    started: u64,
+    /// No refresh before this, while the cached credential is usable.
+    retry_after: Option<Instant>,
+}
+
+/// What a caller does next.
+enum Step {
+    Ready(Arc<AwsCredential>),
+    /// Await the lookup. `fallback` replaces its failure.
+    Await {
+        id: u64,
+        lookup: Lookup,
+        fallback: Option<Arc<AwsCredential>>,
+    },
+}
+
+/// The first half of a decision, taken under the lock.
+enum Plan {
+    Done(Step),
+    /// Start a lookup. The provider is the cached one, if any; building a new
+    /// one reads the profile files, which must not happen under the lock.
+    Start {
+        provider: Option<Arc<ProfileFileCredentialsProvider>>,
+        fallback: Option<Arc<AwsCredential>>,
+    },
 }
 
 /// Test seams: replacements for what the SDK would reach over the network or
@@ -148,47 +210,193 @@ impl fmt::Debug for ProfileCredentials {
 }
 
 impl ProfileCredentials {
-    /// Resolve the credential, reusing the cached one while it is fresh.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Decide what the caller does: use the cache, or await a lookup, starting
+    /// one if none is running.
     #[expect(
         clippy::significant_drop_tightening,
-        reason = "the lock is held across the refresh so concurrent callers share one request"
+        reason = "one lock checks for a running lookup and registers the new one"
     )]
-    async fn lookup(&self) -> object_store::Result<Arc<AwsCredential>> {
-        // Held across the refresh so concurrent callers share one SSO request.
-        let mut state = self.state.lock().await;
-        let now = SystemTime::now();
-        if let Some(c) = state.cached.as_ref().filter(|c| c.is_fresh(now)) {
-            return Ok(Arc::clone(&c.credential));
+    fn step(&self) -> Step {
+        let (provider, fallback) = match self.plan() {
+            Plan::Done(step) => return step,
+            Plan::Start { provider, fallback } => (provider, fallback),
+        };
+        // Building reads the profile files, and the SDK logs that.
+        let provider = provider.unwrap_or_else(|| {
+            tracing::subscriber::with_default(NoSubscriber::default(), || {
+                Arc::new(self.build_provider())
+            })
+        });
+        let tick = Instant::now();
+        let mut state = self.state();
+        // Another caller may have started one meanwhile.
+        if let Some(f) = &state.in_flight {
+            return Step::Await {
+                id: f.id,
+                lookup: f.lookup.clone(),
+                fallback,
+            };
         }
-        // The SDK traces each request with its headers, and the redaction list
-        // of aws-smithy-runtime-api leaves out `x-amz-sso_bearer_token`, so the
-        // whole lookup runs without a subscriber: no host log may see that
-        // token, nor a helper's error text.
-        let result = async {
-            let provider = state.provider.get_or_insert_with(|| self.build_provider());
-            provider.provide_credentials().await
+        let provider = Arc::clone(state.provider.get_or_insert(provider));
+        let lookup = Self::start(self.profile.clone(), provider);
+        state.started += 1;
+        let id = state.started;
+        state.in_flight = Some(InFlight {
+            id,
+            started: tick,
+            lookup: lookup.clone(),
+        });
+        Step::Await {
+            id,
+            lookup,
+            fallback,
+        }
+    }
+
+    fn plan(&self) -> Plan {
+        let (now, tick) = (SystemTime::now(), Instant::now());
+        let mut state = self.state();
+        if let Some(c) = state.cached.as_ref().filter(|c| c.is_fresh(now)) {
+            return Plan::Done(Step::Ready(Arc::clone(&c.credential)));
+        }
+        let fallback = state
+            .cached
+            .as_ref()
+            .filter(|c| c.is_usable(now))
+            .map(|c| Arc::clone(&c.credential));
+        // A lookup that nobody finishes (its caller was dropped, or it hung) is
+        // abandoned. With a fallback it may run for one lookup timeout; without
+        // one it is joined longer, so a helper that is still running is not
+        // started twice.
+        let limit = if fallback.is_some() {
+            LOOKUP_TIMEOUT
+        } else {
+            STALE_LOOKUP
+        };
+        if state
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| tick.duration_since(f.started) >= limit)
+        {
+            state.in_flight = None;
+            state.provider = None;
+            if fallback.is_some() {
+                tracing::warn!(
+                    "AWS profile `{}` credential refresh did not finish; using the cached credential",
+                    self.profile
+                );
+            }
+        }
+        // A usable credential never waits for a refresh that is already running
+        // or that failed a moment ago.
+        if let Some(credential) = &fallback
+            && (state.in_flight.is_some() || state.retry_after.is_some_and(|t| tick < t))
+        {
+            return Plan::Done(Step::Ready(Arc::clone(credential)));
+        }
+        if let Some(f) = &state.in_flight {
+            return Plan::Done(Step::Await {
+                id: f.id,
+                lookup: f.lookup.clone(),
+                fallback,
+            });
+        }
+        Plan::Start {
+            provider: state.provider.clone(),
+            fallback,
+        }
+    }
+
+    /// The lookup itself. The SDK traces each request with its headers, and the
+    /// redaction list of aws-smithy-runtime-api leaves out
+    /// `x-amz-sso_bearer_token`, so it runs without a subscriber: no host log
+    /// may see that token, nor a helper's error text.
+    fn start(profile: String, provider: Arc<ProfileFileCredentialsProvider>) -> Lookup {
+        async move {
+            let creds = provider
+                .provide_credentials()
+                .await
+                .map_err(|e| describe(&profile, &e))?;
+            Ok(Cached {
+                credential: Arc::new(AwsCredential {
+                    key_id: creds.access_key_id().to_owned(),
+                    secret_key: creds.secret_access_key().to_owned(),
+                    token: creds.session_token().map(str::to_owned),
+                }),
+                expires: creds.expiry(),
+            })
         }
         .with_subscriber(NoSubscriber::default())
-        .await;
-        // A failed provider is dropped and rebuilt, re-reading the files. One
-        // dropped by a timeout stays in place.
-        let creds = result.map_err(|e| {
+        .boxed()
+        .shared()
+    }
+
+    /// Record the outcome of lookup `id`; only the first caller to see it does.
+    /// A failed provider is dropped and rebuilt, re-reading the files.
+    fn finish(&self, id: u64, result: &std::result::Result<Cached, String>) {
+        let mut state = self.state();
+        if state.in_flight.as_ref().is_none_or(|f| f.id != id) {
+            return;
+        }
+        state.in_flight = None;
+        if let Ok(cached) = result {
+            state.cached = Some(cached.clone());
+            state.retry_after = None;
+        } else {
             state.provider = None;
-            StoreError::Generic {
-                store: "S3",
-                source: describe(&self.profile, &e).into(),
-            }
-        })?;
-        let credential = Arc::new(AwsCredential {
-            key_id: creds.access_key_id().to_owned(),
-            secret_key: creds.secret_access_key().to_owned(),
-            token: creds.session_token().map(str::to_owned),
+            state.retry_after = Some(Instant::now() + RETRY_BACKOFF);
+        }
+    }
+
+    /// Resolve the credential: the cached one while it is fresh, else the
+    /// shared lookup. Callers share one lookup, so a SSO request or a
+    /// `credential_process` helper runs once however many wait.
+    async fn lookup(&self) -> object_store::Result<Arc<AwsCredential>> {
+        let (id, lookup, fallback) = match self.step() {
+            Step::Ready(credential) => return Ok(credential),
+            Step::Await {
+                id,
+                lookup,
+                fallback,
+            } => (id, lookup, fallback),
+        };
+        // Every caller is bounded by its own 30 s. With a fallback, a timeout
+        // abandons the lookup, so the refresh is retried after the back-off.
+        // Without one the lookup stays for the next caller to join (see
+        // `STALE_LOOKUP`). The helper process it started is not killed. The
+        // text is fixed: nothing from the SDK.
+        let waited = tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await;
+        let timed_out = waited.is_err();
+        let result = waited.unwrap_or_else(|_| {
+            Err(format!(
+                "AWS profile `{}` credentials unavailable: timed out after {} s",
+                self.profile,
+                LOOKUP_TIMEOUT.as_secs()
+            ))
         });
-        state.cached = Some(Cached {
-            credential: Arc::clone(&credential),
-            expires: creds.expiry(),
-        });
-        Ok(credential)
+        if !timed_out || fallback.is_some() {
+            self.finish(id, &result);
+        }
+        match result {
+            Ok(cached) => Ok(cached.credential),
+            // The text is already redacted, so it may be logged.
+            Err(text) => fallback.map_or_else(
+                || {
+                    Err(StoreError::Generic {
+                        store: "S3",
+                        source: text.clone().into(),
+                    })
+                },
+                |credential| {
+                    tracing::warn!("{text}; using the cached credential");
+                    Ok(credential)
+                },
+            ),
+        }
     }
 
     /// A provider for `profile`. Reads nothing until credentials are requested.
@@ -243,8 +451,9 @@ impl ProfileCredentials {
 }
 
 /// The state of one named AWS profile, built once per registry and shared by
-/// every S3 backend it creates: the profile files are parsed at most once and
-/// all backends sign through one credential cache.
+/// every S3 backend it creates: the S3 settings are read once, the credential
+/// provider re-reads the profile files when it is (re)built, and all backends
+/// sign through one credential cache.
 pub struct AwsProfile {
     name: String,
     files: Option<EnvConfigFiles>,
@@ -446,22 +655,7 @@ impl CredentialProvider for ProfileCredentials {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
-        // The deadline covers the wait for the lock too, so every caller is
-        // bounded by its own 30 s. A timed-out lookup drops the SDK future and
-        // leaves the provider in place. The text is fixed: nothing from the SDK.
-        tokio::time::timeout(LOOKUP_TIMEOUT, self.lookup())
-            .await
-            .unwrap_or_else(|_| {
-                Err(StoreError::Generic {
-                    store: "S3",
-                    source: format!(
-                        "AWS profile `{}` credentials unavailable: timed out after {} s",
-                        self.profile,
-                        LOOKUP_TIMEOUT.as_secs()
-                    )
-                    .into(),
-                })
-            })
+        self.lookup().await
     }
 }
 
@@ -974,6 +1168,10 @@ mod tests {
     enum Outcome {
         Credentials,
         FailFirst,
+        /// Every call after the first fails.
+        FailLater,
+        /// Every call after the first never answers.
+        HangLater,
         NotLoaded,
     }
 
@@ -1017,6 +1215,10 @@ mod tests {
                     Outcome::FailFirst if n == 0 => {
                         Err(CredentialsError::provider_error("TOPSECRET"))
                     }
+                    Outcome::FailLater if n > 0 => {
+                        Err(CredentialsError::provider_error("TOPSECRET"))
+                    }
+                    Outcome::HangLater if n > 0 => std::future::pending().await,
                     _ => Ok(Credentials::new(
                         this.key,
                         "fakesecret",
@@ -1132,6 +1334,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Silent {
         silent: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<AtomicUsize>,
     }
 
     impl ProvideCredentials for Silent {
@@ -1139,6 +1342,7 @@ mod tests {
         where
             Self: 'a,
         {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let silent = self.silent.load(Ordering::SeqCst);
             future::ProvideCredentials::new(async move {
                 if silent {
@@ -1150,9 +1354,21 @@ mod tests {
     }
 
     fn silent_profile() -> (ProfileCredentials, Arc<std::sync::atomic::AtomicBool>) {
+        let (creds, flag, _) = counted_silent_profile();
+        (creds, flag)
+    }
+
+    /// As [`silent_profile`], with the count of calls to the source.
+    fn counted_silent_profile() -> (
+        ProfileCredentials,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<AtomicUsize>,
+    ) {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let calls = Arc::new(AtomicUsize::new(0));
         let source = Silent {
             silent: Arc::clone(&flag),
+            calls: Arc::clone(&calls),
         };
         let creds = ProfileCredentials {
             hooks: Hooks {
@@ -1161,7 +1377,7 @@ mod tests {
             },
             ..creds("t", files(FAKE_PROFILE))
         };
-        (creds, flag)
+        (creds, flag, calls)
     }
 
     #[tokio::test(start_paused = true)]
@@ -1194,10 +1410,135 @@ mod tests {
             assert_eq!(at, Duration::from_secs(expected));
         }
 
-        // The lock is free again and the provider still works.
+        // The silent lookup is joined until it is stale; then a new one runs.
         flag.store(false, Ordering::SeqCst);
+        tokio::time::sleep(STALE_LOOKUP).await;
         let got = creds.get_credential().await.expect("recovers");
         assert_eq!(got.key_id, "AKIDLATE");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_lookup_is_joined_not_started_again() {
+        let (creds, flag, calls) = counted_silent_profile();
+        for _ in 0..2 {
+            let err = creds.get_credential().await.expect_err("times out");
+            assert!(err.to_string().contains("timed out"), "{err}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A lookup nobody finished is not joined for ever.
+        flag.store(false, Ordering::SeqCst);
+        tokio::time::sleep(STALE_LOOKUP).await;
+        let got = creds.get_credential().await.expect("new lookup");
+        assert_eq!(got.key_id, "AKIDLATE");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A provider whose first credential has 4 minutes left (usable, not
+    /// fresh) and whose later lookups behave as `outcome`.
+    async fn almost_expired(outcome: Outcome) -> (Fake, ProfileCredentials, Arc<AwsCredential>) {
+        let mut fake = Fake::new("AKIDFAKE", Some(SystemTime::now() + Duration::from_mins(4)));
+        fake.outcome = outcome;
+        let creds = with_fake("t", FAKE_PROFILE, "Fake", &fake);
+        let first = creds.get_credential().await.expect("first");
+        assert_eq!(fake.calls(), 1);
+        (fake, creds, first)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_refresh_serves_the_usable_credential_and_backs_off() {
+        let (fake, creds, first) = almost_expired(Outcome::FailLater).await;
+        let got = creds.get_credential().await.expect("served from cache");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 2);
+
+        // No second attempt before the back-off ends.
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        let got = creds.get_credential().await.expect("still cached");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 2);
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let got = creds.get_credential().await.expect("still cached");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_refresh_does_not_hold_back_other_callers() {
+        let (fake, creds, first) = almost_expired(Outcome::HangLater).await;
+        let start = tokio::time::Instant::now();
+        let other = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let got = creds.get_credential().await.expect("cached");
+            (got, start.elapsed())
+        };
+        let (refreshing, (got, at)) = tokio::join!(creds.get_credential(), other);
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(at, Duration::from_secs(1));
+        // The refresh caller gives up at its deadline and also gets the cache.
+        assert!(Arc::ptr_eq(&first, &refreshing.expect("cached")));
+        assert_eq!(start.elapsed(), LOOKUP_TIMEOUT);
+        assert_eq!(fake.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_refresh_is_retried_before_the_fallback_runs_out() {
+        let (fake, creds, first) = almost_expired(Outcome::HangLater).await;
+        let start = tokio::time::Instant::now();
+        let got = creds.get_credential().await.expect("cached");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 2);
+
+        // The abandoned lookup is not joined; the back-off ends, a new one runs.
+        tokio::time::sleep(RETRY_BACKOFF).await;
+        let got = creds.get_credential().await.expect("cached");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 3);
+        assert!(start.elapsed() < Duration::from_mins(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_refresh_is_abandoned_and_started_again() {
+        let (fake, creds, first) = almost_expired(Outcome::HangLater).await;
+        // The starter goes away mid-lookup.
+        tokio::time::timeout(Duration::from_secs(1), creds.get_credential())
+            .await
+            .expect_err("cancelled");
+        assert_eq!(fake.calls(), 2);
+
+        // Within the lookup timeout the lookup is left alone.
+        let got = creds.get_credential().await.expect("cached");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 2);
+
+        // After it, a later caller abandons it and starts a new one.
+        tokio::time::sleep(LOOKUP_TIMEOUT).await;
+        let got = creds.get_credential().await.expect("cached");
+        assert!(Arc::ptr_eq(&first, &got));
+        assert_eq!(fake.calls(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_credential_is_not_served_after_a_failed_refresh() {
+        let mut fake = Fake::new("AKIDFAKE", Some(SystemTime::now() - Duration::from_secs(1)));
+        fake.outcome = Outcome::FailLater;
+        let creds = with_fake("t", FAKE_PROFILE, "Fake", &fake);
+        creds.get_credential().await.expect("first");
+        let err = creds.get_credential().await.expect_err("expired");
+        let text = format!("{err} {err:?}");
+        assert!(text.contains("`t`"), "{text}");
+        assert!(!text.contains("TOPSECRET"), "{text}");
+        assert_eq!(fake.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_with_under_a_minute_left_is_not_served_after_a_failure() {
+        let mut fake = Fake::new("AKIDFAKE", Some(SystemTime::now() + MIN_LEFT / 2));
+        fake.outcome = Outcome::FailLater;
+        let creds = with_fake("t", FAKE_PROFILE, "Fake", &fake);
+        creds.get_credential().await.expect("first");
+        creds.get_credential().await.expect_err("too little left");
     }
 
     #[tokio::test]

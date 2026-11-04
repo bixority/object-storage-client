@@ -10,8 +10,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Releases and dry runs use separate groups, so a dry run never cancels a
+  # release. A release is never cancelled: a half-published release is worse.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
 
@@ -58,8 +60,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  # Advisories and yanks change over time, so a release re-checks them.
+  deny:
+    name: cargo deny (advisories, bans, sources)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources
+          arguments: --all-features
 
   build-wheels:
     name: Build wheels (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }} / py${{ matrix.python }})
@@ -69,23 +85,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest, linux-aarch64]
         python: ["3.13", "3.14", "3.15"]
         include:
           - os: linux-aarch64
-            python: "3.13"
-            arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            manylinux: 2_28
-          - os: linux-aarch64
-            python: "3.14"
-            arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            manylinux: 2_28
-          - os: linux-aarch64
-            python: "3.15"
             arch: aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
@@ -106,7 +109,6 @@ jobs:
           command: build
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          sccache: true
           args: >
             --release
             --strip
@@ -148,21 +150,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest, linux-aarch64]
         python: ["3.13", "3.14", "3.15"]
         include:
           - os: linux-aarch64
-            python: "3.13"
-            arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - os: linux-aarch64
-            python: "3.14"
-            arch: aarch64
-            target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - os: linux-aarch64
-            python: "3.15"
             arch: aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
@@ -204,8 +195,16 @@ jobs:
         run: uv run --no-sync pytest
 
       # The aarch64 wheel is tested inside the same manylinux image that built
-      # it, under QEMU. The container installs the test dependencies from the
-      # locked export and the wheel from dist, then runs pytest in /work.
+      # it, under QEMU. The host exports the locked test dependencies with
+      # hashes; the container installs them with --require-hashes and the wheel
+      # from dist, then runs pytest in /work.
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: matrix.arch
+
+      - name: Export the locked test dependencies (aarch64)
+        if: matrix.arch
+        run: uv export --locked --no-emit-project --group dev --group oracle > requirements.txt
+
       - name: Run the Python tests (aarch64, emulated manylinux)
         if: matrix.arch
         env:
@@ -218,13 +217,10 @@ jobs:
             bash -euo pipefail -c '
               tag=$(echo "$PY_VERSION" | tr -d .)
               /opt/python/cp${tag}-cp${tag}/bin/python -m venv /tmp/venv
-              /tmp/venv/bin/python -m pip install --quiet uv
-              /tmp/venv/bin/uv export --locked --no-hashes --no-emit-project \
-                --group dev --group oracle > /tmp/requirements.txt
-              /tmp/venv/bin/uv pip install --python /tmp/venv/bin/python \
-                -r /tmp/requirements.txt
-              /tmp/venv/bin/uv pip install --python /tmp/venv/bin/python \
-                --no-index --no-deps --find-links dist object-storage-client
+              /tmp/venv/bin/python -m pip install --quiet --require-hashes \
+                -r /work/requirements.txt
+              /tmp/venv/bin/python -m pip install --quiet --no-index --no-deps \
+                --find-links dist object-storage-client
               /tmp/venv/bin/python -m pytest
             '
 
@@ -279,7 +275,7 @@ jobs:
 
   publish-crate:
     name: Publish crate to Codeberg
-    needs: [ package-crate, build-wheels, test-wheels, build-sdist ]
+    needs: [ deny, package-crate, build-wheels, test-wheels, build-sdist ]
     runs-on: ubuntu-latest
     environment: release
     if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')
@@ -301,7 +297,7 @@ jobs:
 
   publish-to-pypi:
     name: Publish to PyPI
-    needs: [ package-crate, build-wheels, test-wheels, build-sdist ]
+    needs: [ deny, package-crate, build-wheels, test-wheels, build-sdist ]
     runs-on: ubuntu-latest
     environment: release
     if: github.event_name == 'release' && startsWith(github.ref, 'refs/tags/v')

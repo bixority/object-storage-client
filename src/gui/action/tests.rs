@@ -3,7 +3,7 @@ use super::*;
 mod close;
 mod jobs;
 mod nav;
-use crate::gui::model::{Entry, MAX_ENTRIES};
+use crate::gui::model::{Entry, Item, MAX_ENTRIES};
 use chrono::DateTime;
 
 fn loc(url: &str) -> Location {
@@ -38,6 +38,26 @@ fn page(side: Side, seq: u64, first: bool, entries: Vec<Entry>, next: Option<&st
             next: next.map(str::to_owned),
         }),
     })
+}
+
+fn plan(kind: OpKind, items: Vec<Item>, checked: bool) -> Plan {
+    Plan {
+        kind,
+        items,
+        checked,
+        failures: Vec::new(),
+    }
+}
+
+/// Delivers `plan` as the result of planning job `job`.
+fn planned(s: &mut AppState, job: u64, plan: Plan) -> Vec<Command> {
+    update(
+        s,
+        Msg::Event(Event::Planned {
+            job: JobId(job),
+            plan,
+        }),
+    )
 }
 
 fn act(state: &mut AppState, action: Action) -> Vec<Command> {
@@ -365,4 +385,16 @@ fn address_text_follows_up_open_and_refresh() {
     act(&mut s, Action::AddressEdited(Side::Left, "typed".into()));
     act(&mut s, Action::Refresh(Side::Left));
     assert_address_matches_after_error(&mut s, &loc("file:///l/"));
+}
+
+#[test]
+fn typed_address_survives_a_first_page() {
+    let mut s = state();
+    act(&mut s, Action::Navigate(Side::Left, "s3://b/p/".into()));
+    act(
+        &mut s,
+        Action::AddressEdited(Side::Left, "s3://other/".into()),
+    );
+    update(&mut s, page(Side::Left, 2, true, vec![dir("d")], None));
+    assert_eq!(s.panels[0].address_text, "s3://other/");
 }

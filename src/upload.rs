@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Tuning for [`upload_stream`].
+#[derive(Clone)]
 pub struct UploadOptions {
     /// Bytes buffered before switching to multipart; also the part size.
     pub part_size: usize,
@@ -27,6 +28,13 @@ pub struct UploadOptions {
     /// `file://` destination takes them (less the umask) instead of
     /// `0o666 & !umask`, so a streamed copy keeps a private file private.
     pub source_mode: Option<u32>,
+    /// The local file a copy or move reads from, if any. Its permission bits
+    /// are used as `source_mode` when that is `None`; they are read on a
+    /// blocking thread, and only for a `file://` destination.
+    pub source_path: Option<std::path::PathBuf>,
+    /// The upload is a move. A `file://` destination then takes the source's
+    /// bits even over a file you own, as a rename would keep them.
+    pub move_source: bool,
     /// The expected size of the input in bytes, if known. Providers allow at
     /// most 10,000 parts per upload, so a large input gets parts of about
     /// `size / 9000` (never below `part_size`) instead of failing past
@@ -47,8 +55,7 @@ pub struct UploadOptions {
     /// `put`. Larger input fails with [`Error::InvalidInput`] before any
     /// request. Tests lower it.
     pub max_single_put: usize,
-    /// The memory budget for parts in flight; see [`UPLOAD_BUDGET`].
-    #[cfg(test)]
+    /// The memory budget for parts in flight; see [`UPLOAD_BUDGET`]. Tests lower it.
     pub byte_budget: usize,
 }
 
@@ -71,11 +78,12 @@ impl Default for UploadOptions {
             part_size: 8 * 1024 * 1024,
             max_concurrency: 4,
             source_mode: None,
+            source_path: None,
+            move_source: false,
             size_hint: None,
             if_unchanged: None,
             attributes: Attributes::new(),
             max_single_put: MAX_SINGLE_PUT,
-            #[cfg(test)]
             byte_budget: UPLOAD_BUDGET,
         }
     }
@@ -97,18 +105,14 @@ impl UploadOptions {
     /// How many parts of `part_size` bytes may be in flight: `max_concurrency`,
     /// reduced so that they fit the memory budget (at least one).
     fn parallelism(&self, part_size: usize) -> usize {
-        #[cfg(test)]
-        let budget = self.byte_budget;
-        #[cfg(not(test))]
-        let budget = UPLOAD_BUDGET;
-        (budget / part_size.max(1)).clamp(1, self.max_concurrency.max(1))
+        (self.byte_budget / part_size.max(1)).clamp(1, self.max_concurrency.max(1))
     }
 
     /// Options for a copy or move of `size` bytes whose source is `path` on
     /// `backend`.
     pub(crate) fn copying_from(backend: &dyn Backend, path: &ObjectPath, size: u64) -> Self {
         Self {
-            source_mode: local::source_mode(backend, path),
+            source_path: backend.local_path(path).ok().flatten(),
             size_hint: Some(size),
             ..Self::default()
         }
@@ -170,7 +174,13 @@ fn changed_or(guard: Option<&Guard>, e: object_store::Error) -> Error {
 pub async fn put_bytes(backend: &dyn Backend, path: &ObjectPath, data: Bytes) -> Result<()> {
     if let Some(dest) = backend.local_path(path)? {
         let chunk: Result<Bytes> = Ok(data);
-        return local::write(dest, stream::iter([chunk]).boxed(), None, None).await;
+        return local::write(
+            dest,
+            stream::iter([chunk]).boxed(),
+            &UploadOptions::default(),
+            None,
+        )
+        .await;
     }
     let defaults = UploadOptions::default();
     if backend.supports_multipart() && data.len() >= defaults.part_size {
@@ -186,11 +196,21 @@ pub async fn put_bytes(backend: &dyn Backend, path: &ObjectPath, data: Bytes) ->
 }
 
 /// Spawns `abort()` on the wrapped upload if dropped before it completed or
-/// was aborted, including mid-`finish`.
+/// was aborted, including mid-`finish`. While armed it holds a
+/// [`PendingAbort`], so [`drain_pending_aborts`] also waits for an upload whose
+/// cancellation has not been processed yet; the token moves into the abort task.
 #[derive(Debug)]
-struct AbortOnDrop(Option<Box<dyn MultipartUpload>>, Option<Guard>);
+struct AbortOnDrop(
+    Option<Box<dyn MultipartUpload>>,
+    Option<Guard>,
+    Option<PendingAbort>,
+);
 
 impl AbortOnDrop {
+    fn new(upload: Box<dyn MultipartUpload>, guard: Option<Guard>) -> Self {
+        Self(Some(upload), guard, Some(PendingAbort::new()))
+    }
+
     fn inner(&mut self) -> object_store::Result<&mut Box<dyn MultipartUpload>> {
         self.0.as_mut().ok_or_else(|| object_store::Error::Generic {
             store: "upload",
@@ -214,12 +234,14 @@ impl MultipartUpload for AbortOnDrop {
         }
         let result = self.inner()?.complete().await?;
         self.0 = None;
+        self.2 = None;
         Ok(result)
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
         let result = self.inner()?.abort().await;
         self.0 = None;
+        self.2 = None;
         result
     }
 }
@@ -229,7 +251,7 @@ impl Drop for AbortOnDrop {
         if let Some(mut upload) = self.0.take()
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            let pending = PendingAbort::new();
+            let pending = self.2.take();
             handle.spawn(async move {
                 let _ = upload.abort().await;
                 drop(pending);
@@ -238,13 +260,15 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// How many abort tasks spawned by dropped uploads are still alive.
+/// How many multipart uploads are armed (will be aborted if dropped) or have an
+/// abort task still alive.
 static PENDING_ABORTS: AtomicUsize = AtomicUsize::new(0);
 /// Notified whenever a [`PendingAbort`] is dropped.
 static ABORT_DONE: Notify = Notify::const_new();
 
-/// Counts one abort task in [`PENDING_ABORTS`] for as long as it lives, so a
-/// cancelled or panicked task is uncounted too.
+/// Counts one upload or abort task in [`PENDING_ABORTS`] for as long as it
+/// lives, so a cancelled or panicked task is uncounted too.
+#[derive(Debug)]
 struct PendingAbort;
 
 impl PendingAbort {
@@ -261,13 +285,12 @@ impl Drop for PendingAbort {
     }
 }
 
-/// Waits, for at most `timeout`, for the aborts of uploads that were dropped
-/// mid-way (cancelled commands) to finish, so a pending multipart upload or a
-/// staging file is not left behind when the process exits right after.
-#[cfg_attr(
-    not(any(feature = "cli", feature = "python", feature = "gui")),
-    allow(dead_code)
-)]
+/// Waits, for at most `timeout`, for multipart uploads still in flight and for
+/// the aborts of uploads that were dropped mid-way (cancelled commands) to
+/// finish, so a pending multipart upload or a staging file is not left behind
+/// when the process exits right after. An upload that is still running delays
+/// the return by up to `timeout`.
+#[cfg_attr(not(any(feature = "cli", feature = "python")), allow(dead_code))]
 #[doc(hidden)]
 pub async fn drain_pending_aborts(timeout: Duration) {
     let drained = async {
@@ -325,9 +348,21 @@ pub async fn upload_stream(
     mut data: ByteStream,
     opts: &UploadOptions,
 ) -> Result<()> {
+    // `LocalFileSystem` rejects attributes, so a `file://` destination never
+    // sees them, whichever write path it takes.
+    let cleared;
+    let opts = if backend.scheme() == "file" && !opts.attributes.is_empty() {
+        cleared = UploadOptions {
+            attributes: Attributes::new(),
+            ..opts.clone()
+        };
+        &cleared
+    } else {
+        opts
+    };
     if let Some(dest) = backend.local_path(path)? {
         let guard = Guard::new(backend, path, opts);
-        return local::write(dest, data, opts.source_mode, guard.as_ref()).await;
+        return local::write(dest, data, opts, guard.as_ref()).await;
     }
     let store = backend.store();
     let multipart = backend.supports_multipart();
@@ -432,7 +467,7 @@ async fn upload_multipart(
     let upload = backend.store().put_multipart_opts(path, multipart).await?;
     let guard = Guard::new(backend, path, opts);
     let mut writer = WriteMultipart::new_with_chunk_size(
-        Box::new(AbortOnDrop(Some(upload), guard.clone())),
+        Box::new(AbortOnDrop::new(upload, guard.clone())),
         part_size,
     );
 
@@ -472,17 +507,17 @@ async fn upload_multipart(
     }
 }
 
-/// Writes to `file://` destinations. `object_store`'s local `put` creates its
-/// staging file with the umask default mode and so exposes the data, and
-/// replaces a private destination with a world-readable file. Here the staging
-/// file is private until it is complete.
 /// Destinations whose next `file://` sync fails, for tests.
 #[cfg(test)]
 pub static SYNC_FAULTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
     std::sync::Mutex::new(Vec::new());
 
+/// Writes to `file://` destinations. `object_store`'s local `put` creates its
+/// staging file with the umask default mode and so exposes the data, and
+/// replaces a private destination with a world-readable file. Here the staging
+/// file is private until it is complete.
 mod local {
-    use super::{Backend, ByteStream, Guard, ObjectPath, Result};
+    use super::{ByteStream, Guard, Result, UploadOptions};
     #[cfg(unix)]
     use crate::client::Error;
     #[cfg(unix)]
@@ -492,21 +527,6 @@ mod local {
     #[cfg(unix)]
     use std::io;
     use std::path::{Path, PathBuf};
-
-    /// Mode bits a copy takes from a local source, if `path` is one.
-    pub(super) fn source_mode(backend: &dyn Backend, path: &ObjectPath) -> Option<u32> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let local = backend.local_path(path).ok()??;
-            Some(std::fs::metadata(local).ok()?.permissions().mode() & 0o777)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (backend, path);
-            None
-        }
-    }
 
     /// Removes the staging file unless disarmed, also when the upload future
     /// is dropped.
@@ -525,6 +545,8 @@ mod local {
     impl Drop for Staging {
         fn drop(&mut self) {
             if let Some(path) = self.0.take() {
+                // Inline, so the staging file is gone when the write returns
+                // or is dropped, also during shutdown.
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -576,13 +598,15 @@ mod local {
     pub(super) async fn write(
         dest: PathBuf,
         mut data: ByteStream,
-        source_mode: Option<u32>,
+        opts: &UploadOptions,
         guard: Option<&Guard>,
     ) -> Result<()> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use tokio::io::AsyncWriteExt;
 
         let target = dest.clone();
+        let (source_mode, source_path, moving) =
+            (opts.source_mode, opts.source_path.clone(), opts.move_source);
         // The closure owns the guard, so a dropped future cannot leak the file.
         let (file, mut staging, last) = tokio::task::spawn_blocking(move || {
             // A regular file keeps its mode; a symlink is replaced, never
@@ -599,24 +623,41 @@ mod local {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(io_err(&e, "stat", &target)),
             };
+            let source_mode = source_mode.or_else(|| {
+                let meta = std::fs::metadata(source_path?).ok()?;
+                Some(meta.permissions().mode() & 0o777)
+            });
             let euid = rustix::process::geteuid().as_raw();
-            let (create, last) =
-                fsmode::modes(existing, euid, source_mode, fsmode::umask_near(&target));
+            let (create, last) = fsmode::modes(
+                existing,
+                euid,
+                source_mode,
+                moving,
+                fsmode::umask_near(&target),
+            );
             create_staging(&target, create).map(|(f, s)| (f, s, last))
         })
         .await
         .map_err(|e| Error::Generic(format!("Local write task failed: {e}")))??;
         let staged = staging.path().to_owned();
 
-        let mut file = tokio::fs::File::from_std(file);
+        // Network chunks are small (a TLS record is 16 KiB): buffer them so a
+        // write is one blocking-pool hop per `FILE_BUF`, not per chunk.
+        let mut out = tokio::io::BufWriter::with_capacity(
+            crate::backend::FILE_BUF,
+            tokio::fs::File::from_std(file),
+        );
         while let Some(chunk) = data.next().await {
-            file.write_all(&chunk?)
+            out.write_all(&chunk?)
                 .await
                 .map_err(|e| io_err(&e, "write", &staged))?;
         }
-        file.flush()
+        // The flush drains the buffer and the file's own; `into_inner` would
+        // discard unflushed data.
+        out.flush()
             .await
             .map_err(|e| io_err(&e, "write", &staged))?;
+        let file = out.into_inner();
         if let Some(mode) = last {
             file.set_permissions(std::fs::Permissions::from_mode(mode))
                 .await
@@ -667,7 +708,7 @@ mod local {
     pub(super) async fn write(
         _dest: PathBuf,
         _data: ByteStream,
-        _source_mode: Option<u32>,
+        _opts: &UploadOptions,
         _guard: Option<&Guard>,
     ) -> Result<()> {
         unreachable!("only Unix backends have a local path")
@@ -681,11 +722,9 @@ mod tests {
     use crate::backend::TestBackend;
     use crate::client::Error;
     use async_trait::async_trait;
-    use futures::stream::{self, BoxStream};
+    use futures::stream;
     use object_store::memory::InMemory;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, PutMultipartOptions, PutOptions,
-    };
+    use object_store::{PutMultipartOptions, PutOptions};
     use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     use std::sync::{Arc, Mutex};
@@ -785,72 +824,37 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl ObjectStore for FaultStore {
-        async fn put_opts(
-            &self,
-            location: &ObjectPath,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            self.c.put.fetch_add(1, SeqCst);
-            self.c
-                .segment_ptrs
-                .lock()
-                .unwrap()
-                .extend(payload.iter().map(|b| b.as_ptr() as usize));
-            self.inner.put_opts(location, payload, opts).await
-        }
+    forward_object_store! {
+        impl ObjectStore for FaultStore => inner;
+        forward [get_opts, delete_stream, list, list_with_delimiter, copy_opts];
+        {
+            async fn put_opts(
+                &self,
+                location: &ObjectPath,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> object_store::Result<PutResult> {
+                self.c.put.fetch_add(1, SeqCst);
+                self.c
+                    .segment_ptrs
+                    .lock()
+                    .unwrap()
+                    .extend(payload.iter().map(|b| b.as_ptr() as usize));
+                self.inner.put_opts(location, payload, opts).await
+            }
 
-        async fn put_multipart_opts(
-            &self,
-            location: &ObjectPath,
-            opts: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.c.multipart.fetch_add(1, SeqCst);
-            let inner = self.inner.put_multipart_opts(location, opts).await?;
-            Ok(Box::new(FaultUpload {
-                inner,
-                c: Arc::clone(&self.c),
-            }))
-        }
-
-        async fn get_opts(
-            &self,
-            location: &ObjectPath,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
-        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&ObjectPath>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&ObjectPath>,
-        ) -> object_store::Result<ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &ObjectPath,
-            to: &ObjectPath,
-            options: CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
+            async fn put_multipart_opts(
+                &self,
+                location: &ObjectPath,
+                opts: PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.c.multipart.fetch_add(1, SeqCst);
+                let inner = self.inner.put_multipart_opts(location, opts).await?;
+                Ok(Box::new(FaultUpload {
+                    inner,
+                    c: Arc::clone(&self.c),
+                }))
+            }
         }
     }
 
@@ -1278,7 +1282,7 @@ mod tests {
         let store = InMemory::new();
         let path = ObjectPath::from("done");
         let upload = store.put_multipart(&path).await.unwrap();
-        let mut guarded = AbortOnDrop(Some(upload), None);
+        let mut guarded = AbortOnDrop::new(upload, None);
         guarded
             .put_part(Bytes::from_static(b"abc").into())
             .await
@@ -1323,8 +1327,8 @@ mod tests {
     #[tokio::test]
     async fn drain_pending_aborts_waits_for_a_dropped_uploads_abort() {
         let done = Arc::new(AtomicUsize::new(0));
-        drop(AbortOnDrop(
-            Some(Box::new(SlowAbort(Arc::clone(&done)))),
+        drop(AbortOnDrop::new(
+            Box::new(SlowAbort(Arc::clone(&done))),
             None,
         ));
         assert_eq!(done.load(SeqCst), 0, "abort runs in the background");
@@ -1336,8 +1340,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn drain_pending_aborts_is_bounded_by_its_timeout() {
         let done = Arc::new(AtomicUsize::new(0));
-        drop(AbortOnDrop(
-            Some(Box::new(SlowAbort(Arc::clone(&done)))),
+        drop(AbortOnDrop::new(
+            Box::new(SlowAbort(Arc::clone(&done))),
             None,
         ));
         let started = tokio::time::Instant::now();
@@ -1346,6 +1350,19 @@ mod tests {
         // abort could finish.
         assert!(started.elapsed() < Duration::from_millis(100));
         assert_eq!(done.load(SeqCst), 0, "the abort had not completed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_pending_aborts_waits_for_an_armed_upload() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut armed = AbortOnDrop::new(Box::new(SlowAbort(Arc::clone(&done))), None);
+        let started = tokio::time::Instant::now();
+        drain_pending_aborts(Duration::from_millis(50)).await;
+        // Virtual time: nothing was dropped yet, but the drain still waited
+        // for its whole timeout because the upload is armed.
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        armed.abort().await.unwrap();
+        assert_eq!(done.load(SeqCst), 1);
     }
 
     /// The version of `path` in `store`, as a reencrypt would have read it.
@@ -1431,7 +1448,7 @@ mod tests {
         tx.send(Ok(Bytes::from_static(b"secret"))).await.unwrap();
         let staging = dir.path().join("obj#1");
         for _ in 0..400 {
-            if std::fs::metadata(&staging).is_ok_and(|m| m.len() == 6) {
+            if std::fs::metadata(&staging).is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1453,6 +1470,35 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["obj"], "no staging or probe file is left");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_move_takes_the_source_mode_over_a_wider_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let client = crate::Client::<crate::Plain>::default();
+        for (moving, want) in [(true, 0o600), (false, 0o644)] {
+            let file = dir.path().join(format!("obj{moving}"));
+            std::fs::write(&file, b"old").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let url = url::Url::from_file_path(&file).unwrap();
+            let (backend, path) = client.get_backend(&url).unwrap();
+            let opts = UploadOptions {
+                source_mode: Some(0o600),
+                move_source: moving,
+                ..UploadOptions::default()
+            };
+            upload_stream(
+                backend.as_ref(),
+                &path,
+                input(vec![Bytes::from_static(b"x")]),
+                &opts,
+            )
+            .await
+            .unwrap();
+            assert_eq!(mode_of(&file), want, "moving: {moving}");
+        }
     }
 
     #[cfg(unix)]
@@ -1760,5 +1806,52 @@ mod tests {
         assert_eq!(opts.parallelism(5 * mib), 4);
         assert_eq!(opts.parallelism(16 * mib), 2);
         assert_eq!(opts.parallelism(100 * mib), 1);
+    }
+
+    /// A `file` backend with no private writer, as on Windows, so uploads
+    /// reach `LocalFileSystem` itself.
+    struct BareFileBackend {
+        store: Arc<dyn ObjectStore>,
+    }
+
+    #[async_trait]
+    impl crate::backend::Backend for BareFileBackend {
+        fn store(&self) -> &Arc<dyn ObjectStore> {
+            &self.store
+        }
+
+        fn scheme(&self) -> &'static str {
+            "file"
+        }
+
+        fn supports_multipart(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_destination_never_gets_attributes() {
+        use object_store::{Attribute, local::LocalFileSystem};
+        let dir = tempfile::tempdir().unwrap();
+        let b = BareFileBackend {
+            store: Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+        };
+        let mut attributes = Attributes::new();
+        attributes.insert(Attribute::ContentType, "application/pdf".into());
+        attributes.insert(Attribute::CacheControl, "no-cache".into());
+        // One body below the part size (single put) and one above it
+        // (multipart).
+        for len in [1000, 3000] {
+            let opts = UploadOptions {
+                part_size: 2048,
+                attributes: attributes.clone(),
+                ..UploadOptions::default()
+            };
+            let (data, parts) = chunks(len);
+            let name = ObjectPath::from(format!("out-{len}"));
+            upload_stream(&b, &name, input(parts), &opts).await.unwrap();
+            let got = b.store.get(&name).await.unwrap().bytes().await.unwrap();
+            assert_eq!(got.as_ref(), data.as_slice());
+        }
     }
 }

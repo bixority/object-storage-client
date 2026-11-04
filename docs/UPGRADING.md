@@ -1,5 +1,313 @@
 # Upgrading
 
+## From 0.3.0 to 0.4.0
+
+This release contains breaking changes; read every section below before
+upgrading. Rust API changes are listed under Errors (`Error::Denied`),
+Encryption (`EncryptionConfig::new`, the now crate-private `KeyProvider` and
+key types) and AWS credentials and signing (`presign_s3` returns `Result`).
+
+### Errors
+
+- New `Error::Denied(String)`: the store answered 401 or 403. It is returned
+  from every call, including `create_bucket` and `bucket_exists`. Code that
+  matched `Error::ObjectStore(object_store::Error::PermissionDenied { .. })` or
+  `Unauthenticated { .. }` must match `Error::Denied` instead, and code that
+  matched `Error::Generic` for a denied bucket call likewise. Python raises
+  `PermissionError` for it, now also from `create_bucket` and `bucket_exists`
+  (they raised `RuntimeError`).
+
+### Encryption
+
+- An object is judged to be encrypted by its first three bytes, not the first
+  byte. A plain object of three or more bytes that starts with `0x01` or `0x02`
+  (for example `02 9a 11`) is now `Error::NotEncrypted`; it used to be a
+  decryption error. The reverse also holds: damage to byte 1 or 2 of an
+  encrypted object is reported as `NotEncrypted` too (reads still fail), so
+  `osc enc scan` and `reencrypt` count such an object as not encrypted.
+- `FormatError::UnsupportedSuite` is now returned only for suite `0x0578`; any
+  other suite bytes are `FormatError::NotOsc`.
+- The encrypted client looks at the keyring file (at most once per check
+  interval) when it asks for the active key, so it sees the key a rotation on
+  disk made active. The Python `Keyring.__repr__` still never reads the file.
+- `Client::reencrypt` (and Python `reencrypt`) refuses a `from` key that the
+  keyring does not hold, before any listing or read: Rust gets
+  `Error::Key(KeyError::UnknownId)`, Python raises `EncryptionError`. It used to
+  return `Skipped` for every object. A foreign message with several data keys
+  is no longer rewritten from a key the keyring lacks; the CLI already refused
+  that.
+- `osc enc scan` and `osc enc reencrypt` count a listed entry of size 0 as
+  not encrypted without reading it. S3 and GCS list a console folder marker
+  (`p/sub/`) as an empty `p/sub`; it used to count as `unreadable` or `error`
+  and made both commands exit 1. `Client::reencrypt` and `inspect_encryption`
+  on a direct URL are unchanged.
+- `KeyProvider` is no longer public. `EncryptionConfig::new` takes an
+  `Arc<Keyring>` instead of an `Arc<dyn KeyProvider>`; code that passed a
+  `Keyring` compiles unchanged. A custom provider was never usable, because
+  its data-key types had no public constructors or accessors. Removed from
+  `object_storage_client::encryption`: `DataKey`, `EncryptedDataKey` and
+  `EncryptionContext`; removed from `encryption::keys`: `KeyProvider`,
+  `DataKey` and `EncryptedDataKey`. The `KeyProvider` methods
+  `namespace`, `active_key_name` and `holds_key` are gone from the public API
+  with it, including on `Keyring`; use `Keyring::status().active` for the
+  active key's ID. `CallerContext`, `MAX_CONTEXT_LEN` and `KEY_OBJECT` stay.
+- A whole-buffer `put` or `put_with_context` of 8 MiB or more on the encrypted
+  client, and Python `put_object` on an encrypted client, no longer builds the
+  whole ciphertext in memory before the upload starts. It is sealed in slices
+  while the parts are sent (to `file://` and to stores with multipart upload),
+  so peak memory falls from about twice the object to the object plus about
+  40 MiB. The stored bytes are the same.
+- `Keyring::status` no longer waits for a reload that another task is running;
+  it reports the last known state. Keep the keyring file on a local or tmpfs
+  filesystem: a reload still runs a synchronous `stat` on the calling thread.
+
+### Copy and move
+
+- The encrypted client now always decrypts and re-encrypts on copy and move,
+  with a fresh data key and message ID. It no longer copies bytes, uses a
+  server-side copy or renames a `file://` object, even inside one bucket or for
+  a client with object-key binding off. Copies inside one bucket now cost a
+  full download and upload.
+- The plain client now refuses to copy or move an encrypted object to another
+  name with `Error::InvalidInput`, because the byte copy would be unreadable:
+  the header binds the object name. Copy it with the encrypted client instead.
+  The same name in another bucket, and objects without a binding, still copy.
+- Every plain copy or move now makes one extra ranged request to read the start
+  of the source. Without the `encryption` feature, any object that starts with
+  the bytes `02 04 78` is treated as bound and refused for another name.
+- The plain client now copies and moves between two buckets (containers) of
+  one provider server-side: S3 `CopyObject`, GCS `objects.rewrite` and Azure
+  `Copy Blob` (same storage account). Before, such a copy downloaded and
+  uploaded every byte. See [Copy and move](BEHAVIOR.md#copy-and-move) for when
+  it applies; otherwise the copy is streamed as before. The encrypted client
+  never copies server-side.
+- A server-side copy sends no storage class or access tier, so the destination
+  gets the provider's default for a copy, as a streamed copy does. User
+  metadata and the content headers are copied by the provider.
+- A store with a provider-side encryption setting (S3 `AWS_SERVER_SIDE_ENCRYPTION`
+  and its key settings, Azure `AZURE_STORAGE_ENCRYPTION_KEY`) or S3 Express
+  still streams between buckets, so that the write applies the setting.
+- A move between buckets keeps its source when the source changed since it was
+  read (`Error::SourceChanged`), and the destination is then not written.
+- GCS and Azure bucket copies are tested against an emulator that is not the
+  real service; S3 against Garage only. Azure with an Entra ID (bearer token)
+  credential is covered by stub tests only; a server that cannot verify the
+  source answers `CannotVerifyCopySource` and the copy is streamed.
+- An Azure copy or move inside one container waits for `Copy Blob` to finish
+  (polling the destination for at most 120 s) and fails if the copy failed,
+  was aborted or is still pending after that. A move deletes its source only
+  after the copy succeeded. Each Azure server-side copy costs at least one
+  extra `HEAD` request, and the account needs read access to the destination.
+
+### Listings no longer follow symlinks on `file://`
+
+- `Client::list`, `list_stream`, Python `list_objects` and `list_objects_stream`,
+  `osc ls`, `osc enc scan` and `reencrypt` no longer follow symlinks below the
+  prefix. A link to a file or to a directory is not listed, and nothing below
+  a linked directory is listed. In 0.3.0 they were listed, so a recursive
+  copy, move, rename or re-encryption reached files outside the prefix. The
+  prefix itself is still resolved as named. A caller that relied on the old
+  behaviour has to list the link target itself.
+- In `osc-gui`, a local symlink is shown with a link mark and acted on as the
+  link: Delete removes only the link (0.3.0 deleted the files behind a linked
+  folder), Rename and a Move to a local folder rename the link, and Copy or a
+  Move to another store skips it with "symbolic link skipped". Links inside a
+  copied, moved or renamed folder are skipped. See GUI.md.
+
+### Moves and writes on `file://`
+
+- A move on one file system now refuses a destination that is a directory,
+  FIFO, socket or device with `Error::InvalidInput` and leaves it alone. It
+  used to replace a FIFO or socket and fail with an `ObjectStore` error on a
+  directory. A source that is a directory, FIFO, socket or device is refused
+  with `Error::InvalidInput` by `cp` and `mv` (it was `NotFound`). A source
+  symlink is moved as a link.
+- A move across file systems now gives the destination the source's permission
+  bits (without setuid, setgid and sticky), also over a file you own, as a move
+  on one file system does. It used to keep the destination's bits.
+- The local backend now syncs the directories of both ends after a rename,
+  copy or delete, and on Windows syncs the files it puts. Each costs an
+  `fsync`.
+- On Linux, a destination directory with a default POSIX ACL now decides the
+  mode of a new file through a probe file, as the kernel would, instead of the
+  umask. A new file there is no longer widened to `0666` minus the umask.
+- A staging file left by a failed or cancelled write is now removed on a
+  blocking thread, so it may exist for a moment after the call returns.
+
+### WebDAV collections on `http(s)://`
+
+- `Client::delete` (`osc rm`, `delete_object`) and `move_object` (`osc mv`) on
+  an `http(s)://` URL first send a `PROPFIND` with `Depth: 0`. A URL that names
+  a WebDAV collection is refused with `Error::InvalidInput`; before, the server
+  removed the collection and everything in it. A 404, 405 or 501 answer lets the
+  call go on, any other answer fails it. This costs one extra request.
+- A copy or move inside one `http(s)://` origin is sent with `Overwrite: F`
+  and never replaces an existing destination. When the destination exists the
+  copy is streamed with a `PUT` (buffered, limited to 1 GiB), which overwrites
+  a file as before and is refused for a collection. Before, an existing
+  collection was replaced and its members deleted.
+- A same-origin `http(s)://` copy or move needs a server that supports WebDAV
+  `COPY`. This was always so and is now documented.
+
+### URLs
+
+- The refusal of `..` and `.` segments, tabs, newlines and surrounding
+  whitespace in URLs now also holds for URLs written without `//`
+  (`file:/a/.\t.`, `http:host/a/..`, `s3:/b/k`). They used to slip through and
+  were rewritten by the URL parser.
+- `osc` checks each operand as you wrote it, before the URL parser rewrites it.
+  `osc sign s3://b/a/../k`, `osc rm 's3://b/a<TAB>b'` and
+  `osc enc reencrypt s3://b/t/../` now fail with an input error; they used to
+  act on the rewritten URL. Local paths are not affected: `osc put x ../out/x`
+  still resolves `..`.
+
+### Buckets
+
+- `create_bucket` and `bucket_exists` use the client settings of the store:
+  `*_ALLOW_INVALID_CERTIFICATES`, `*_PROXY_URL`, `*_PROXY_CA_CERTIFICATE`,
+  `*_PROXY_EXCLUDES`, `*_USER_AGENT`, `*_HTTP1_ONLY`, `*_HTTP2_ONLY`,
+  `*_DISABLE_SYSTEM_CERTIFICATES` and `*_ALLOW_HTTP`. They used to ignore them,
+  so a self-signed endpoint that worked for objects failed for `mb`. Each
+  backend now has its own client (5 s connect, 30 s request, no redirects),
+  and `StoreRegistry::http` is gone. Without `*_ALLOW_HTTP`, a plain `http://`
+  endpoint is refused by the transport (S3 and GCS allow it as before:
+  an `http://` S3 endpoint and the GCS default enable it).
+- `create_bucket` on `gs://` after an HTTP 409 now lists the project's buckets
+  (`buckets.list`) and succeeds only if `GOOGLE_CLOUD_PROJECT` lists the
+  bucket. It needs `storage.buckets.list` besides `storage.buckets.create`. A
+  bucket in another project is an error even if you can read or write it. This
+  closes bucket squatting: reading a bucket's metadata does not prove you own
+  it.
+- With `AZURE_SKIP_SIGNATURE=true` or `GOOGLE_SKIP_SIGNATURE=true`, bucket
+  calls are sent unsigned and no longer query the instance metadata service.
+  `bucket_exists` on Azure raises an error for a 404 then, because an anonymous
+  request for a private container is answered with 404. Pre-signing a `gs://`
+  URL on such a store fails with `SigningUnsupported`.
+- Azure bucket calls use the account and endpoint the store was configured with,
+  aliases included (`AZURE_ENDPOINT`). They are refused with
+  `AZURE_STORAGE_USE_EMULATOR` or `AZURE_USE_FABRIC_ENDPOINT` unless an
+  endpoint is set. GCS bucket calls fall back to `GOOGLE_BASE_URL` when
+  `GCS_BASE_URL` is unset.
+
+### AWS credentials and signing
+
+- `S3_ACCESS_KEY_ID` is now sent without any session token and without an empty
+  `x-amz-security-token`, in requests and in pre-signed URLs.
+  `AWS_SESSION_TOKEN` is still ignored with `S3_*` keys. Temporary credentials
+  must use `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`,
+  or a profile; the old documentation showed `S3_*` keys with a token, which
+  never worked.
+- `sign::presign_s3` and `presign_s3_at` return `Result<Url>` instead of `Url`
+  and no longer panic. An unusable URL, such as a bucket name that is not a
+  valid host in virtual-hosted style, is `Error::InvalidInput`
+  (Python: `ValueError`).
+- A URL signed with `content_length` or `content_type` now keeps
+  `x-amz-request-payer=requester` when `AWS_REQUEST_PAYER` is set. Before, it
+  was dropped and S3 answered 403.
+- With an AWS profile, a cached credential with at least 1 minute left is used
+  while a refresh is running, slow or failed (it is retried after 30 s), and
+  the error shows once the credential has run out. A credential lookup is
+  shared between callers: after a timeout the next call joins it for up to 5
+  minutes, instead of starting another `credential_process`. A timed-out helper
+  is not killed.
+
+### Shared clients and credentials
+
+- One client now shares HTTP clients (connections and the loaded system CA
+  store) between stores with the same transport settings, and one credential
+  provider per provider across all buckets, so tokens from web identity (IRSA),
+  instance metadata, GCS OAuth or Azure AD are fetched once, not per bucket.
+  The variables of a client are fixed, so every bucket would have used the same
+  credentials. Stores that skip signing, and AWS profiles, are unchanged.
+  Changes to the system CA store are picked up by a new `Client`, not by an
+  existing one.
+
+### CLI
+
+- The `cli` Cargo feature now implies `encryption`, so `--features cli` alone
+  builds an `osc` with the `--keyring`, `keyring` and `enc` commands. Before,
+  that build had no keys and `--require-encryption` could only fail. Builds with
+  default features are unchanged.
+- `osc ls --url` prints the full URL of each object instead of its name. Plain
+  `osc ls` still prints the literal store names, so a name with `%` in it must
+  not be pasted into a URL; use `--url` to pass listed objects to other
+  commands.
+- The key-source check runs for every command. With `--keyring` (or
+  `OSC_KEYRING_FILE`) and `OSC_KEYRING_COMMAND` both set, `enc inspect`,
+  `enc scan` and the `keyring` helpers now exit 1, as `ls` and the other
+  commands already did.
+- `osc put -r` refuses a `file://` destination that is the source directory or
+  inside it. Before, it uploaded its own output; copy to a directory outside
+  the source.
+- `osc put FILE` now fails, and commits nothing, when the file shrinks during
+  the upload. Before, it committed the short object and exited 0.
+- A timed-out `OSC_KEYRING_COMMAND`, or one still running when `osc` is
+  interrupted, has its shell killed. Processes the shell started may still keep
+  running; use a single command or `exec`.
+- Progress and listing lines are written asynchronously: SIGINT and SIGTERM now
+  end `osc` even while standard output is blocked. The output is unchanged.
+
+### GUI folder operations
+
+- `osc-gui` refuses to copy or move a folder into itself, and to copy or move
+  into the same folder, even when the two URLs encode the path differently
+  (for example `(` and `%28`).
+- Keys pressed in one frame can no longer act on the previous folder's rows
+  while a new folder is loading: Select all and Enter are ignored until the
+  first page arrives.
+- A copy, move or rename of folders that would plan more than 1,000,000
+  objects fails before anything runs.
+- A zero-size console folder marker below a copied, moved or renamed folder no
+  longer shows up as a "not found" failure.
+
+### Python
+
+- The type stub now declares the client methods as `def m(...) ->
+  asyncio.Future[T]` instead of `async def`. The runtime is unchanged: each
+  call already started its work and returned a future. A type checker now
+  rejects `asyncio.create_task(client.get_object(url))` and
+  `TaskGroup.create_task(...)`, which already raised `TypeError` at run time.
+  Await the future, pass it to `asyncio.gather` or `asyncio.ensure_future`, or
+  wrap the call in a coroutine.
+- The exit hook now also waits for multipart uploads that are still running,
+  not only for aborts already started. An upload still running at exit (its
+  future was never cancelled) can delay exit by up to 10 s.
+- A reserved or oversized encryption context now makes
+  `EncryptedObjectStorageClient.put_object_stream` (and the Rust
+  `put_stream_with_context`) fail before any local I/O. A `file://` destination
+  no longer gets empty parent directories in that case.
+- `put_object_stream` now pipes a `ByteStream` natively, with no Python call
+  per chunk, so a busy event loop no longer slows the copy. The `ByteStream`
+  is consumed and closed by the call: reading it afterwards raises
+  `RuntimeError`. A closed `ByteStream`, or one with a read pending, is
+  refused with `RuntimeError` and nothing is written. Other async iterables
+  are read as before.
+
+### Fewer requests
+
+- A header probe (encrypted metadata, `inspect_encryption`, `osc enc scan`,
+  `osc enc reencrypt` and the plain client's copy check) first asks for 1 KiB
+  instead of 16 KiB. A header that does not fit is read again, so it costs a
+  second request.
+- `osc enc reencrypt` takes the extra slots of a large object (8 MiB or more)
+  only when it rewrites it. A large object that is skipped takes one slot, so
+  a re-run goes faster. A rewritten large object reads its header twice.
+- `osc-gui` deletes selected objects on a bucket store in batches, and
+  copies objects within one S3 store without a `HEAD` for the size.
+  Folder listings of a copy, move or rename run several at a time, and the
+  existence check runs 32 at a time instead of 8.
+- `get_pre_signed_urls` on GCS signs 8 URLs at a time when it has to ask the
+  IAM `signBlob` API for each one.
+
+### Performance
+
+- Writes to `file://` go through a 512 KiB buffer. A write in progress holds
+  that much more memory, and its staging file (`dst#N`) can stay empty until
+  512 KiB have arrived or the stream ends.
+- `osc-gui`: after a job, only the panels it touched are listed again, and the
+  other keeps its loaded pages, selection and cursor. The busy indicator
+  redraws about 8 times a second instead of at display rate.
+
 ## From 0.2.0 to 0.2.1
 
 Despite the patch version number, this release contains breaking changes.
@@ -108,10 +416,13 @@ Read every entry below before upgrading from 0.2.0.
 
 - Object requests no longer fail after 30 s in total. S3, GCS, Azure and
   `http(s)://` requests now connect within 5 s, have a 24 h total deadline
-  (none for `http(s)://`) and fail after 5 minutes without progress. Large
-  downloads and slow consumers that used to fail with a timeout now finish. Set
+  (none for `http(s)://`) and fail when a download goes silent for 5 minutes.
+  Large downloads and slow consumers that used to fail with a timeout now
+  finish. An upload is not covered by that: each upload request (one put or one
+  part) must be fully sent and answered within the 5 minutes. Set
   `AWS_TIMEOUT`, `AWS_READ_TIMEOUT` (or the `GOOGLE_` / `AZURE_` names) to keep
-  the old limits.
+  the old limits or to allow slower uploads; see
+  [Request timeouts](CONFIGURATION.md#request-timeouts).
 - Each profile credential lookup (SSO, STS, `credential_process`) is bounded
   to 30 s and fails with a "timed out" error instead of hanging.
 

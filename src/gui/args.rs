@@ -59,13 +59,25 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, FromArgMatches};
+
+    /// Parses without the env bindings, so an exported `OSC_KEYRING_FILE` or
+    /// `OSC_REQUIRE_ENCRYPTION` cannot leak into the test.
+    fn parse(argv: &[&str]) -> Args {
+        let m = Args::command()
+            .mut_arg("keyring", |a| a.env(None))
+            .mut_arg("require_encryption", |a| a.env(None))
+            .try_get_matches_from(argv)
+            .expect("parses");
+        Args::from_arg_matches(&m).expect("args")
+    }
 
     #[test]
     fn args_take_two_optional_urls() {
-        let args = Args::try_parse_from(["osc-gui", "s3://b/p/", "/tmp/x"]).expect("parses");
+        let args = parse(&["osc-gui", "s3://b/p/", "/tmp/x"]);
         assert_eq!(args.left.as_deref(), Some("s3://b/p/"));
         assert_eq!(args.right.as_deref(), Some("/tmp/x"));
-        let args = Args::try_parse_from(["osc-gui"]).expect("parses");
+        let args = parse(&["osc-gui"]);
         assert!(args.left.is_none() && args.right.is_none());
     }
 }

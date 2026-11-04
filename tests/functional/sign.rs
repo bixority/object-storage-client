@@ -50,7 +50,7 @@ fn matches_aws_documented_vector() -> std::result::Result<(), Box<dyn std::error
         "us-east-1",
         &SignOptions::default(),
         date,
-    );
+    )?;
 
     let signature = signed
         .query_pairs()
@@ -105,7 +105,7 @@ fn signed_put(
         "us-east-1",
         options,
         date,
-    );
+    )?;
     let get = |name: &str| {
         signed
             .query_pairs()
@@ -201,7 +201,7 @@ fn presign_host_only_when_no_headers() -> std::result::Result<(), Box<dyn std::e
         &test_credential(),
         "eu-west-1",
         &SignOptions::default(),
-    );
+    )?;
 
     let query = signed.query().ok_or("signed URL has no query string")?;
     assert!(query.contains("X-Amz-SignedHeaders=host"));

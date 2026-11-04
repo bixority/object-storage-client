@@ -6,6 +6,7 @@ use super::{CliError, to_url};
 use crate::client::Error as StorageError;
 use crate::{Client, Codec};
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use std::fs;
 use std::ops::ControlFlow;
@@ -15,10 +16,10 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 
-/// Read and write buffer size for local files: the local store's read chunk,
-/// and above the upload coalescing threshold, so uploaded chunks go into parts
-/// without a copy.
-const FILE_BUF: usize = 512 * 1024;
+// Read and write buffer size for local files: the local store's read chunk,
+// and above the upload coalescing threshold, so uploaded chunks go into parts
+// without a copy.
+use crate::backend::FILE_BUF;
 
 /// Files `put -r` uploads at once.
 const FILES_IN_FLIGHT: usize = 8;
@@ -39,15 +40,15 @@ pub(super) fn weight(size: u64, budget: usize) -> u32 {
     }
 }
 
-/// Runs `job` while holding `weight` permits of `budget`. The semaphore is
-/// never closed, so the error is not expected.
+/// Runs `job` while holding `weight` permits of `budget`. The callers' local
+/// semaphores are never closed, so acquiring cannot fail.
 pub(super) async fn run_weighted<T>(
     budget: &Semaphore,
     weight: u32,
     job: impl Future<Output = T>,
-) -> Result<T, tokio::sync::AcquireError> {
-    let _permit = budget.acquire_many(weight).await?;
-    Ok(job.await)
+) -> T {
+    let _permit = budget.acquire_many(weight).await.ok();
+    job.await
 }
 
 /// Longest file name the common file systems accept, in bytes.
@@ -80,21 +81,125 @@ pub(super) async fn put<C: Codec>(
         if !dst_root.ends_with('/') {
             dst_root.push('/');
         }
+        refuse_destination_inside(src, &dst_root)?;
 
         outln!(
             "Recursive upload {} -> {}",
             show_path(src),
             show_url(&dst_root)
-        )?;
+        )
+        .await?;
         upload_dir_recursive(client, src, &dst_root).await?;
     } else {
         let dst_url = to_url(dst)?;
 
-        outln!("Upload {} -> {}", show_path(src), show_url(&dst_url))?;
+        outln!("Upload {} -> {}", show_path(src), show_url(&dst_url)).await?;
         let file = tokio::fs::File::open(src).await.map_err(read_err(src))?;
-        put_file(client, file, &dst_url).await?;
+        put_file(client, file, &dst_url, src).await?;
     }
 
+    Ok(())
+}
+
+/// The chunks of `file`, read to its end. A regular file that ends short of
+/// `expected` bytes and is really shorter now is an error, not a clean end, so
+/// a file truncated during the upload commits nothing. A file that grows is
+/// read in full, and so is one whose size never matches its content (`/proc`,
+/// sysfs).
+async fn file_chunks(
+    file: tokio::fs::File,
+    expected: Option<u64>,
+    label: String,
+) -> BoxStream<'static, crate::Result<Bytes>> {
+    struct State {
+        chunks: Option<ReaderStream<tokio::fs::File>>,
+        count: u64,
+        expected: Option<u64>,
+        probe: Option<tokio::fs::File>,
+        label: String,
+    }
+    // A second handle to the same file, to see its size at the end.
+    let probe = match expected {
+        Some(_) => file.try_clone().await.ok(),
+        None => None,
+    };
+    let state = State {
+        chunks: Some(ReaderStream::with_capacity(file, FILE_BUF)),
+        count: 0,
+        expected,
+        probe,
+        label,
+    };
+    futures::stream::unfold(state, |mut state| async move {
+        let mut chunks = state.chunks.take()?;
+        match chunks.next().await {
+            Some(Ok(chunk)) => {
+                state.count += chunk.len() as u64;
+                state.chunks = Some(chunks);
+                Some((Ok(chunk), state))
+            }
+            Some(Err(e)) => Some((Err(StorageError::from(e)), state)),
+            None => {
+                let short = match (state.expected, &state.probe) {
+                    (Some(size), probe) if state.count < size => match probe {
+                        Some(probe) => probe.metadata().await.map_or(true, |m| m.len() < size),
+                        None => true,
+                    },
+                    _ => false,
+                };
+                short.then(|| {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("{} shrank during the upload", state.label),
+                    );
+                    (Err(StorageError::from(e)), state)
+                })
+            }
+        }
+    })
+    .boxed()
+}
+
+/// Canonicalizes `path`; the part that does not exist yet is appended as is.
+fn canonicalize_lenient(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        match fs::canonicalize(existing) {
+            Ok(mut found) => {
+                found.extend(missing.iter().rev());
+                return Ok(found);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+                    return Err(e);
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Refuses a `file://` destination that is the source directory or inside it:
+/// the walk would pick up the copies and staging files the upload writes.
+/// Another mount of the same directory is not seen.
+fn refuse_destination_inside(src: &Path, dst_root: &str) -> Result<(), CliError> {
+    let Some(dst) = url::Url::parse(dst_root)
+        .ok()
+        .and_then(|u| u.to_file_path().ok())
+    else {
+        return Ok(());
+    };
+    let src = fs::canonicalize(src).map_err(read_err(src))?;
+    let dst = canonicalize_lenient(&dst).map_err(read_err(&dst))?;
+    if dst.starts_with(&src) {
+        return Err(CliError::UnsafePath {
+            path: dst.display().to_string(),
+            reason: "destination is inside the source directory",
+        });
+    }
     Ok(())
 }
 
@@ -104,6 +209,7 @@ async fn put_file<C: Codec>(
     client: &Client<C>,
     file: tokio::fs::File,
     dst_url: &str,
+    path: &Path,
 ) -> Result<(), CliError> {
     let meta = file.metadata().await.ok();
     // A `file://` destination keeps the source's permission bits, as a copy does.
@@ -115,17 +221,32 @@ async fn put_file<C: Codec>(
     #[cfg(not(unix))]
     let source_mode = None;
     let size = meta.as_ref().map(std::fs::Metadata::len);
-    let chunks =
-        ReaderStream::with_capacity(file, FILE_BUF).map(|chunk| chunk.map_err(StorageError::from));
+    let expected = meta
+        .as_ref()
+        .filter(|m| m.is_file())
+        .map(std::fs::Metadata::len);
+    put_opened(client, file, dst_url, path, (size, expected, source_mode)).await
+}
+
+/// [`put_file`] for a file whose size, expected length (a regular file) and
+/// mode are known already.
+async fn put_opened<C: Codec>(
+    client: &Client<C>,
+    file: tokio::fs::File,
+    dst_url: &str,
+    path: &Path,
+    (size, expected, source_mode): (Option<u64>, Option<u64>, Option<u32>),
+) -> Result<(), CliError> {
+    let chunks = file_chunks(file, expected, show_path(path)).await;
     client
-        .put_local_file(dst_url, chunks.boxed(), source_mode, size)
+        .put_local_file(dst_url, chunks, source_mode, size)
         .await?;
     Ok(())
 }
 
 /// Removes a file when dropped, unless [`Self::keep`] was called. Covers
 /// errors and a cancelled download alike.
-struct TempFile(Option<PathBuf>);
+pub(super) struct TempFile(Option<PathBuf>);
 
 impl TempFile {
     fn keep(mut self) {
@@ -184,7 +305,7 @@ pub(super) fn download_modes(
     umask: Option<u32>,
 ) -> (Option<u32>, Option<u32>) {
     crate::fsmode::owned_mode(existing, euid).map_or_else(
-        || crate::fsmode::modes(None, euid, None, umask),
+        || crate::fsmode::modes(None, euid, None, false, umask),
         |mode| (Some(mode), Some(mode)),
     )
 }
@@ -206,20 +327,29 @@ pub(super) fn temp_file_name(name: &std::ffi::OsStr, suffix: &str) -> std::ffi::
 
 /// Creates the download temp file exclusively. With `mode` (Unix only) it is
 /// created with at most those bits, so it is never more readable than the file
-/// it replaces, not even before the data is written.
+/// it replaces, not even before the data is written. The file and its cleanup
+/// guard are made in one blocking task, so a dropped future cannot leave the
+/// file behind.
 pub(super) async fn create_temp_file(
     path: &Path,
     mode: Option<u32>,
-) -> std::io::Result<tokio::fs::File> {
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        opts.mode(mode & 0o777);
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    opts.open(path).await
+) -> std::io::Result<(tokio::fs::File, TempFile)> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode & 0o777);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        let file = opts.open(&path)?;
+        Ok((tokio::fs::File::from_std(file), TempFile(Some(path))))
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Downloads to a temporary file next to `dst` and renames it into place only
@@ -232,7 +362,7 @@ pub(super) async fn get<C: Codec>(
 ) -> Result<(), CliError> {
     let src_url = to_url(src)?;
 
-    outln!("Download {} -> {}", show_url(&src_url), show_path(dst))?;
+    outln!("Download {} -> {}", show_url(&src_url), show_path(dst)).await?;
 
     let write_err = |source| CliError::WriteFile {
         path: dst.display().to_string(),
@@ -279,11 +409,9 @@ pub(super) async fn get<C: Codec>(
             crate::fsmode::umask_near(dst),
         );
         final_mode = mode;
-        let file = create_temp_file(&tmp, create_mode)
+        create_temp_file(&tmp, create_mode)
             .await
-            .map_err(write_err)?;
-        let guard = TempFile(Some(tmp));
-        (file, guard)
+            .map_err(write_err)?
     };
 
     let mut out = BufWriter::with_capacity(FILE_BUF, file);
@@ -302,8 +430,26 @@ pub(super) async fn get<C: Codec>(
         let _ = final_mode;
         drop(out);
         tokio::fs::rename(tmp, dst).await.map_err(write_err)?;
+        sync_parent(dst).await.map_err(write_err)?;
     }
     guard.keep();
+    Ok(())
+}
+
+/// Makes a rename into `path` durable by syncing its directory (Unix only).
+async fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        tokio::task::spawn_blocking(move || fs::File::open(dir)?.sync_all())
+            .await
+            .map_err(std::io::Error::other)??;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -386,20 +532,29 @@ async fn upload_dir_recursive<C: Codec>(
                 let dst_url = destination_url(dst_root_url, &file.rel)?;
                 let path = tree.display_path(&file);
 
-                outln!("Upload {} -> {}", show_path(&path), show_url(&dst_url))?;
-                let source = tree.open(&file)?;
-                // A file whose size is unknown counts as large.
-                let size = source.metadata().await.map_or(u64::MAX, |m| m.len());
+                outln!("Upload {} -> {}", show_path(&path), show_url(&dst_url)).await?;
+                // Each open walks the directory chain from the root: on a slow
+                // file system that must not stall the uploads in flight.
+                let opener = Arc::clone(tree);
+                let local = tokio::task::spawn_blocking(move || opener.open(&file))
+                    .await
+                    .map_err(CliError::Task)??;
+                let size = local.size;
+                let source = tokio::fs::File::from_std(local.file);
+                // A regular file's mode is copied as it is on a `file://` destination.
+                let mode = cfg!(unix).then_some(local.mode);
                 run_weighted(
                     budget,
                     weight(size, FILES_IN_FLIGHT),
-                    put_file(client, source, &dst_url),
+                    put_opened(
+                        client,
+                        source,
+                        &dst_url,
+                        &path,
+                        (Some(size), Some(size), mode),
+                    ),
                 )
                 .await
-                .map_err(|e| CliError::ReadFile {
-                    path: path.display().to_string(),
-                    source: std::io::Error::other(e),
-                })?
             }
         })
         .buffer_unordered(FILES_IN_FLIGHT)

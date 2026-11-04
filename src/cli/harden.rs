@@ -1,11 +1,14 @@
 /// Keeps key material out of core dumps and away from same-user debuggers.
 ///
-/// A release build aborts on panic and the abort signal dumps core by
-/// default, which would write every loaded key and credential to disk. Both
-/// calls are best effort: a limit that cannot be set is not worth refusing to
-/// run for. The process keeps access to its own `/proc/self`, and children
-/// (the keyring command) inherit the zero core limit.
-#[cfg(unix)]
+/// A crash (allocation failure, an AWS-LC fatal error, stack overflow, a
+/// crash in C code or a panic during unwinding) raises a signal that dumps
+/// core by default, which would write every loaded key and credential to
+/// disk. Release builds unwind on panic, so this is not about panics. Turning
+/// off `PR_SET_DUMPABLE` also blocks same-user `ptrace` and `/proc/<pid>/mem`
+/// reads. See `docs/ENCRYPTION.md#core-dumps`. Both calls are best effort: a
+/// limit that cannot be set is not worth refusing to run for. The process
+/// keeps access to its own `/proc/self`, and children (the keyring command)
+/// inherit the zero core limit.
 #[doc(hidden)]
 pub fn harden_process() {
     use rustix::process::{Resource, Rlimit, setrlimit};

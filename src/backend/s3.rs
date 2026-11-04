@@ -2,23 +2,33 @@
 
 use super::aws_profile;
 use super::{
-    AwsProfile, Backend, BoundedConnector, Vars, bucket_exists_from_response, default_timeouts,
-    error_body, parse_bool, send_signed,
+    AwsProfile, Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response,
+    create_failed, default_timeouts, error_body, parse_bool, read_document, redact_error_body,
+    send_signed, send_with_retry,
 };
 use crate::client::{Error, Result};
 use crate::sign::{self, SignMethod, SignOptions};
 use bytes::Bytes;
 use http::Method;
-use object_store::ObjectStore;
 use object_store::aws::{
     AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsAuthorizer, AwsCredential,
 };
 use object_store::client::{HttpRequest, HttpRequestBody};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
+use object_store::{ObjectMeta, ObjectStore, StaticCredentialProvider};
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+
+/// The settings behind [`S3Backend`]'s `provider_policy`.
+const POLICY_KEYS: [&str; 5] = [
+    "aws_server_side_encryption",
+    "aws_sse_kms_key_id",
+    "aws_sse_bucket_key_enabled",
+    "aws_sse_customer_key_base64",
+    "aws_s3_express",
+];
 
 /// How requests address the bucket. `S3_ADDRESSING_STYLE` sets it; when that is
 /// unset, `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` decides, and path is the default.
@@ -62,10 +72,19 @@ pub struct S3Backend {
     endpoint: Option<String>,
     /// How the bucket is addressed, for object and bucket requests alike.
     addressing: AddressingStyle,
+    /// The client of the bucket calls, with the store's transport settings.
+    http: BucketClient,
+    /// `AWS_REQUEST_PAYER`: pre-signed URLs carry `x-amz-request-payer`.
+    request_payer: bool,
+    /// A setting that the store's own requests turn into encryption headers
+    /// (`AWS_SERVER_SIDE_ENCRYPTION` and its key settings), or `AWS_S3_EXPRESS`:
+    /// the hand-built copy request does not carry them, so such a store streams.
+    provider_policy: bool,
 }
 
 impl S3Backend {
-    /// Build the S3 store from the environment, mirroring the configuration the
+    /// Build the S3 store from the environment, with the HTTP clients and
+    /// credential provider of `shared`, mirroring the configuration the
     /// rest of the client reads (`S3_REGION`, `S3_ACCESS_KEY_ID`,
     /// `S3_SECRET_ACCESS_KEY`, `S3_ALLOW_HTTP`) on top of
     /// [`AmazonS3Builder::from_env`].
@@ -97,7 +116,12 @@ impl S3Backend {
     /// Returns an error if the bucket (URL host) is missing, a profile is
     /// combined with `AWS_ENDPOINT_URL`, the profile's files cannot be read, or
     /// the store fails to build.
-    pub fn new(host: Option<&str>, vars: &Vars, profile: Option<&AwsProfile>) -> Result<Self> {
+    pub fn with_shared(
+        host: Option<&str>,
+        vars: &Vars,
+        profile: Option<&AwsProfile>,
+        shared: &Shared,
+    ) -> Result<Self> {
         let get_var = |k: &str| vars.get(k);
         let s3_allow_http = get_var("S3_ALLOW_HTTP").unwrap_or_else(|| "false".into());
         let bucket = host.ok_or_else(|| Error::InvalidInput("Missing bucket in S3 URL".into()))?;
@@ -167,13 +191,7 @@ impl S3Backend {
             addressing.is_virtual().to_string(),
         );
 
-        if let Some(access_key_id) = get_var("S3_ACCESS_KEY_ID") {
-            builder = builder.with_token("").with_access_key_id(access_key_id);
-        }
-
-        if let Some(secret_access_key) = get_var("S3_SECRET_ACCESS_KEY") {
-            builder = builder.with_secret_access_key(secret_access_key);
-        }
+        builder = Self::with_s3_keys(vars, builder);
 
         if let Some(profile) = profile {
             // The registry's one provider: every bucket shares its cache.
@@ -193,12 +211,29 @@ impl S3Backend {
         if skip_signature {
             builder = builder.with_skip_signature(true);
         }
+        // The registry's one provider for the other sources (static keys, web
+        // identity, container credentials, IMDS), except for a profile, which
+        // has its own, and for a store that skips signing, whose provider must
+        // never be called.
+        let share = !uses_profile && !skip_signature;
+        if share && let Some(credentials) = shared.aws.get() {
+            builder = builder.with_credentials(Arc::clone(credentials));
+        }
 
-        let inner = Arc::new(
-            builder
-                .with_http_connector(BoundedConnector::default())
-                .build()?,
-        );
+        let request_payer = builder
+            .get_config_value(&AmazonS3ConfigKey::RequestPayer)
+            .and_then(|v| parse_bool(&v))
+            .unwrap_or(false);
+        let provider_policy = Self::provider_policy(&builder);
+        let http = BucketClient::new(Transport::read(
+            |k| builder.get_config_value(&AmazonS3ConfigKey::Client(k)),
+            vars,
+        ));
+        let inner = Arc::new(builder.with_http_connector(shared.connector()).build()?);
+        if share {
+            // A racing store loses; both hold equivalent providers.
+            let _ = shared.aws.set(Arc::clone(inner.credentials()));
+        }
         Ok(Self {
             store: Arc::clone(&inner) as Arc<dyn ObjectStore>,
             inner,
@@ -207,7 +242,55 @@ impl S3Backend {
             region,
             endpoint,
             addressing,
+            http,
+            request_payer,
+            provider_policy,
         })
+    }
+
+    /// Whether `builder` holds a setting behind `provider_policy`.
+    fn provider_policy(builder: &AmazonS3Builder) -> bool {
+        POLICY_KEYS.iter().any(|name| {
+            name.parse::<AmazonS3ConfigKey>()
+                .ok()
+                .and_then(|key| builder.get_config_value(&key))
+                .is_some_and(|v| *name != "aws_s3_express" || parse_bool(&v) == Some(true))
+        })
+    }
+
+    /// As [`Self::with_shared`], with providers and clients of its own.
+    #[cfg(test)]
+    pub fn new(host: Option<&str>, vars: &Vars, profile: Option<&AwsProfile>) -> Result<Self> {
+        Self::with_shared(host, vars, profile, &Shared::default())
+    }
+
+    /// Applies `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` to `builder`.
+    ///
+    /// `S3_*` keys are long-lived, so they never carry a session token:
+    /// `AWS_SESSION_TOKEN` belongs to the ambient `AWS_*` identity. The builder
+    /// cannot unset a token, which is why the credential is explicit. Its
+    /// secret is `S3_SECRET_ACCESS_KEY`, else the builder's own; with neither,
+    /// the builder reports the missing secret when it builds.
+    fn with_s3_keys(vars: &Vars, mut builder: AmazonS3Builder) -> AmazonS3Builder {
+        if let Some(access_key_id) = vars.get("S3_ACCESS_KEY_ID") {
+            let secret_key = vars
+                .get("S3_SECRET_ACCESS_KEY")
+                .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::SecretAccessKey));
+            if let Some(secret_key) = secret_key {
+                builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(
+                    AwsCredential {
+                        key_id: access_key_id.clone(),
+                        secret_key,
+                        token: None,
+                    },
+                )));
+            }
+            builder = builder.with_access_key_id(access_key_id);
+        }
+        if let Some(secret_access_key) = vars.get("S3_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret_access_key);
+        }
+        builder
     }
 
     /// The addressing style `S3_ADDRESSING_STYLE` names, if it is set. Empty is
@@ -292,35 +375,34 @@ impl S3Backend {
         Ok(Some(self.inner.credentials().get_credential().await?))
     }
 
-    /// The `(endpoint, region)` the bucket-management requests target, both
-    /// resolved once in [`S3Backend::new`]. The region drives the `SigV4` scope
-    /// and the `LocationConstraint` of `CreateBucket`. The AWS default endpoint
-    /// is always https, whatever `S3_ALLOW_HTTP` says: that setting is for
-    /// custom endpoints. A custom endpoint is used as configured (an `http://`
-    /// endpoint enables plain HTTP for the store, see [`S3Backend::new`]).
-    fn endpoint_and_region(&self) -> (String, String) {
-        let endpoint = self
-            .endpoint
+    /// The endpoint path-style requests target, resolved once in
+    /// [`S3Backend::new`]. The AWS default endpoint is always https, whatever
+    /// `S3_ALLOW_HTTP` says: that setting is for custom endpoints. A custom
+    /// endpoint is used as configured (an `http://` endpoint enables plain HTTP
+    /// for the store, see [`S3Backend::new`]).
+    fn endpoint(&self) -> String {
+        self.endpoint
             .clone()
-            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", self.region));
-        (endpoint, self.region.clone())
+            .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", self.region))
     }
 
     /// A bucket-level request (`/<bucket>`) carrying `body`, `SigV4`-signed
     /// unless signing is skipped. The credential comes from
     /// [`S3Backend::credential`], so `skip_signature` never reaches IMDS.
     async fn bucket_request(&self, method: Method, body: Bytes) -> Result<HttpRequest> {
-        let (endpoint, region) = self.endpoint_and_region();
-        let endpoint = endpoint.trim_end_matches('/');
-        let uri = match (self.addressing, &self.endpoint) {
+        let uri = match (self.addressing, self.endpoint.as_deref()) {
             // The store uses a custom endpoint as is in this mode.
-            (AddressingStyle::Virtual, Some(_)) => format!("{endpoint}/"),
+            (AddressingStyle::Virtual, Some(endpoint)) => {
+                format!("{}/", endpoint.trim_end_matches('/'))
+            }
             (AddressingStyle::Virtual, None) => {
-                format!("https://{}.s3.{region}.amazonaws.com/", self.bucket)
+                format!("https://{}.s3.{}.amazonaws.com/", self.bucket, self.region)
             }
             // Path-style addressing keeps the request endpoint-agnostic, which
             // is what MinIO / SeaweedFS expect and AWS also accepts.
-            (AddressingStyle::Path, _) => format!("{endpoint}/{}", self.bucket),
+            (AddressingStyle::Path, _) => {
+                format!("{}/{}", self.endpoint().trim_end_matches('/'), self.bucket)
+            }
         };
         let mut request: HttpRequest = http::Request::builder()
             .method(method)
@@ -331,12 +413,105 @@ impl S3Backend {
         // Reuse object_store's SigV4 implementation — no signing reimplemented.
         // When signing is skipped (anonymous store) the request is sent as-is.
         if let Some(credential) = self.credential().await? {
-            AwsAuthorizer::new(credential.as_ref(), "s3", &region)
+            AwsAuthorizer::new(credential.as_ref(), "s3", &self.region)
                 .try_authorize(&mut request, None)
                 .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
         }
         Ok(request)
     }
+
+    /// `source` as the backend a `CopyObject` into this bucket may read from,
+    /// or `None` when it must stream. Both sides must sign, with the very same
+    /// credential provider, and reach the same endpoint and region in the same
+    /// addressing style. Requester-pays buckets stream, so do stores with provider-side
+    /// encryption settings or S3 Express (see `provider_policy`), and so does a custom
+    /// endpoint in virtual-hosted style, where the endpoint names one bucket.
+    fn copy_source<'a>(&self, source: &'a dyn Backend) -> Option<&'a Self> {
+        let other = source.as_any()?.downcast_ref::<Self>()?;
+        let usable = !self.skip_signature
+            && !other.skip_signature
+            && !self.request_payer
+            && !other.request_payer
+            && !self.provider_policy
+            && !other.provider_policy
+            && self.region == other.region
+            && self.endpoint == other.endpoint
+            && self.addressing == other.addressing
+            && !(self.addressing.is_virtual() && self.endpoint.is_some())
+            && Arc::ptr_eq(self.inner.credentials(), other.inner.credentials());
+        usable.then_some(other)
+    }
+
+    /// The URI of the object `path` in this bucket, in the addressing style of
+    /// the store. The key is encoded as `object_store` encodes it.
+    fn object_uri(&self, path: &ObjectPath) -> String {
+        let key = encode_key(path);
+        if self.addressing.is_virtual() {
+            // `copy_source` refused a custom endpoint in this mode.
+            format!(
+                "https://{}.s3.{}.amazonaws.com/{key}",
+                self.bucket, self.region
+            )
+        } else {
+            format!(
+                "{}/{}/{key}",
+                self.endpoint().trim_end_matches('/'),
+                self.bucket
+            )
+        }
+    }
+}
+
+/// The key of `path` as a URI path: everything but unreserved characters and
+/// `/` is percent-encoded, as `object_store` does for its own requests.
+fn encode_key(path: &ObjectPath) -> String {
+    const KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~')
+        .remove(b'/');
+    percent_encoding::utf8_percent_encode(path.as_ref(), KEY).to_string()
+}
+
+/// Whether `text`, the start of a `200` answer, is a `CopyObjectResult`
+/// document. Only that counts as a copy that happened.
+fn is_copy_result(text: &str) -> bool {
+    let mut rest = text.trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace());
+    if rest.starts_with("<?xml")
+        && let Some(end) = rest.find("?>")
+    {
+        rest = rest[end + 2..].trim_start();
+    }
+    rest.strip_prefix("<CopyObjectResult")
+        .and_then(|after| after.chars().next())
+        .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+}
+
+/// What `CopyObject` answered, as the caller of [`Backend::copy_from`] sees it.
+/// S3 may answer `200` and put an `<Error>` document in the body, after white
+/// space that keeps a long request alive, so the body decides, not only the
+/// status: a `2xx` is a copy only if the body is a `CopyObjectResult`. Any other
+/// body, an empty one included, is an error. `501` and `NotImplemented` (some
+/// S3-compatible servers) mean the server cannot copy, and the caller streams.
+fn copy_outcome(status: reqwest::StatusCode, text: &str) -> Result<bool> {
+    if status.is_success() && is_copy_result(text) {
+        return Ok(true);
+    }
+    let text = crate::text::escape(&redact_error_body(text), 4096);
+    let code = |code: &str| text.contains(&format!("<Code>{code}</Code>"));
+    if status.as_u16() == 501 || code("NotImplemented") {
+        return Ok(false);
+    }
+    if status.as_u16() == 412 || code("PreconditionFailed") {
+        return Err(Error::SourceChanged { url: String::new() });
+    }
+    if status.is_success() {
+        return Err(Error::Generic(format!(
+            "S3 CopyObject did not report a copy (HTTP {status}): {text}"
+        )));
+    }
+    Err(create_failed("S3 CopyObject", status, &text))
 }
 
 #[async_trait::async_trait]
@@ -362,6 +537,71 @@ impl Backend for S3Backend {
         "s3"
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
+    fn copies_from(&self, src: &dyn Backend) -> bool {
+        self.copy_source(src).is_some()
+    }
+
+    /// A signed `CopyObject`: `PUT` of the destination key with
+    /// `x-amz-copy-source: /<bucket>/<key>`, and `x-amz-copy-source-if-match`
+    /// with the source's e-tag when `known` has one. The source's metadata is
+    /// copied (the default `MetadataDirective`); no storage class is sent, as
+    /// a streamed copy keeps none either. See [`S3Backend::copy_source`] for
+    /// when this runs; a source over 5 GiB never gets here (the caller
+    /// streams it). A `501` answer means the server has no `CopyObject`, and
+    /// the caller streams. A `200` whose body is an `<Error>` document is a
+    /// failure, and `412` is [`Error::SourceChanged`].
+    async fn copy_from(
+        &self,
+        src: &dyn Backend,
+        src_path: &ObjectPath,
+        dst_path: &ObjectPath,
+        known: Option<&ObjectMeta>,
+    ) -> Result<bool> {
+        let Some(source) = self.copy_source(src) else {
+            return Ok(false);
+        };
+        let copy_source = format!("/{}/{}", source.bucket, encode_key(src_path));
+        let mut builder = http::Request::builder()
+            .method(Method::PUT)
+            .uri(self.object_uri(dst_path))
+            .header("x-amz-copy-source", copy_source);
+        if let Some(etag) = known.and_then(|meta| meta.e_tag.as_deref()) {
+            // An e-tag that is no header value cannot be matched: stream.
+            let Ok(etag) = http::HeaderValue::from_str(etag) else {
+                return Ok(false);
+            };
+            builder = builder.header("x-amz-copy-source-if-match", etag);
+        }
+        let request = builder
+            .body(HttpRequestBody::empty())
+            .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
+        let client = self.http.get()?;
+        let response = send_with_retry(|| async {
+            let mut request = request.clone();
+            let credential = self.credential().await?.ok_or_else(|| {
+                Error::Generic(
+                    "Cannot copy on S3 without credentials (this store runs unsigned)".into(),
+                )
+            })?;
+            AwsAuthorizer::new(credential.as_ref(), "s3", &self.region)
+                .try_authorize(&mut request, None)
+                .map_err(|e| Error::Generic(format!("Failed to sign S3 request: {e}")))?;
+            send_signed(client, request).await
+        })
+        .await?;
+        let status = response.status();
+        let text = if status.is_success() {
+            read_document(response).await?
+        } else {
+            error_body(response).await
+        };
+        copy_outcome(status, &text)
+    }
+
     /// Issues an S3 `CreateBucket` request, signed with `object_store`'s
     /// [`AwsAuthorizer`] (`SigV4`). A `LocationConstraint` body is sent for every
     /// region except `us-east-1`, per the S3 API. Succeeds for a `2xx` response
@@ -369,8 +609,8 @@ impl Backend for S3Backend {
     /// (the bucket is already ours, so the call is idempotent). Every other
     /// response is an error, including `BucketAlreadyExists`: another account
     /// owns that global name.
-    async fn create_bucket(&self, client: &reqwest::Client, _url: &Url) -> Result<()> {
-        let region = self.endpoint_and_region().1;
+    async fn create_bucket(&self, _url: &Url) -> Result<()> {
+        let region = &self.region;
         let body = if region == "us-east-1" {
             Bytes::new()
         } else {
@@ -382,7 +622,7 @@ impl Backend for S3Backend {
         };
 
         let request = self.bucket_request(Method::PUT, body.clone()).await?;
-        let response = send_signed(client, request, body).await?;
+        let response = send_signed(self.http.get()?, request).await?;
         let status = response.status();
         if status.is_success() {
             return Ok(());
@@ -399,9 +639,7 @@ impl Backend for S3Backend {
                 self.bucket
             )));
         }
-        Err(Error::Generic(format!(
-            "S3 CreateBucket failed (HTTP {status}): {text}"
-        )))
+        Err(create_failed("S3 CreateBucket", status, &text))
     }
 
     /// Issues an S3 `HeadBucket` request (`HEAD /<bucket>`), signed with
@@ -409,9 +647,9 @@ impl Backend for S3Backend {
     /// probe that avoids the `ListBucket` payload: HTTP `200` means the bucket
     /// exists and `404` that it does not. A `403` (also the answer to a wrong
     /// key or signature) or `401` is an error: existence is unknown.
-    async fn bucket_exists(&self, client: &reqwest::Client, _url: &Url) -> Result<bool> {
+    async fn bucket_exists(&self, _url: &Url) -> Result<bool> {
         let request = self.bucket_request(Method::HEAD, Bytes::new()).await?;
-        let response = send_signed(client, request, Bytes::new()).await?;
+        let response = send_signed(self.http.get()?, request).await?;
         bucket_exists_from_response(response, "S3").await
     }
 
@@ -456,12 +694,17 @@ impl Backend for S3Backend {
         // Resolve credentials once, then re-sign each URL with the bound headers.
         let credential = self.inner.credentials().get_credential().await?;
         let region = &self.region;
-        Ok(bases
+        bases
             .into_iter()
             .map(|mut base| {
                 // Drop the host-only query produced by the object store's signer;
                 // we generate our own SigV4 query over the bound headers.
                 base.set_query(None);
+                // The signer added this parameter, and it must be signed too.
+                if self.request_payer {
+                    base.query_pairs_mut()
+                        .append_pair("x-amz-request-payer", "requester");
+                }
                 sign::presign_s3(
                     &base,
                     &http_method,
@@ -470,24 +713,17 @@ impl Backend for S3Backend {
                     region,
                     options,
                 )
-                .into()
+                .map(Into::into)
             })
-            .collect())
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::stub::{Reply, Request, serve};
+    use crate::backend::stub::{Reply, Request, serve, serve_cut};
     use object_store::ObjectStoreExt;
-
-    fn client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client")
-    }
 
     /// A backend for bucket `bkt` that talks to the stub at `base`.
     fn stubbed(base: &str) -> S3Backend {
@@ -516,7 +752,7 @@ mod tests {
     async fn create(status: u16, body: String) -> (Result<()>, Vec<Request>) {
         let stub = serve(vec![Reply::new(status, body)]).await;
         let url = Url::parse("s3://bkt").expect("url");
-        let result = stubbed(&stub.base).create_bucket(&client(), &url).await;
+        let result = stubbed(&stub.base).create_bucket(&url).await;
         (result, stub.requests())
     }
 
@@ -540,6 +776,43 @@ mod tests {
     async fn create_bucket_ignores_the_name_outside_a_code_element() {
         let doc = error_document("InternalError", "BucketAlreadyOwnedByYou");
         assert!(create(500, doc).await.0.is_err());
+    }
+
+    #[tokio::test]
+    async fn bucket_calls_follow_the_stores_transport_settings() {
+        let proxy = serve(vec![Reply::new(200, "")]).await;
+        let backend = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[
+                ("S3_ENDPOINT", "http://bucket.invalid:9"),
+                ("S3_REGION", "us-east-1"),
+                ("S3_ACCESS_KEY_ID", "k"),
+                ("S3_SECRET_ACCESS_KEY", "s"),
+                ("AWS_PROXY_URL", &proxy.base),
+                ("AWS_ALLOW_INVALID_CERTIFICATES", "true"),
+            ]),
+            None,
+        )
+        .expect("build");
+        let transport = backend.http.transport();
+        assert!(transport.allow_invalid_certificates);
+        assert!(transport.allow_http, "an http endpoint allows http");
+        let url = Url::parse("s3://bkt").expect("url");
+        assert!(backend.bucket_exists(&url).await.expect("exists"));
+        assert_eq!(
+            proxy.requests()[0].line,
+            "HEAD http://bucket.invalid:9/bkt HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bucket_reports_401_and_403_as_denied() {
+        for status in [401, 403] {
+            let doc = error_document("AccessDenied", "Access Denied");
+            let err = create(status, doc).await.0.expect_err("denied");
+            assert!(matches!(err, Error::Denied(_)), "{err:?}");
+            assert!(err.to_string().contains("AccessDenied"), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -569,8 +842,10 @@ mod tests {
             None,
         )
         .expect("build");
-        let (endpoint, region) = http.endpoint_and_region();
-        assert_eq!(endpoint, format!("https://s3.{region}.amazonaws.com"));
+        assert_eq!(
+            http.endpoint(),
+            format!("https://s3.{}.amazonaws.com", http.region)
+        );
 
         // A custom endpoint is used as configured.
         let custom = S3Backend::new(
@@ -582,7 +857,7 @@ mod tests {
             None,
         )
         .expect("build");
-        assert_eq!(custom.endpoint_and_region().0, "http://127.0.0.1:9000");
+        assert_eq!(custom.endpoint(), "http://127.0.0.1:9000");
 
         let https = S3Backend::new(
             Some("b"),
@@ -590,7 +865,7 @@ mod tests {
             None,
         )
         .expect("build");
-        let (endpoint_https, _) = https.endpoint_and_region();
+        let endpoint_https = https.endpoint();
         assert!(
             endpoint_https.starts_with("https://"),
             "Should be https when allow_http is false, got {endpoint_https}"
@@ -610,9 +885,8 @@ mod tests {
             None,
         )
         .expect("build");
-        let (endpoint, region) = backend.endpoint_and_region();
-        assert_eq!(endpoint, "http://127.0.0.1:3900");
-        assert_eq!(region, "eu-north-1");
+        assert_eq!(backend.endpoint(), "http://127.0.0.1:3900");
+        assert_eq!(backend.region, "eu-north-1");
         assert!(!backend.skip_signature);
         // The built store itself must carry the Map-provided config.
         let url = backend
@@ -766,7 +1040,7 @@ mod tests {
             &[("S3_ENDPOINT", "http://127.0.0.1:1")],
         );
         let backend = with_aws_profile(&vars, "dev").expect("build");
-        assert_eq!(backend.endpoint_and_region().1, "eu-west-3");
+        assert_eq!(backend.region, "eu-west-3");
         let credential = backend.credential().await.expect("credential");
         assert_eq!(credential.expect("signed").key_id, "AKIDFILE");
     }
@@ -875,7 +1149,7 @@ mod tests {
             None,
         )
         .expect("build");
-        assert_eq!(backend.endpoint_and_region().0, "http://127.0.0.1:3900");
+        assert_eq!(backend.endpoint(), "http://127.0.0.1:3900");
     }
 
     /// A backend with static keys and no profile, built from `pairs`.
@@ -914,7 +1188,7 @@ mod tests {
         ];
         for (pairs, want) in rows {
             let backend = keyed(pairs);
-            assert_eq!(backend.endpoint_and_region().1, want, "{pairs:?}");
+            assert_eq!(backend.region, want, "{pairs:?}");
             let url = signed(&backend).await;
             assert!(
                 url.as_str().contains(&format!("%2F{want}%2Fs3%2F")),
@@ -1133,7 +1407,7 @@ mod tests {
         for (profile, pairs, want) in rows {
             let (_dir, vars) = profiled(&config, None, pairs);
             let backend = with_aws_profile(&vars, profile).expect("build");
-            assert_eq!(backend.endpoint_and_region().1, want, "{profile} {pairs:?}");
+            assert_eq!(backend.region, want, "{profile} {pairs:?}");
             let url = signed(&backend).await;
             assert!(
                 url.as_str().contains(&format!("%2F{want}%2Fs3%2F")),
@@ -1179,6 +1453,144 @@ mod tests {
             assert!(url.contains("%2Feu-west-3%2Fs3%2Faws4_request"), "{url}");
             assert!(url.contains("X-Amz-Security-Token=tok"), "{url}");
         }
+    }
+
+    /// Headers of a bucket request, and the pre-signed URLs, of a store built
+    /// from `pairs` (static keys on the AWS endpoint, so nothing is sent).
+    async fn token_traces(pairs: &[(&str, &str)]) -> (Option<String>, Vec<String>) {
+        let backend = S3Backend::new(Some("bkt"), &Vars::from_pairs(pairs), None).expect("build");
+        let request = backend
+            .bucket_request(Method::HEAD, Bytes::new())
+            .await
+            .expect("request");
+        let header = request
+            .headers()
+            .get("x-amz-security-token")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let bound = SignOptions {
+            content_length: Some(5),
+            content_type: Some("text/plain".into()),
+        };
+        let mut urls = Vec::new();
+        for options in [SignOptions::default(), bound] {
+            urls.extend(
+                backend
+                    .pre_signed_urls(
+                        &[ObjectPath::from("o")],
+                        SignMethod::Get,
+                        Duration::from_mins(1),
+                        &options,
+                    )
+                    .await
+                    .expect("sign"),
+            );
+        }
+        (header, urls)
+    }
+
+    #[tokio::test]
+    async fn s3_keys_ignore_the_ambient_session_token() {
+        let (header, urls) = token_traces(&[
+            ("S3_ACCESS_KEY_ID", "k"),
+            ("S3_SECRET_ACCESS_KEY", "s"),
+            ("AWS_SESSION_TOKEN", "ambient"),
+        ])
+        .await;
+        assert_eq!(header, None);
+        assert_eq!(urls.len(), 2);
+        for url in urls {
+            assert!(
+                !url.to_ascii_lowercase().contains("security-token"),
+                "{url}"
+            );
+            assert!(url.contains("X-Amz-Credential=k%2F"), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_keys_take_the_secret_from_the_aws_variable_when_s3_has_none() {
+        let (header, urls) = token_traces(&[
+            ("S3_ACCESS_KEY_ID", "k"),
+            ("AWS_SECRET_ACCESS_KEY", "s"),
+            ("AWS_SESSION_TOKEN", "ambient"),
+        ])
+        .await;
+        assert_eq!(header, None);
+        assert!(urls.iter().all(|u| u.contains("X-Amz-Credential=k%2F")));
+    }
+
+    #[test]
+    fn s3_keys_without_any_secret_fail_to_build() {
+        let vars = Vars::from_pairs(&[("S3_ACCESS_KEY_ID", "k")]);
+        assert!(S3Backend::new(Some("bkt"), &vars, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn aws_keys_still_carry_the_session_token() {
+        let (header, urls) = token_traces(&[
+            ("AWS_ACCESS_KEY_ID", "k"),
+            ("AWS_SECRET_ACCESS_KEY", "s"),
+            ("AWS_SESSION_TOKEN", "tok"),
+        ])
+        .await;
+        assert_eq!(header.as_deref(), Some("tok"));
+        assert_eq!(urls.len(), 2);
+        for url in urls {
+            assert!(url.contains("X-Amz-Security-Token=tok"), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_bound_url_keeps_the_request_payer() {
+        let sign = |payer: &'static str| async move {
+            let backend = keyed(&[("AWS_REQUEST_PAYER", payer)]);
+            let mut urls = backend
+                .pre_signed_urls(
+                    &[ObjectPath::from("o")],
+                    SignMethod::Put,
+                    Duration::from_mins(1),
+                    &SignOptions {
+                        content_length: Some(5),
+                        content_type: None,
+                    },
+                )
+                .await
+                .expect("sign");
+            urls.remove(0)
+        };
+        let url = sign("true").await;
+        assert!(url.contains("x-amz-request-payer=requester"), "{url}");
+        let url = sign("false").await;
+        assert!(!url.contains("x-amz-request-payer"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn a_bucket_name_that_is_not_a_uri_host_is_an_error_not_a_panic() {
+        let backend = S3Backend::new(
+            Some("a{b"),
+            &Vars::from_pairs(&[
+                ("S3_ACCESS_KEY_ID", "k"),
+                ("S3_SECRET_ACCESS_KEY", "s"),
+                ("S3_ADDRESSING_STYLE", "virtual"),
+            ]),
+            None,
+        )
+        .expect("build");
+        let options = SignOptions {
+            content_length: None,
+            content_type: Some("text/plain".into()),
+        };
+        let err = backend
+            .pre_signed_urls(
+                &[ObjectPath::from("o")],
+                SignMethod::Put,
+                Duration::from_mins(1),
+                &options,
+            )
+            .await
+            .expect_err("invalid host");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -1232,10 +1644,7 @@ mod tests {
         let stub = serve(vec![Reply::new(200, "")]).await;
         let (_dir, backend) = dev_backend("dev", &[("S3_ENDPOINT", stub.base.as_str())]);
         let url = Url::parse("s3://bkt").expect("url");
-        backend
-            .create_bucket(&client(), &url)
-            .await
-            .expect("create");
+        backend.create_bucket(&url).await.expect("create");
         let requests = stub.requests();
         assert_eq!(requests.len(), 1);
         let body = String::from_utf8_lossy(&requests[0].body);
@@ -1258,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn a_profile_endpoint_is_used_for_s3() {
         let (_dir, backend) = endpoint_backend(&[]);
-        assert_eq!(backend.endpoint_and_region().0, "http://127.0.0.1:9");
+        assert_eq!(backend.endpoint(), "http://127.0.0.1:9");
         // The http:// endpoint enables plain HTTP in the store, which signs for it.
         let url = signed(&backend).await;
         assert!(url.as_str().starts_with("http://127.0.0.1:9/"), "{url}");
@@ -1267,7 +1676,7 @@ mod tests {
     #[tokio::test]
     async fn s3_endpoint_beats_the_profile_endpoint() {
         let (_dir, backend) = endpoint_backend(&[("S3_ENDPOINT", "http://127.0.0.1:8")]);
-        assert_eq!(backend.endpoint_and_region().0, "http://127.0.0.1:8");
+        assert_eq!(backend.endpoint(), "http://127.0.0.1:8");
         let url = signed(&backend).await;
         assert!(url.as_str().starts_with("http://127.0.0.1:8/"), "{url}");
     }
@@ -1275,10 +1684,7 @@ mod tests {
     #[tokio::test]
     async fn ignore_configured_endpoint_urls_drops_the_profile_endpoint() {
         let (_dir, backend) = endpoint_backend(&[("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "true")]);
-        assert_eq!(
-            backend.endpoint_and_region().0,
-            "https://s3.eu-west-3.amazonaws.com"
-        );
+        assert_eq!(backend.endpoint(), "https://s3.eu-west-3.amazonaws.com");
     }
 
     /// A store for bucket `bkt` on a stub at `base`, unsigned, plus `extra`.
@@ -1337,5 +1743,521 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
+    }
+
+    fn shared_pointer(backend: &S3Backend) -> *const () {
+        Arc::as_ptr(backend.inner.credentials()).cast()
+    }
+
+    #[test]
+    fn buckets_of_one_registry_share_a_credential_provider() {
+        // IMDS (no keys, no endpoint) and static keys.
+        for pairs in [
+            &[("AWS_REGION", "eu-west-1")][..],
+            &[
+                ("AWS_REGION", "eu-west-1"),
+                ("AWS_ACCESS_KEY_ID", "k"),
+                ("AWS_SECRET_ACCESS_KEY", "s"),
+            ][..],
+        ] {
+            let vars = Vars::from_pairs(pairs);
+            let shared = Shared::default();
+            let first = S3Backend::with_shared(Some("a"), &vars, None, &shared).expect("a");
+            let second = S3Backend::with_shared(Some("b"), &vars, None, &shared).expect("b");
+            assert_eq!(shared_pointer(&first), shared_pointer(&second));
+            let held = shared.aws.get().expect("stored");
+            assert_eq!(Arc::as_ptr(held).cast::<()>(), shared_pointer(&first));
+            // Another registry has its own.
+            let other = S3Backend::new(Some("a"), &vars, None).expect("other");
+            assert_ne!(shared_pointer(&first), shared_pointer(&other));
+        }
+    }
+
+    #[test]
+    fn a_store_that_skips_signing_takes_no_shared_provider() {
+        let shared = Shared::default();
+        let signed = Vars::from_pairs(&[("AWS_REGION", "eu-west-1")]);
+        let first = S3Backend::with_shared(Some("a"), &signed, None, &shared).expect("a");
+        // A custom endpoint without credentials skips signing.
+        let anonymous = Vars::from_pairs(&[("S3_ENDPOINT", "http://h"), ("S3_REGION", "r")]);
+        let skipping = S3Backend::with_shared(Some("b"), &anonymous, None, &shared).expect("b");
+        assert!(skipping.skip_signature);
+        assert_ne!(shared_pointer(&first), shared_pointer(&skipping));
+        assert_eq!(
+            Arc::as_ptr(shared.aws.get().expect("stored")).cast::<()>(),
+            shared_pointer(&first)
+        );
+        // It does not fill an empty one either.
+        let empty = Shared::default();
+        S3Backend::with_shared(Some("b"), &anonymous, None, &empty).expect("b");
+        assert!(empty.aws.get().is_none());
+    }
+
+    fn copy_vars(base: &str) -> Vec<(&str, &str)> {
+        vec![
+            ("S3_ENDPOINT", base),
+            ("S3_ALLOW_HTTP", "true"),
+            ("S3_REGION", "us-east-1"),
+            ("S3_ACCESS_KEY_ID", "k"),
+            ("S3_SECRET_ACCESS_KEY", "s"),
+        ]
+    }
+
+    /// Backends for buckets `bkt` (destination) and `src bkt` on the stub at
+    /// `base`, of one registry.
+    fn copy_pair(base: &str) -> (S3Backend, S3Backend) {
+        let vars = Vars::from_pairs(&copy_vars(base));
+        let shared = Shared::default();
+        let build =
+            |bucket| S3Backend::with_shared(Some(bucket), &vars, None, &shared).expect("build");
+        (build("bkt"), build("src"))
+    }
+
+    fn meta(etag: Option<&str>) -> ObjectMeta {
+        ObjectMeta {
+            location: ObjectPath::from("a"),
+            last_modified: chrono::DateTime::UNIX_EPOCH,
+            size: 1,
+            e_tag: etag.map(str::to_owned),
+            version: None,
+        }
+    }
+
+    const COPY_RESULT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <CopyObjectResult><ETag>\"e\"</ETag></CopyObjectResult>";
+
+    /// `copy_from` of `a b/c` to `d/e` against a stub answering `reply`.
+    async fn cross_copy(reply: Reply, known: Option<&ObjectMeta>) -> (Result<bool>, Vec<Request>) {
+        let stub = serve(vec![reply]).await;
+        let (dst, src) = copy_pair(&stub.base);
+        let done = dst
+            .copy_from(
+                &src,
+                &ObjectPath::from("a b/c"),
+                &ObjectPath::from("d/e"),
+                known,
+            )
+            .await;
+        (done, stub.requests())
+    }
+
+    #[tokio::test]
+    async fn a_cross_bucket_copy_is_a_signed_copy_object() {
+        let known = meta(Some("\"abc\""));
+        let (done, requests) = cross_copy(Reply::new(200, COPY_RESULT), Some(&known)).await;
+        assert!(done.expect("copy"));
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].line, "PUT /bkt/d/e HTTP/1.1");
+        let headers = requests[0].headers.to_ascii_lowercase();
+        assert!(
+            headers.contains("x-amz-copy-source: /src/a%20b/c\r\n")
+                || headers.contains("x-amz-copy-source: /src/a%20b/c"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("x-amz-copy-source-if-match: \"abc\""),
+            "{headers}"
+        );
+        assert!(
+            headers.contains("authorization: aws4-hmac-sha256"),
+            "{headers}"
+        );
+        let signed = headers
+            .split("signedheaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .expect("signed headers");
+        assert!(signed.contains("x-amz-copy-source;"), "{signed}");
+        assert!(signed.contains("x-amz-copy-source-if-match"), "{signed}");
+        assert_eq!(requests[0].body.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_copy_without_a_known_e_tag_sends_no_condition() {
+        let (done, requests) = cross_copy(Reply::new(200, COPY_RESULT), None).await;
+        assert!(done.expect("copy"));
+        let headers = requests[0].headers.to_ascii_lowercase();
+        assert!(!headers.contains("if-match"), "{headers}");
+    }
+
+    #[tokio::test]
+    async fn an_error_document_in_a_200_is_a_failure() {
+        let doc = error_document("InternalError", "We encountered an internal error");
+        let (done, _) = cross_copy(Reply::new(200, doc), None).await;
+        let err = done.expect_err("error in 200");
+        assert!(matches!(err, Error::Generic(_)), "{err:?}");
+        assert!(err.to_string().contains("InternalError"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_without_copy_object_streams() {
+        let (done, _) = cross_copy(Reply::new(501, ""), None).await;
+        assert!(!done.expect("501"));
+        let doc = error_document("NotImplemented", "not here");
+        let (done, _) = cross_copy(Reply::new(200, doc), None).await;
+        assert!(!done.expect("NotImplemented in 200"));
+    }
+
+    #[tokio::test]
+    async fn a_changed_source_and_a_denial_are_errors() {
+        let (done, _) = cross_copy(
+            Reply::new(412, error_document("PreconditionFailed", "no")),
+            Some(&meta(Some("\"abc\""))),
+        )
+        .await;
+        assert!(matches!(
+            done.expect_err("412"),
+            Error::SourceChanged { .. }
+        ));
+        let (done, _) =
+            cross_copy(Reply::new(403, error_document("AccessDenied", "no")), None).await;
+        let err = done.expect_err("403");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        assert!(err.to_string().contains("AccessDenied"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn copies_stay_in_the_provider_account_and_endpoint() {
+        let stub = serve(vec![]).await;
+        let (dst, src) = copy_pair(&stub.base);
+        assert!(dst.copies_from(&src));
+
+        let refuse = |pairs: &[(&str, &str)], shared: &Shared| {
+            let vars = Vars::from_pairs(pairs);
+            S3Backend::with_shared(Some("src"), &vars, None, shared).expect("other")
+        };
+        let base = copy_vars(&stub.base);
+        let with = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = base.clone();
+            pairs.retain(|(k, _)| !extra.iter().any(|(e, _)| e == k));
+            pairs.extend_from_slice(extra);
+            pairs
+        };
+        // Another registry holds another credential provider.
+        assert!(!dst.copies_from(&refuse(&base, &Shared::default())));
+        // The same registry, another endpoint, region or addressing style.
+        let shared = Shared::default();
+        let first = refuse(&base, &shared);
+        for extra in [
+            [("S3_ENDPOINT", "http://other.invalid:9")],
+            [("S3_REGION", "eu-west-1")],
+            [("S3_ADDRESSING_STYLE", "virtual")],
+            [("AWS_REQUEST_PAYER", "true")],
+        ] {
+            let other = refuse(&with(&extra), &shared);
+            assert!(first.copies_from(&first), "same bucket reads itself");
+            assert!(!first.copies_from(&other), "{extra:?}");
+            assert!(!other.copies_from(&first), "{extra:?}");
+        }
+        // A store that skips signing, on either side.
+        let skipping = refuse(&with(&[("AWS_SKIP_SIGNATURE", "true")]), &shared);
+        assert!(skipping.skip_signature);
+        assert!(!first.copies_from(&skipping) && !skipping.copies_from(&first));
+        // Another provider.
+        let memory: Arc<dyn Backend> = Arc::new(crate::backend::TestBackend {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            multipart: false,
+        });
+        assert!(!dst.copies_from(memory.as_ref()));
+        assert!(
+            !dst.copy_from(memory.as_ref(), &"a".into(), &"b".into(), None)
+                .await
+                .expect("refused")
+        );
+        assert!(stub.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn virtual_hosting_on_a_custom_endpoint_streams() {
+        let stub = serve(vec![]).await;
+        let mut pairs = copy_vars(&stub.base);
+        pairs.push(("S3_ADDRESSING_STYLE", "virtual"));
+        let vars = Vars::from_pairs(&pairs);
+        let shared = Shared::default();
+        let a = S3Backend::with_shared(Some("a"), &vars, None, &shared).expect("a");
+        let b = S3Backend::with_shared(Some("b"), &vars, None, &shared).expect("b");
+        assert!(!a.copies_from(&b));
+    }
+
+    #[test]
+    fn object_uris_follow_the_addressing_style() {
+        let path = ObjectPath::from("d e/f");
+        let path_style = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[("S3_ENDPOINT", "http://h:9/"), ("S3_REGION", "r")]),
+            None,
+        )
+        .expect("build");
+        assert_eq!(path_style.object_uri(&path), "http://h:9/bkt/d%20e/f");
+        let aws = S3Backend::new(
+            Some("bkt"),
+            &Vars::from_pairs(&[
+                ("S3_REGION", "eu-west-1"),
+                ("S3_ADDRESSING_STYLE", "virtual"),
+            ]),
+            None,
+        )
+        .expect("build");
+        assert_eq!(
+            aws.object_uri(&path),
+            "https://bkt.s3.eu-west-1.amazonaws.com/d%20e/f"
+        );
+    }
+
+    /// Runs a copy or move of `src bkt/a` to `bkt/b` through `server_side_copy`
+    /// against a stub answering `replies`.
+    async fn copy_through_codec(
+        replies: Vec<Reply>,
+        delete_source: bool,
+    ) -> (Result<bool>, Vec<String>) {
+        copy_on(serve(replies).await, delete_source).await
+    }
+
+    async fn copy_on(
+        stub: crate::backend::stub::Stub,
+        delete_source: bool,
+    ) -> (Result<bool>, Vec<String>) {
+        use crate::codec::sealed::{Location, Resolved};
+        let (dst, src) = copy_pair(&stub.base);
+        let at = |backend: S3Backend, url: &str| {
+            let url = Url::parse(url).expect("url");
+            let path = ObjectPath::from_url_path(url.path()).expect("path");
+            Resolved {
+                backend: Arc::new(backend),
+                loc: Location { url, path },
+            }
+        };
+        let done = crate::codec::server_side_copy(
+            &at(src, "s3://src/a"),
+            &at(dst, "s3://bkt/b"),
+            delete_source,
+            None,
+        )
+        .await;
+        let lines = stub
+            .requests()
+            .into_iter()
+            .map(|r| r.line.split(" HTTP").next().unwrap_or_default().to_owned())
+            .collect();
+        (done, lines)
+    }
+
+    fn head_reply() -> Reply {
+        Reply::new(200, "")
+            .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header("ETag", "\"0x1\"")
+    }
+
+    #[tokio::test]
+    async fn a_cross_bucket_move_deletes_the_source_only_after_the_copy() {
+        let replies = vec![
+            head_reply(),
+            Reply::new(200, COPY_RESULT),
+            head_reply(),
+            head_reply(),
+            Reply::new(
+                200,
+                "<DeleteResult><Deleted><Key>a</Key></Deleted></DeleteResult>",
+            ),
+        ];
+        let (done, lines) = copy_through_codec(replies, true).await;
+        assert!(done.expect("move"));
+        assert_eq!(
+            lines,
+            [
+                "HEAD /src/a",
+                "PUT /bkt/b",
+                "HEAD /bkt/b",
+                "HEAD /src/a",
+                "POST /src?delete"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cross_bucket_copy_keeps_the_source() {
+        let doc = error_document("InternalError", "oops");
+        for reply in [Reply::new(200, doc.clone()), Reply::new(500, doc)] {
+            let (done, lines) = copy_through_codec(vec![head_reply(), reply], true).await;
+            done.expect_err("failed copy");
+            assert_eq!(lines, ["HEAD /src/a", "PUT /bkt/b"]);
+        }
+        let changed = Reply::new(412, error_document("PreconditionFailed", "no"));
+        let (done, lines) = copy_through_codec(vec![head_reply(), changed], true).await;
+        let err = done.expect_err("changed");
+        assert!(
+            matches!(&err, Error::SourceChanged { url } if url == "s3://src/a"),
+            "{err:?}"
+        );
+        assert_eq!(lines, ["HEAD /src/a", "PUT /bkt/b"]);
+    }
+
+    #[tokio::test]
+    async fn a_move_streams_when_the_server_cannot_copy() {
+        let (done, lines) = copy_through_codec(vec![head_reply(), Reply::new(501, "")], true).await;
+        assert!(!done.expect("501"));
+        assert_eq!(lines, ["HEAD /src/a", "PUT /bkt/b"]);
+    }
+
+    #[tokio::test]
+    async fn a_copy_over_five_gib_streams_without_a_copy_request() {
+        use crate::codec::sealed::{Location, Resolved};
+        let stub = serve(vec![]).await;
+        let (dst, src) = copy_pair(&stub.base);
+        let at = |backend: S3Backend, url: &str| {
+            let url = Url::parse(url).expect("url");
+            let path = ObjectPath::from_url_path(url.path()).expect("path");
+            Resolved {
+                backend: Arc::new(backend),
+                loc: Location { url, path },
+            }
+        };
+        let done = crate::codec::server_side_copy(
+            &at(src, "s3://src/a"),
+            &at(dst, "s3://bkt/b"),
+            false,
+            Some(6 << 30),
+        )
+        .await;
+        assert!(!done.expect("too large"));
+        assert!(stub.requests().is_empty());
+    }
+
+    /// A move whose copy answer is not a `CopyObjectResult` keeps its source:
+    /// no request after the `PUT` deletes anything.
+    #[tokio::test]
+    async fn a_move_without_a_copy_result_keeps_the_source() {
+        let keep_alive = " ".repeat(10_000);
+        for body in [
+            "",
+            "   \n  ",
+            "<html>hi</html>",
+            &format!("{keep_alive}<CopyObjectRes"),
+        ] {
+            let replies = vec![head_reply(), Reply::new(200, body)];
+            let (done, lines) = copy_through_codec(replies, true).await;
+            done.expect_err(body);
+            assert_eq!(lines, ["HEAD /src/a", "PUT /bkt/b"], "{body:?}");
+        }
+        // White space, then the connection is cut.
+        let (done, lines) = copy_on(serve_cut(" ".repeat(10_000)).await, true).await;
+        done.expect_err("cut");
+        assert!(lines.iter().all(|l| !l.starts_with("POST")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn keep_alive_white_space_before_the_result_is_a_success() {
+        let body = format!("{}{COPY_RESULT}", " ".repeat(10_000));
+        let (done, requests) = cross_copy(Reply::new(200, body), None).await;
+        assert!(done.expect("copy"));
+        assert_eq!(requests.len(), 1);
+        // And an error document after it is a failure.
+        let doc = format!(
+            "{}{}",
+            " ".repeat(10_000),
+            error_document("InternalError", "late")
+        );
+        let (done, _) = cross_copy(Reply::new(200, doc), None).await;
+        assert!(
+            done.expect_err("late error")
+                .to_string()
+                .contains("InternalError")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_keeps_the_source_when_the_destination_is_smaller() {
+        let short = Reply::new(200, "hello")
+            .header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .header("ETag", "\"0x1\"");
+        let replies = vec![head_reply(), Reply::new(200, COPY_RESULT), short];
+        let (done, lines) = copy_through_codec(replies, true).await;
+        assert!(
+            done.expect_err("size")
+                .to_string()
+                .contains("source was kept")
+        );
+        assert_eq!(lines, ["HEAD /src/a", "PUT /bkt/b", "HEAD /bkt/b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_copy_failures_are_retried_up_to_three_attempts() {
+        let busy = || Reply::new(503, error_document("SlowDown", "later"));
+        let (done, requests) = cross_copy_all(vec![
+            busy(),
+            Reply::new(500, ""),
+            Reply::new(200, COPY_RESULT),
+        ])
+        .await;
+        assert!(done.expect("third attempt"));
+        assert_eq!(requests.len(), 3);
+        let (done, requests) = cross_copy_all(vec![busy(), busy(), busy()]).await;
+        assert!(done.is_err());
+        assert_eq!(requests.len(), 3);
+        // Other answers are final, and so is a 2xx.
+        let (done, requests) =
+            cross_copy_all(vec![Reply::new(403, error_document("AccessDenied", "no"))]).await;
+        assert!(done.is_err());
+        assert_eq!(requests.len(), 1);
+        let (done, requests) = cross_copy_all(vec![Reply::new(200, "")]).await;
+        assert!(done.is_err());
+        assert_eq!(requests.len(), 1);
+    }
+
+    async fn cross_copy_all(replies: Vec<Reply>) -> (Result<bool>, Vec<Request>) {
+        let stub = serve(replies).await;
+        let (dst, src) = copy_pair(&stub.base);
+        let done = dst
+            .copy_from(&src, &ObjectPath::from("a"), &ObjectPath::from("b"), None)
+            .await;
+        (done, stub.requests())
+    }
+
+    #[tokio::test]
+    async fn provider_side_encryption_and_express_make_the_copy_stream() {
+        let stub = serve(vec![]).await;
+        let base = copy_vars(&stub.base);
+        let build = |extra: &[(&'static str, &'static str)], shared: &Shared| {
+            let mut pairs = base.clone();
+            pairs.extend_from_slice(extra);
+            let vars = Vars::from_pairs(&pairs);
+            // An Express bucket name carries the zone.
+            let bucket = if extra.contains(&("AWS_S3_EXPRESS", "true")) {
+                "src--use1-az4--x-s3"
+            } else {
+                "src"
+            };
+            S3Backend::with_shared(Some(bucket), &vars, None, shared).expect("build")
+        };
+        let key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let shared = Shared::default();
+        let plain = build(&[], &shared);
+        let express_off = build(&[("AWS_S3_EXPRESS", "false")], &shared);
+        assert!(plain.copies_from(&express_off));
+        for extra in [
+            &[("AWS_SERVER_SIDE_ENCRYPTION", "AES256")][..],
+            &[
+                ("AWS_SERVER_SIDE_ENCRYPTION", "aws:kms"),
+                ("AWS_SSE_KMS_KEY_ID", "k"),
+            ][..],
+            &[
+                ("AWS_SERVER_SIDE_ENCRYPTION", "aws:kms"),
+                ("AWS_SSE_BUCKET_KEY_ENABLED", "true"),
+            ][..],
+            &[
+                ("AWS_SERVER_SIDE_ENCRYPTION", "sse-c"),
+                ("AWS_SSE_CUSTOMER_KEY_BASE64", key),
+            ][..],
+            &[("AWS_S3_EXPRESS", "true")][..],
+        ] {
+            let other = build(extra, &shared);
+            assert!(!plain.copies_from(&other), "{extra:?}");
+            assert!(!other.copies_from(&plain), "{extra:?}");
+            let done = plain
+                .copy_from(&other, &ObjectPath::from("a"), &ObjectPath::from("b"), None)
+                .await;
+            assert!(!done.expect("refused"), "{extra:?}");
+        }
+        assert!(stub.requests().is_empty());
     }
 }

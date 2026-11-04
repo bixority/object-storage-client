@@ -102,7 +102,7 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mu
 fn banners(ui: &mut egui::Ui, panel: &PanelState, side: Side, actions: &mut Vec<Action>) {
     if panel.loading {
         ui.horizontal(|ui| {
-            ui.spinner();
+            super::busy(ui);
             ui.weak("Loading…");
         });
     }
@@ -178,12 +178,16 @@ fn table(
                 let name = entry.name();
                 let key = entry.key();
                 row.set_selected(panel.selection.contains(&key));
-                let icon = if entry.is_folder() { "🗀" } else { "🗋" };
+                let icon = match entry {
+                    Entry::Folder { .. } => "🗀",
+                    Entry::Object { .. } => "🗋",
+                    Entry::Link { .. } => "🔗",
+                };
                 row.col(|ui| {
                     ui.add(egui::Label::new(format!("{icon} {}", display::text(name))).truncate());
                 });
                 let (size_text, modified_text) = match entry {
-                    Entry::Folder { .. } => (String::new(), String::new()),
+                    Entry::Folder { .. } | Entry::Link { .. } => (String::new(), String::new()),
                     Entry::Object { size, modified, .. } => (
                         human_size(*size),
                         modified.format("%Y-%m-%d %H:%M").to_string(),

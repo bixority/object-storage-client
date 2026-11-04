@@ -80,7 +80,9 @@ fn job(phase: JobPhase) -> Job {
         done: 3,
         total: 48,
         current: "photos/x.jpg".to_owned(),
+        src_dir: loc("file:///l/"),
         dst_dir: loc("file:///r/"),
+        cancelled: false,
     }
 }
 
@@ -138,7 +140,7 @@ fn dialogs() -> Vec<Dialog> {
                 failures,
             },
         },
-        Dialog::Quit { done: 3, total: 48 },
+        Dialog::Quit,
     ]
 }
 
@@ -164,12 +166,17 @@ fn render_smoke_every_state() {
 
     for dialog in dialogs() {
         let mut s = main_state();
-        if matches!(dialog, Dialog::Quit { .. }) {
+        if matches!(dialog, Dialog::Quit) {
             s.job = Some(job(JobPhase::Running));
         }
         s.dialog = Some(dialog);
         fixtures.push(s);
     }
+
+    // The job ended while the question stayed open.
+    let mut ended = main_state();
+    ended.dialog = Some(Dialog::Quit);
+    fixtures.push(ended);
 
     for phase in [
         JobPhase::Planning,

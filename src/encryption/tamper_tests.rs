@@ -1,4 +1,4 @@
-//! Tamper suite (spec §10.2) and property-based round-trips.
+//! Tamper suite and property-based round-trips.
 #![expect(clippy::cast_possible_truncation, reason = "test sizes are small")]
 
 use bytes::{Bytes, BytesMut};
@@ -206,12 +206,12 @@ fn header_field_tampering_is_rejected() {
     let (msg, hl) = encrypt(&data, 4096);
     let l = DecodeLimits::default();
 
-    // suite downgrade to 0x0178
+    // suite downgrade to 0x0178: the prefix no longer matches, so NotOsc
     let mut m = msg.clone();
     m[1..3].copy_from_slice(&0x0178u16.to_be_bytes());
     assert!(matches!(
         run(&m, 0, 0x42, l.clone()).1,
-        Err(DecryptError::Format(FormatError::UnsupportedSuite(0x0178)))
+        Err(DecryptError::Format(FormatError::NotOsc))
     ));
 
     // non-framed content type

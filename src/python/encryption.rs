@@ -2,19 +2,18 @@
 //! `Keyring` and the exception hierarchy.
 
 use super::client::{
-    ObjectStorageClient, bytes_from_py, client_pyclass, stream_result, upload_options,
+    ObjectStorageClient, bytes_from_py, client_pyclass, plain_client, stream_result, upload_options,
 };
-use super::stream::py_async_iter_to_stream;
+use super::stream::{py_async_iter_to_stream, take_byte_stream};
 use super::{call, client_to_py_err, int_in};
 use crate::ReencryptOptions;
 use crate::client::EncryptedObjectStorageClient as InternalClient;
 use crate::codec::CallerContext;
 use crate::encryption::EncryptionConfig;
-use crate::encryption::keys::{KeyError, KeyProvider as _, Keyring as RustKeyring};
+use crate::encryption::keys::{KeyError, Keyring as RustKeyring};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDateTime, PyDict, PyList, PyTzInfo};
-use pyo3_async_runtimes::tokio::get_current_locals;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,7 +105,8 @@ impl Keyring {
     /// [{"id": str, "created": "YYYY-MM-DD"}], "active_age_days": int,
     /// "last_reload_error": str | None}``.
     fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let st = self.inner.status();
+        let inner = Arc::clone(&self.inner);
+        let st = py.detach(move || inner.status());
         let d = PyDict::new(py);
         let keys = PyList::empty(py);
         for k in st.keys {
@@ -135,7 +135,7 @@ impl Keyring {
         format!(
             "Keyring(path={:?}, active={:?})",
             self.path.to_string_lossy(),
-            self.inner.active_key_name()
+            self.inner.active_id()
         )
     }
 }
@@ -162,14 +162,8 @@ client_pyclass!(EncryptedObjectStorageClient, {
         profile: Option<String>,
     ) -> PyResult<Self> {
         let cfg = keyring.config(bind_object_key, frame_length)?;
-        let plain = match profile {
-            Some(p) => crate::ObjectStorageClient::new()
-                .with_s3_profile(p)
-                .map_err(client_to_py_err)?,
-            None => crate::ObjectStorageClient::new(),
-        };
         Ok(Self {
-            inner: Arc::new(plain.with_encryption(cfg)),
+            inner: Arc::new(plain_client(profile)?.with_encryption(cfg)),
         })
     }
 
@@ -250,6 +244,8 @@ client_pyclass!(EncryptedObjectStorageClient, {
     /// Encrypt and upload the bytes-like chunks of an async iterable. Same
     /// bounded read-ahead, back-pressure and abort semantics as the plain client,
     /// including the background abort that the interpreter waits for at exit.
+    /// A ``ByteStream`` is piped natively and is consumed and closed by the
+    /// call (see the plain client).
     /// ``size_hint`` is the expected plaintext size in bytes, if known (see the
     /// plain client).
     #[pyo3(signature = (url, chunks, context=None, *, size_hint=None))]
@@ -263,7 +259,12 @@ client_pyclass!(EncryptedObjectStorageClient, {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         let opts = upload_options(size_hint)?;
-        let stream = py_async_iter_to_stream(chunks, get_current_locals(py)?)?;
+        // Refused calls (no running loop, a fork) leave the stream intact.
+        let locals = super::preflight(py)?;
+        let stream = match take_byte_stream(chunks)? {
+            Some(stream) => stream,
+            None => py_async_iter_to_stream(chunks, locals)?,
+        };
         let ctx = context.unwrap_or_default();
 
         call(py, async move {
@@ -276,7 +277,9 @@ client_pyclass!(EncryptedObjectStorageClient, {
     /// ``"would-rewrite"`` (``dry_run``), ``"skipped"``, ``"not-encrypted"``,
     /// ``"after-cutoff"`` (modified at or after the timezone-aware ``before``,
     /// or the store reports no modification time) or ``"changed"`` (modified
-    /// meanwhile; the newer content is kept). ``before`` compares the
+    /// meanwhile; the newer content is kept). A ``from_key`` equal to the
+    /// active key raises ``ValueError`` and one the keyring does not hold
+    /// raises ``EncryptionError``, both before any object is read. ``before`` compares the
     /// modification time the store reports, which is not authenticated: it only
     /// screens out forgeries by holders of leaked storage credentials on stores
     /// that set the time themselves at commit. The provider, anyone who can set

@@ -56,6 +56,10 @@ pub(super) fn up(state: &mut AppState, side: Side) -> Vec<Command> {
 
 pub(super) fn open(state: &mut AppState, side: Side, name: &str) -> Vec<Command> {
     let panel = &state.panels[side.index()];
+    // The rows are the previous folder's: a name would resolve against the new one.
+    if panel.stale() {
+        return Vec::new();
+    }
     let is_folder = panel
         .entries
         .iter()
@@ -70,6 +74,18 @@ pub(super) fn open(state: &mut AppState, side: Side, name: &str) -> Vec<Command>
 pub(super) fn refresh(state: &mut AppState, side: Side) -> Vec<Command> {
     let location = state.panels[side.index()].location.clone();
     go(state, side, location)
+}
+
+/// Lists the panel's location again and keeps the text being typed in the
+/// address bar.
+pub(super) fn reload(state: &mut AppState, side: Side) -> Vec<Command> {
+    let panel = &state.panels[side.index()];
+    let (text, error) = (panel.address_text.clone(), panel.address_error.clone());
+    let commands = refresh(state, side);
+    let panel = &mut state.panels[side.index()];
+    panel.address_text = text;
+    panel.address_error = error;
+    commands
 }
 
 pub(super) fn load_more(state: &mut AppState, side: Side) -> Vec<Command> {
@@ -110,13 +126,10 @@ pub(super) fn page(
             panel.error = None;
             if first {
                 panel.entries = page.entries;
-                panel.address_text = panel.location.display();
             } else {
                 panel.entries.extend(page.entries);
             }
-            panel
-                .entries
-                .sort_by(|a, b| (!a.is_folder(), a.name()).cmp(&(!b.is_folder(), b.name())));
+            panel.entries.sort_by(Entry::listing_order);
             panel.next = page.next;
             let len = panel.entries.len();
             if len > MAX_ENTRIES || (len == MAX_ENTRIES && panel.next.is_some()) {
@@ -138,6 +151,10 @@ pub(super) fn page(
 
 pub(super) fn select(state: &mut AppState, side: Side, op: SelectOp) -> Vec<Command> {
     let panel = &mut state.panels[side.index()];
+    // Rows of a stale panel are inert; only clearing is safe.
+    if panel.stale() && !matches!(op, SelectOp::Clear) {
+        return Vec::new();
+    }
     match op {
         SelectOp::Only(key) => {
             panel.selection.clear();

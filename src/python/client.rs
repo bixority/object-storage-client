@@ -1,5 +1,5 @@
 use super::encryption::{EncryptedObjectStorageClient, Keyring};
-use super::stream::py_async_iter_to_stream;
+use super::stream::{py_async_iter_to_stream, take_byte_stream};
 use super::{call, client_to_py_err, int_in};
 use crate::client::{EncryptionInfo, ObjectMetadata, ObjectStorageClient as InternalClient};
 use crate::codec::CallerContext;
@@ -8,9 +8,7 @@ use crate::upload::UploadOptions;
 use bytes::Bytes;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyMemoryView};
-use pyo3_async_runtimes::tokio::get_current_locals;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +44,7 @@ pub(super) fn upload_options(size_hint: Option<i128>) -> PyResult<UploadOptions>
 /// it rejects non-`B` formats.)
 pub(super) fn buffer_to_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Option<Bytes>> {
     if obj.is_instance_of::<PyBytes>() || obj.is_instance_of::<PyByteArray>() {
-        return Ok(Some(Bytes::from_owner(obj.extract::<PyBackedBytes>()?)));
+        return Ok(Some(obj.extract::<Bytes>()?));
     }
     let py = obj.py();
     // `memoryview(obj)` succeeds exactly for buffer-protocol objects, which
@@ -55,7 +53,7 @@ pub(super) fn buffer_to_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Option<Bytes>>
         return Ok(None);
     };
     let copy = py.get_type::<PyBytes>().call1((view,))?;
-    Ok(Some(Bytes::from_owner(copy.extract::<PyBackedBytes>()?)))
+    Ok(Some(copy.extract::<Bytes>()?))
 }
 
 /// Converts a bytes-like object or a list of ints into `Bytes`.
@@ -141,11 +139,21 @@ fn sign_args(
     ))
 }
 
+/// A plain client, on the AWS profile `profile` if one is given.
+pub(super) fn plain_client(profile: Option<String>) -> PyResult<InternalClient> {
+    profile.map_or_else(
+        || Ok(InternalClient::new()),
+        |profile| {
+            InternalClient::new()
+                .with_s3_profile(profile)
+                .map_err(client_to_py_err)
+        },
+    )
+}
+
 /// A download on its way to Python as a `ByteStream`.
 pub(super) fn stream_result(stream: crate::codec::ByteStream) -> super::stream::StreamResult {
-    super::stream::StreamResult(super::stream::RawByteStream::new(Box::pin(
-        futures::StreamExt::fuse(stream),
-    )))
+    super::stream::StreamResult(super::stream::RawByteStream::new(stream))
 }
 
 /// Emits the whole `#[pymethods]` block of a client class: the methods shared
@@ -155,6 +163,9 @@ macro_rules! client_pyclass {
     ($ty:ident, { $($extra:tt)* }) => {
         #[pymethods]
         impl $ty {
+            /// Delete an object. An ``http(s)://`` URL that is a ``WebDAV``
+            /// collection raises ``ValueError``, because deleting it would
+            /// remove everything in it; use ``delete_objects_by_prefix``.
             fn delete_object<'py>(
                 &self,
                 py: ::pyo3::Python<'py>,
@@ -180,7 +191,8 @@ macro_rules! client_pyclass {
             }
 
             /// List the objects under the prefix. Names are relative to the
-            /// prefix and come in store order. The whole listing is held in
+            /// prefix and come in store order. On ``file://``, symlinks below
+            /// the prefix are not listed. The whole listing is held in
             /// memory (twice while it is converted); for a large prefix use
             /// :py:meth:`list_objects_stream`.
             fn list_objects<'py>(
@@ -253,8 +265,10 @@ macro_rules! client_pyclass {
             /// URLs the path is the directory to create. Supported for ``file://``,
             /// ``s3://`` (AWS S3, `MinIO` and `SeaweedFS`), ``gs://``/``gcs://`` (Google
             /// Cloud Storage) and the Azure schemes (``az://``, ``wasb(s)://``,
-            /// ``abfs(s)://``). Creating a bucket that already exists is treated as
-            /// success.
+            /// ``abfs(s)://``). A bucket that already exists and is yours (S3
+            /// ``BucketAlreadyOwnedByYou``, GCS visible to the caller, Azure 409) is
+            /// success; a name owned by another account or project raises
+            /// ``RuntimeError``.
             fn create_bucket<'py>(
                 &self,
                 py: ::pyo3::Python<'py>,
@@ -283,6 +297,12 @@ macro_rules! client_pyclass {
                 $crate::python::call(py, async move { inner.bucket_exists(&url).await })
             }
 
+            /// Copies an object; copying it onto itself does nothing. The plain
+            /// client first reads the start of the source (one extra request) and
+            /// raises ``ValueError`` for an encrypted object bound to its name
+            /// when the destination name differs; copy it with the encrypted
+            /// client. The encrypted client always decrypts and re-encrypts,
+            /// never copying server-side.
             fn copy_object<'py>(
                 &self,
                 py: ::pyo3::Python<'py>,
@@ -294,6 +314,10 @@ macro_rules! client_pyclass {
                 $crate::python::call(py, async move { inner.copy(&from_url, &to_url).await })
             }
 
+            /// Moves an object. The source is deleted only after the destination
+            /// committed and only if it is unchanged. The checks and costs are
+            /// those of ``copy_object``. An ``http(s)://`` source that is a
+            /// ``WebDAV`` collection raises ``ValueError``.
             fn move_object<'py>(
                 &self,
                 py: ::pyo3::Python<'py>,
@@ -331,14 +355,8 @@ client_pyclass!(ObjectStorageClient, {
     #[new]
     #[pyo3(signature = (profile=None))]
     fn new(profile: Option<String>) -> PyResult<Self> {
-        let inner = match profile {
-            Some(profile) => InternalClient::new()
-                .with_s3_profile(profile)
-                .map_err(client_to_py_err)?,
-            None => InternalClient::new(),
-        };
         Ok(Self {
-            inner: Arc::new(inner),
+            inner: Arc::new(plain_client(profile)?),
         })
     }
 
@@ -409,13 +427,24 @@ client_pyclass!(ObjectStorageClient, {
     /// ``SIGTERM`` can still leave an incomplete multipart upload: configure an
     /// ``AbortIncompleteMultipartUpload`` lifecycle rule.
     ///
+    /// A ``ByteStream`` from ``get_object_stream`` is piped natively: no
+    /// Python code runs per chunk, so the bytes move even while the event
+    /// loop is busy (a busy loop still delays the start and end of the call).
+    /// It is consumed and closed by the call, also when the upload then
+    /// fails; later reads raise ``RuntimeError``. A closed ``ByteStream``, one
+    /// with a read pending, or a call refused before it starts (no running
+    /// event loop) raises ``RuntimeError``, leaves the stream as it was and
+    /// writes nothing. Any other async iterable is read as described above.
+    ///
     /// ``size_hint`` is the expected total size in bytes, if known. A large
     /// hint makes the upload use bigger parts so that it stays within the
     /// store's part limit (about 78 GiB otherwise). It is a hint, not a limit, but
     /// it must be between 0 and 5 TiB (``ValueError`` otherwise). A
     /// multipart upload holds about 40 MiB of parts in memory (up to five
-    /// 8 MiB parts); with a hint beyond about 70 GiB the parts grow, and at
-    /// most 32 MiB of them are in flight plus the one being filled. A store
+    /// 8 MiB parts); with a hint beyond about 70 GiB the parts grow, and up to
+    /// 32 MiB of them are in flight (always at least one) plus the one being
+    /// filled. Above about 278 GiB a part exceeds 32 MiB, so memory is about one
+    /// part plus about one input chunk (roughly 590 MiB at 5 TiB). A store
     /// without multipart upload (``http(s)://``) buffers the whole object and
     /// refuses more than 1 GiB.
     #[pyo3(signature = (url, chunks, *, size_hint=None))]
@@ -428,7 +457,12 @@ client_pyclass!(ObjectStorageClient, {
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = Arc::clone(&self.inner);
         let opts = upload_options(size_hint)?;
-        let stream = py_async_iter_to_stream(chunks, get_current_locals(py)?)?;
+        // Refused calls (no running loop, a fork) leave the stream intact.
+        let locals = super::preflight(py)?;
+        let stream = match take_byte_stream(chunks)? {
+            Some(stream) => stream,
+            None => py_async_iter_to_stream(chunks, locals)?,
+        };
 
         call(py, async move {
             inner

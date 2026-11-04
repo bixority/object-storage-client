@@ -1,6 +1,6 @@
 //! Close and shutdown rules.
 
-use super::{act, loc, obj, page};
+use super::{act, loc, obj, page, plan, planned};
 use crate::gui::action::close::DRAINING;
 use crate::gui::action::{Action, Answer, Command, Event, Msg, SelectOp, update};
 use crate::gui::model::{
@@ -19,35 +19,29 @@ fn selected() -> AppState {
     s
 }
 
-fn plan(exists: Option<bool>) -> Plan {
-    Plan {
-        kind: OpKind::Copy,
-        items: vec![Item::Transfer {
+fn copy_plan(exists: Option<bool>) -> Plan {
+    plan(
+        OpKind::Copy,
+        vec![Item::Transfer {
             src: "file:///l/a".into(),
             dst: "file:///r/a".into(),
             rel: "a".into(),
+            size: 1,
             exists,
         }],
-        checked: true,
-        failures: Vec::new(),
-    }
+        true,
+    )
 }
 
-fn planned(s: &mut AppState, exists: Option<bool>) -> Vec<Command> {
-    update(
-        s,
-        Msg::Event(Event::Planned {
-            job: JobId(1),
-            plan: plan(exists),
-        }),
-    )
+fn planned_copy(s: &mut AppState, exists: Option<bool>) -> Vec<Command> {
+    planned(s, 1, copy_plan(exists))
 }
 
 /// A copy of `a` that is running (planned with nothing in the way).
 fn running() -> AppState {
     let mut s = selected();
     act(&mut s, Action::Copy);
-    let commands = planned(&mut s, Some(false));
+    let commands = planned_copy(&mut s, Some(false));
     assert!(matches!(commands.as_slice(), [Command::Execute { .. }]));
     s
 }
@@ -66,7 +60,7 @@ fn close_without_job_drains() {
 fn close_with_job_asks_first() {
     let mut s = running();
     assert_eq!(act(&mut s, Action::CloseRequested), vec![]);
-    assert_eq!(s.dialog, Some(Dialog::Quit { done: 0, total: 1 }));
+    assert_eq!(s.dialog, Some(Dialog::Quit));
     assert_eq!(s.closing, Closing::Open);
 
     assert_eq!(act(&mut s, Action::DialogAnswer(Answer::Cancel)), vec![]);
@@ -90,10 +84,10 @@ fn close_while_planning_asks_and_keeps_the_question() {
     let mut s = selected();
     act(&mut s, Action::Copy);
     act(&mut s, Action::CloseRequested);
-    assert!(matches!(s.dialog, Some(Dialog::Quit { .. })));
+    assert!(matches!(s.dialog, Some(Dialog::Quit)));
     // The plan needs an answer, but the close question stays on top.
-    assert_eq!(planned(&mut s, Some(true)), vec![]);
-    assert!(matches!(s.dialog, Some(Dialog::Quit { .. })));
+    assert_eq!(planned_copy(&mut s, Some(true)), vec![]);
+    assert!(matches!(s.dialog, Some(Dialog::Quit)));
     // Keeping the window open brings the plan's own question back.
     act(&mut s, Action::DialogAnswer(Answer::Cancel));
     assert!(matches!(
@@ -107,7 +101,7 @@ fn plan_without_question_runs_after_quit_is_cancelled() {
     let mut s = selected();
     act(&mut s, Action::Copy);
     act(&mut s, Action::CloseRequested);
-    assert_eq!(planned(&mut s, Some(false)), vec![]);
+    assert_eq!(planned_copy(&mut s, Some(false)), vec![]);
     let commands = act(&mut s, Action::DialogAnswer(Answer::Cancel));
     assert!(matches!(commands.as_slice(), [Command::Execute { .. }]));
 }
@@ -116,7 +110,7 @@ fn plan_without_question_runs_after_quit_is_cancelled() {
 fn close_while_confirming_drops_the_job() {
     let mut s = selected();
     act(&mut s, Action::Copy);
-    planned(&mut s, Some(true));
+    planned_copy(&mut s, Some(true));
     assert!(matches!(s.dialog, Some(Dialog::Overwrite { .. })));
     assert_eq!(act(&mut s, Action::CloseRequested), vec![Command::Shutdown]);
     assert_eq!(s.job, None);
@@ -187,7 +181,7 @@ fn failures_during_quit_question_survive_keep_running() {
             },
         }),
     );
-    assert!(matches!(s.dialog, Some(Dialog::Quit { .. })));
+    assert!(matches!(s.dialog, Some(Dialog::Quit)));
     act(&mut s, Action::DialogAnswer(Answer::Cancel));
     assert!(
         matches!(s.dialog, Some(Dialog::Failures { .. })),
@@ -220,4 +214,39 @@ fn finished_while_draining_keeps_the_drain_status() {
     assert_eq!(s.status, DRAINING);
     assert_eq!(s.dialog, None);
     assert_eq!(s.job, None);
+}
+
+#[test]
+fn all_failure_plan_during_quit_is_deferred() {
+    let mut s = selected();
+    act(&mut s, Action::Copy);
+    act(&mut s, Action::CloseRequested);
+    let mut failed = copy_plan(None);
+    failed.items.clear();
+    failed.failures = vec![Failure {
+        name: "a".into(),
+        error: "denied".into(),
+    }];
+    update(
+        &mut s,
+        Msg::Event(Event::Planned {
+            job: JobId(1),
+            plan: failed,
+        }),
+    );
+    assert_eq!(s.dialog, Some(Dialog::Quit));
+    act(&mut s, Action::DialogAnswer(Answer::Cancel));
+    assert!(matches!(s.dialog, Some(Dialog::Failures { .. })));
+}
+
+#[test]
+fn plan_arriving_while_draining_is_dropped() {
+    let mut s = selected();
+    act(&mut s, Action::Copy);
+    update(&mut s, Msg::Event(Event::Interrupted));
+    assert_eq!(s.closing, Closing::Draining);
+    assert_eq!(planned_copy(&mut s, Some(true)), vec![]);
+    assert_eq!(s.job, None);
+    assert_eq!(s.dialog, None);
+    assert_eq!(s.status, DRAINING);
 }

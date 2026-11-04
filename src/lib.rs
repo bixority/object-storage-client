@@ -4,6 +4,10 @@
 //! Items marked `#[doc(hidden)]` are test hooks: they are not part of the
 //! public API and may change in any release, outside semver.
 
+#[cfg(test)]
+#[macro_use]
+mod forward;
+
 mod backend;
 #[cfg(feature = "cli")]
 #[doc(hidden)]

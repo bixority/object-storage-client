@@ -4,7 +4,7 @@
 use super::*;
 use crate::ObjectStorageClient;
 use crate::gui::model::{Item, OnExisting, OpKind, Plan};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -72,6 +72,7 @@ fn transfer(src: String, dst: String) -> Item {
         src,
         dst,
         rel: "x".to_owned(),
+        size: 1,
         exists: Some(false),
     }
 }
@@ -104,6 +105,12 @@ async fn list_sends_page_and_repaints() {
     assert_eq!((side, seq, first), (Side::Left, 1, true));
     let page = result.expect("listed");
     assert_eq!(page.entries.len(), 1);
+    // The repaint is requested right after the event is sent, on the
+    // worker's thread: wait for it rather than race it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while repaints.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     assert!(repaints.load(Ordering::SeqCst) >= 1);
 }
 
@@ -199,7 +206,10 @@ async fn abort_reports_cancelled() {
             format!("{}x", dir_url(dst.path())),
         )],
         checked: true,
-        failures: Vec::new(),
+        failures: vec![Failure {
+            name: "planned".to_owned(),
+            error: "listing failed".to_owned(),
+        }],
     };
     let (mut handle, _) = start();
     send(
@@ -218,6 +228,9 @@ async fn abort_reports_cancelled() {
     assert_eq!(job, JobId(7));
     assert!(outcome.cancelled);
     assert_eq!(outcome.done, 0);
+    // The plan's failures are reported with a cancelled job too.
+    assert_eq!(outcome.failures.len(), 1);
+    assert_eq!(outcome.failures[0].name, "planned");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -38,6 +38,8 @@ pub enum DecryptError {
         short_debug_tail(.expected),
         short_debug_tail(.found)
     )]
+    // `found` comes from the unauthenticated header: always print it through
+    // `short_debug_tail`, in `Display` and `Debug` alike.
     BindingMismatch { expected: String, found: String },
     /// A context entry required by the reader is missing from the (still
     /// unauthenticated) header or has another value. Names only the key,

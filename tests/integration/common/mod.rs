@@ -161,9 +161,17 @@ where
     }
 }
 
+/// The one place the Garage image tag is written: the image and the reusable
+/// container name (which `concat!` needs as a literal) both use it.
+macro_rules! garage_tag {
+    () => {
+        "v2.5.0"
+    };
+}
+
 /// Starts (or reuses) Garage and blocks until the S3 API accepts requests.
 fn start_garage() -> u16 {
-    let request = GenericImage::new("docker.io/dxflrs/garage", "v2.5.0")
+    let request = GenericImage::new("docker.io/dxflrs/garage", garage_tag!())
         .with_exposed_port(S3_PORT.tcp())
         .with_wait_for(WaitFor::message_on_either_std("Creating default bucket"))
         .with_copy_to(
@@ -177,7 +185,7 @@ fn start_garage() -> u16 {
         .with_label("org.bixority.object-storage-client", "it-garage");
     start_shared(
         &GARAGE_PORT,
-        "osc-it-garage-v2.5.0",
+        concat!("osc-it-garage-", garage_tag!()),
         request,
         S3_PORT,
         |port| async move {
@@ -213,6 +221,70 @@ pub fn both_client() -> ObjectStorageClient {
     vars.extend(azurite::azurite_vars());
     vars.extend(gcs::gcs_vars());
     ObjectStorageClient::with_vars(vars)
+}
+
+/// Copies `from` to `to` until either ends, adding the bytes to `counter`.
+async fn pipe(
+    mut from: impl tokio::io::AsyncRead + Unpin,
+    mut to: impl tokio::io::AsyncWrite + Unpin,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0_u8; 64 * 1024];
+    while let Ok(n) = from.read(&mut buf).await {
+        if n == 0 {
+            return;
+        }
+        counter.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        if to.write_all(&buf[..n]).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// A TCP forwarder in front of an emulator that counts the bytes passing in
+/// both directions, to tell a server-side copy from a streamed one.
+pub struct CountingProxy {
+    /// `http://127.0.0.1:<port>` of the forwarder.
+    pub endpoint: String,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CountingProxy {
+    /// The bytes forwarded so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Starts a [`CountingProxy`] to the server at `target` (`http://host:port`),
+/// on the runtime of the calling test.
+///
+/// # Panics
+/// If the listener cannot be bound or `target` has no `host:port`.
+pub async fn counting_proxy(target: &str) -> CountingProxy {
+    let target = target.trim_start_matches("http://").to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+    let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = std::sync::Arc::clone(&bytes);
+    tokio::spawn(async move {
+        loop {
+            let Ok((client, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(server) = tokio::net::TcpStream::connect(&target).await else {
+                continue;
+            };
+            let (cr, cw) = client.into_split();
+            let (sr, sw) = server.into_split();
+            tokio::spawn(pipe(cr, sw, std::sync::Arc::clone(&counter)));
+            tokio::spawn(pipe(sr, cw, std::sync::Arc::clone(&counter)));
+        }
+    });
+    CountingProxy { endpoint, bytes }
 }
 
 /// `s3://default/<prefix>/` with a prefix unique to this call, so parallel

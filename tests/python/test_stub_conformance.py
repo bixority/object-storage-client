@@ -4,9 +4,8 @@ import ast
 import inspect
 from pathlib import Path
 
-import pytest
-
 import object_storage_client as module
+import pytest
 
 STUB = Path(module.__file__).with_name("__init__.pyi")
 TREE = ast.parse(STUB.read_text())
@@ -16,19 +15,6 @@ def _stub_classes() -> list[ast.ClassDef]:
     return [n for n in TREE.body if isinstance(n, ast.ClassDef)]
 
 
-def _typeddict_names() -> set[str]:
-    """Stub classes that derive (directly or not) from TypedDict."""
-    names = {"TypedDict"}
-    for node in _stub_classes():  # bases are declared before their subclasses
-        if any(isinstance(b, ast.Name) and b.id in names for b in node.bases):
-            names.add(node.name)
-    return names - {"TypedDict"}
-
-
-def _is_typeddict(node: ast.ClassDef) -> bool:
-    return node.name in _typeddict_names()
-
-
 def _members(node: ast.ClassDef) -> list[str]:
     """Methods and properties of a stub class (annotated fields excluded)."""
     return [
@@ -36,20 +22,6 @@ def _members(node: ast.ClassDef) -> list[str]:
         for n in node.body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-
-
-def _fields(node: ast.ClassDef) -> set[str]:
-    """Annotated fields of a stub TypedDict, including inherited ones."""
-    out = {
-        n.target.id
-        for n in node.body
-        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
-    }
-    by_name = {c.name: c for c in _stub_classes()}
-    for b in node.bases:
-        if isinstance(b, ast.Name) and b.id in by_name:
-            out |= _fields(by_name[b.id])
-    return out
 
 
 def _params(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, str]]:
@@ -84,25 +56,16 @@ def test_every_stub_name_exists_at_runtime():
             if cls is None:
                 missing.append(node.name)
                 continue
-            if not _is_typeddict(node):
-                missing += [
-                    f"{node.name}.{m}" for m in _members(node) if not hasattr(cls, m)
-                ]
+            missing += [
+                f"{node.name}.{m}" for m in _members(node) if not hasattr(cls, m)
+            ]
     assert missing == []
 
 
 def test_stub_has_classes_to_check():
     """Guards the conformance tests against an empty or misparsed stub."""
     names = {n.name for n in _stub_classes()}
-    assert {"KeyringStatus", "KeyInfo", "ObjectStorageClient", "Keyring"} <= names
-
-
-@pytest.mark.parametrize(
-    "node", [n for n in _stub_classes() if _is_typeddict(n)], ids=lambda n: n.name
-)
-def test_typeddict_fields_match(node):
-    cls = getattr(module, node.name)
-    assert set(cls.__required_keys__) | set(cls.__optional_keys__) == _fields(node)
+    assert {"ObjectStorageClient", "EncryptedObjectStorageClient", "Keyring"} <= names
 
 
 def _runtime_signature(node: ast.ClassDef, fn) -> inspect.Signature | None:
@@ -120,8 +83,6 @@ def _runtime_signature(node: ast.ClassDef, fn) -> inspect.Signature | None:
 
 def _signature_cases():
     for node in _stub_classes():
-        if _is_typeddict(node):
-            continue
         for fn in node.body:
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 sig = _runtime_signature(node, fn)
@@ -139,6 +100,17 @@ def test_signature_cases_cover_the_client_methods():
     assert {"ObjectStorageClient.__init__", "ObjectStorageClient.get_object"} <= ids
 
 
+@pytest.mark.parametrize(
+    "node",
+    [n for n in _stub_classes() if n.name in {"ObjectStorageClient", "EncryptedObjectStorageClient"}],
+    ids=lambda n: n.name,
+)
+def test_client_methods_are_not_coroutines_in_the_stub(node):
+    # Calls return an asyncio.Future, which create_task rejects.
+    coroutines = [n.name for n in node.body if isinstance(n, ast.AsyncFunctionDef)]
+    assert coroutines == []
+
+
 def test_all_is_in_stub():
     defined = {n.name for n in TREE.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
     imported = {
@@ -147,4 +119,4 @@ def test_all_is_in_stub():
         if isinstance(n, (ast.Import, ast.ImportFrom))
         for a in n.names
     }
-    assert set(module.__all__) - defined - imported == set()
+    assert set(module.__dict__["__all__"]) - defined - imported == set()

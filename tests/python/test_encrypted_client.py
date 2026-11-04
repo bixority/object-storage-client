@@ -3,10 +3,10 @@ import datetime
 import os
 import re
 import shutil
+from typing import Any
 from urllib.parse import quote
 
 import pytest
-
 from object_storage_client import (
     ByteStream,
     DecryptionError,
@@ -41,10 +41,12 @@ async def test_encrypted_constructor_accepts_profile(keyring, store):
     assert await secure.get_object(f"{store}/a") == b"payload"
     # The object really is encrypted.
     assert (await secure.inspect_encryption(f"{store}/a"))["key_names"]
+    bad_profile: Any = 1
     with pytest.raises(TypeError):
-        EncryptedObjectStorageClient(keyring, profile=1)
+        EncryptedObjectStorageClient(keyring, profile=bad_profile)
+    extra_positional: Any = (keyring, True, 65536, "x")
     with pytest.raises(TypeError):  # profile is keyword-only
-        EncryptedObjectStorageClient(keyring, True, 65536, "x")
+        EncryptedObjectStorageClient(*extra_positional)
 
 
 @pytest.mark.parametrize("frame_length", [-1, 2**32])
@@ -225,6 +227,18 @@ async def test_reserved_context_key_raises_before_io(secure, plain, store):
     assert not await plain.object_exists(f"{store}/r.bin")
 
 
+@pytest.mark.parametrize(
+    "bad", [{"osc:key": "v"}, {"k": "v" * 70_000}], ids=["reserved", "oversized"]
+)
+async def test_bad_context_on_a_stream_put_creates_no_directory(secure, tmp_path, bad):
+    parent = tmp_path / "absent" / "deep"
+    with pytest.raises(ValueError):
+        await secure.put_object_stream(
+            (parent / "o.bin").as_uri(), chunks(b"x"), context=bad
+        )
+    assert not (tmp_path / "absent").exists()
+
+
 async def test_oversized_context_raises_value_error(secure, plain, store):
     with pytest.raises(ValueError):
         await secure.put_object(f"{store}/big.bin", b"x", context={"k": "v" * 70_000})
@@ -285,9 +299,14 @@ async def test_missing_object_is_file_not_found(secure, store):
         await secure.get_object(f"{store}/missing")
 
 
-async def test_binding_mismatch_after_rename(secure, plain, store):
+async def test_binding_mismatch_after_rename(secure, plain, store, tmp_path):
     await secure.put_object(f"{store}/one", b"data")
-    await plain.copy_object(f"{store}/one", f"{store}/two")
+    # The plain client refuses a byte copy that would unbind the object.
+    with pytest.raises(ValueError, match="bound to its name"):
+        await plain.copy_object(f"{store}/one", f"{store}/two")
+    assert not await plain.object_exists(f"{store}/two")
+    # Renamed outside osc, the object no longer matches its binding.
+    (tmp_path / "store" / "one").rename(tmp_path / "store" / "two")
     with pytest.raises(DecryptionError):
         await secure.get_object(f"{store}/two")
 
@@ -434,11 +453,24 @@ async def test_reencrypt(plain, keyring_path, two_keyring_path, store, tmp_path)
     assert await secure.reencrypt(url, first) == "skipped"
 
 
+async def test_reencrypt_refuses_a_key_the_keyring_does_not_hold(
+    plain, keyring_path, two_keyring_path, store
+):
+    first = Keyring.from_file(keyring_path).status()["active"]
+    secure = plain.with_encryption(Keyring.from_file(two_keyring_path))
+    await plain.with_encryption(Keyring.from_file(keyring_path)).put_object(f"{store}/u", b"x")
+    # Refused before the object is read, so even a missing object does not matter.
+    for url in (f"{store}/u", f"{store}/missing"):
+        with pytest.raises(EncryptionError):
+            await secure.reencrypt(url, "kek-typo")
+    assert await secure.reencrypt(f"{store}/u", first, dry_run=True) == "would-rewrite"
+
+
 async def test_reencrypt_cutoff_and_plain(plain, keyring_path, two_keyring_path, store):
     first = Keyring.from_file(keyring_path).status()["active"]
     secure = plain.with_encryption(Keyring.from_file(two_keyring_path))
     await plain.with_encryption(Keyring.from_file(keyring_path)).put_object(f"{store}/c", b"x")
-    past = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+    past = datetime.datetime(2000, 1, 1, tzinfo=datetime.UTC)
     assert await secure.reencrypt(f"{store}/c", first, before=past) == "after-cutoff"
     await plain.put_object(f"{store}/p", b"plain")
     assert await secure.reencrypt(f"{store}/p", first) == "not-encrypted"

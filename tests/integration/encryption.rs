@@ -4,23 +4,25 @@
 //! through the client). They need a container runtime
 //! (docker or podman); run with `cargo test --test integration -- --ignored`.
 
+#[cfg(all(unix, feature = "cli"))]
+use crate::common::garage_vars;
 use crate::common::gcs::seed;
 use crate::common::provider::{Provider, base, per_provider};
 use crate::common::{
-    ACCESS_KEY, BUCKET, REGION, SECRET_KEY, both_client, garage_endpoint, garage_vars,
-    unique_gcs_bucket, unique_prefix,
+    ACCESS_KEY, BUCKET, REGION, SECRET_KEY, both_client, garage_endpoint, unique_gcs_bucket,
+    unique_prefix,
 };
-use crate::support::{TestResult, chunked, count_errors_to_end, drain, pattern};
+use crate::support::{TestResult, chunked, config_for, count_errors_to_end, drain, pattern};
 use bytes::Bytes;
 use chrono::NaiveDate;
 use object_storage_client::encryption::keys::KeyError;
-use object_storage_client::encryption::{EncryptionConfig, Keyring, new_keyring, rotate_keyring};
+use object_storage_client::encryption::{Keyring, new_keyring, rotate_keyring};
 use object_storage_client::sign::{SignOptions, presign_s3};
 use object_storage_client::{Client, Error, ObjectStorageClient, Result};
 use object_store::{MultipartUpload, ObjectStoreExt};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Duration;
+#[cfg(all(unix, feature = "cli"))]
 use tempfile::tempdir;
 
 pub type Secure = Client<object_storage_client::encryption::Envelope>;
@@ -32,10 +34,6 @@ const fn today() -> NaiveDate {
 /// The text of a keyring with one fresh key.
 fn ring_text(prefix: &str) -> String {
     new_keyring(prefix, today()).expect("keyring").to_string()
-}
-
-fn config_for(text: &str) -> EncryptionConfig {
-    EncryptionConfig::new(Arc::new(Keyring::parse(text).expect("parse")))
 }
 
 fn active_id(text: &str) -> String {
@@ -174,8 +172,8 @@ async fn plain_and_foreign(p: Provider) -> TestResult {
 }
 per_provider!(refusals, plain_and_foreign);
 
-/// Same-store copy and move on the active key are byte copies; copies from an
-/// old key, or to another path with binding on, are re-encrypted.
+/// Same-store copies and moves are always re-encrypted with a fresh message ID,
+/// whatever the key and the binding.
 async fn same_store_copy_and_move(p: Provider) -> TestResult {
     let plain = both_client();
     let base = base(&plain, p, "copy").await?;
@@ -188,7 +186,7 @@ async fn same_store_copy_and_move(p: Provider) -> TestResult {
     let ctx = BTreeMap::from([("tenant".to_owned(), "acme".to_owned())]);
     let body = pattern(300_000);
 
-    // Active key: the stored bytes are copied unchanged.
+    // Active key: the copy is re-encrypted, not a byte copy.
     let (src, copy, moved) = (
         format!("{base}src"),
         format!("{base}copy"),
@@ -197,10 +195,15 @@ async fn same_store_copy_and_move(p: Provider) -> TestResult {
     old.put_with_context(&src, body.clone(), &ctx).await?;
     let stored = plain.get(&src).await?;
     old.copy(&src, &copy).await?;
-    assert_eq!(plain.get(&copy).await?, stored);
+    assert_ne!(plain.get(&copy).await?, stored);
+    assert_ne!(
+        old.inspect_encryption(&copy).await?.message_id,
+        old.inspect_encryption(&src).await?.message_id
+    );
+    assert_eq!(old.get(&copy).await?.as_ref(), body.as_slice());
     old.move_object(&copy, &moved).await?;
     assert!(!plain.exists(&copy).await?);
-    assert_eq!(plain.get(&moved).await?, stored);
+    assert_ne!(plain.get(&moved).await?, stored);
     assert_eq!(old.get(&moved).await?.as_ref(), body.as_slice());
 
     // Old key: the other client decrypts and re-encrypts on its active key.
@@ -230,7 +233,7 @@ async fn same_store_copy_and_move(p: Provider) -> TestResult {
 }
 per_provider!(same_store, same_store_copy_and_move);
 
-/// Garage <-> Azurite copies and moves, byte-verified and re-encrypting.
+/// Garage <-> Azurite copies and moves, always re-encrypting.
 async fn cross_provider(from: Provider, to: Provider) -> TestResult {
     let plain = both_client();
     let (src_base, dst_base) = (
@@ -244,16 +247,17 @@ async fn cross_provider(from: Provider, to: Provider) -> TestResult {
     let body = pattern(9 << 20);
     let url = |b: &str, n: &str| format!("{b}{n}");
 
-    // Binding off: the verified stored bytes arrive unchanged.
+    // Binding off: the copy is still re-encrypted.
     let src = url(&src_base, "src");
     unbound.put_with_context(&src, body.clone(), &ctx).await?;
     let stored = plain.get(&src).await?;
     let (copy, moved) = (url(&dst_base, "copy"), url(&dst_base, "moved"));
     unbound.copy(&src, &copy).await?;
-    assert_eq!(plain.get(&copy).await?, stored);
+    assert_ne!(plain.get(&copy).await?, stored);
+    assert_eq!(unbound.get(&copy).await?.as_ref(), body.as_slice());
     unbound.move_object(&src, &moved).await?;
     assert!(!plain.exists(&src).await?);
-    assert_eq!(plain.get(&moved).await?, stored);
+    assert_ne!(plain.get(&moved).await?, stored);
     assert_eq!(unbound.get(&moved).await?.as_ref(), body.as_slice());
 
     // Binding on: the destination path is part of the context, so re-encrypt.
@@ -425,8 +429,8 @@ async fn gcs_read_encrypted_and_tampered() -> TestResult {
     Ok(())
 }
 
-/// GCS -> Garage copy and move of encrypted objects: stored bytes arrive
-/// unchanged, a move deletes the source, a tampered source is not copied.
+/// GCS -> Garage copy and move of encrypted objects: they are re-encrypted, a
+/// move deletes the source, a tampered source is not copied.
 /// (Garage -> GCS is not possible: the emulator rejects the client's writes.)
 #[tokio::test]
 #[ignore = "needs a container runtime (docker or podman)"]
@@ -447,11 +451,12 @@ async fn gcs_to_garage_copy_and_move() -> TestResult {
 
     let (copy, moved) = (format!("{garage}copy"), format!("{garage}moved"));
     client.copy(&src, &copy).await?;
-    assert_eq!(plain.get(&copy).await?, stored);
+    assert_ne!(plain.get(&copy).await?, stored);
+    assert_eq!(client.get(&copy).await?.as_ref(), body.as_slice());
     assert!(plain.exists(&src).await?, "copy keeps the source");
     client.move_object(&src, &moved).await?;
     assert!(!plain.exists(&src).await?, "move removes the source");
-    assert_eq!(plain.get(&moved).await?, stored);
+    assert_ne!(plain.get(&moved).await?, stored);
     assert_eq!(client.get(&moved).await?.as_ref(), body.as_slice());
 
     // A tampered source is refused and nothing is written or deleted.
@@ -490,7 +495,7 @@ async fn pending_uploads(prefix: &str) -> std::result::Result<String, Box<dyn st
         &cred,
         REGION,
         &SignOptions::default(),
-    );
+    )?;
     let response = reqwest::get(signed).await?;
     assert!(response.status().is_success(), "{}", response.status());
     Ok(response.text().await?)
@@ -528,7 +533,7 @@ async fn failed_multipart_upload_leaves_nothing_behind() -> TestResult {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "cli"))]
 #[tokio::test]
 #[ignore = "needs a container runtime (docker or podman)"]
 async fn cli_encrypted_put_get_against_garage() -> TestResult {

@@ -187,13 +187,13 @@ pub(super) fn update(state: &mut AppState, msg: Msg) -> Vec<Command> {
             Action::Delete => job::delete(state),
             Action::DialogText(text) => job::dialog_text(state, text),
             Action::DialogAnswer(answer) => {
-                if matches!(state.dialog, Some(Dialog::Quit { .. })) {
+                if matches!(state.dialog, Some(Dialog::Quit)) {
                     close::quit_answer(state, answer)
                 } else {
                     job::answer(state, answer)
                 }
             }
-            Action::CancelJob => job::cancel(&*state),
+            Action::CancelJob => job::cancel(state),
             Action::CloseRequested => close::close_requested(state),
             Action::FocusAddress(_) => Vec::new(),
         },

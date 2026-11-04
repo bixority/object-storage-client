@@ -22,8 +22,11 @@ pub(crate) const PAGE_SIZE: usize = 1_000;
 pub(crate) const MAX_ENTRIES: usize = 50_000;
 /// The most entries a pre-flight check examines.
 pub(crate) const CHECK_LIMIT: usize = 1_000;
+/// The most items a plan holds across all selected folders; a larger plan fails
+/// as a whole before anything runs.
+pub(crate) const MAX_PLAN_ITEMS: usize = 1_000_000;
 /// Concurrent pre-flight checks.
-pub(crate) const CHECK_CONCURRENCY: usize = 8;
+pub(crate) const CHECK_CONCURRENCY: usize = 32;
 /// Concurrent transfer operations.
 pub(crate) const OP_CONCURRENCY: usize = 4;
 /// How long closing waits for running work to drain.
@@ -69,6 +72,10 @@ pub enum Entry {
         size: u64,
         modified: DateTime<Utc>,
     },
+    /// A symlink of a `file://` folder, acted on as the link itself.
+    Link {
+        name: String,
+    },
 }
 
 impl Entry {
@@ -76,7 +83,7 @@ impl Entry {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::Folder { name } | Self::Object { name, .. } => name,
+            Self::Folder { name } | Self::Object { name, .. } | Self::Link { name } => name,
         }
     }
 
@@ -84,6 +91,11 @@ impl Entry {
     #[must_use]
     pub const fn is_folder(&self) -> bool {
         matches!(self, Self::Folder { .. })
+    }
+
+    /// Listing order: folders first, then by name.
+    pub(crate) fn listing_order(a: &Self, b: &Self) -> std::cmp::Ordering {
+        (!a.is_folder(), a.name()).cmp(&(!b.is_folder(), b.name()))
     }
 
     /// The key that identifies this row in a selection.
@@ -195,6 +207,16 @@ pub enum Item {
         src: String,
         dst: String,
         rel: String,
+        /// The size the listing gave, 0 for a console folder marker.
+        size: u64,
+        /// Whether the destination exists; `None` when it was not checked.
+        exists: Option<bool>,
+    },
+    /// Renames a symlink with `rename(2)`, without reading what it points to.
+    RenameLink {
+        src: String,
+        dst: String,
+        rel: String,
         /// Whether the destination exists; `None` when it was not checked.
         exists: Option<bool>,
     },
@@ -237,6 +259,9 @@ impl Plan {
                     Item::Transfer {
                         exists: Some(true),
                         ..
+                    } | Item::RenameLink {
+                        exists: Some(true),
+                        ..
                     }
                 )
             })
@@ -277,8 +302,12 @@ pub(crate) struct Job {
     pub(crate) total: usize,
     /// Display text of the item last reported.
     pub(crate) current: String,
+    /// The folder the batch's entries are in.
+    pub(crate) src_dir: Location,
     /// The batch's destination folder, for the confirmation dialogs.
     pub(crate) dst_dir: Location,
+    /// Cancel was pressed; a plan that arrives later is dropped.
+    pub(crate) cancelled: bool,
 }
 
 /// A modal question or report. Every string is display text.
@@ -322,10 +351,7 @@ pub(crate) enum Dialog {
         kind: OpKind,
         outcome: Outcome,
     },
-    Quit {
-        done: usize,
-        total: usize,
-    },
+    Quit,
 }
 
 /// The whole GUI state.

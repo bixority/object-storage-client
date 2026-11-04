@@ -5,16 +5,16 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
-from testcontainers.core.container import DockerContainer
-from testcontainers.core.wait_strategies import LogMessageWaitStrategy
-
 from object_storage_client import (
     EncryptedObjectStorageClient,
     Keyring,
     ObjectStorageClient,
 )
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
 
 @pytest.fixture
@@ -100,7 +100,8 @@ def _log_line(text: str) -> LogMessageWaitStrategy:
 
 def _loopback(container: DockerContainer, port: int) -> DockerContainer:
     """Publish `port` on a random 127.0.0.1 port only (keys are well known)."""
-    container.ports[f"{port}/tcp"] = ("127.0.0.1", None)
+    ports: Any = container.ports  # typed for int ports; a (host, None) tuple is valid
+    ports[f"{port}/tcp"] = ("127.0.0.1", None)
     return container
 
 

@@ -2,7 +2,7 @@
 
 use super::args::Args;
 use super::model::Encryption;
-use crate::cli::{CliError, KeySources, open_keyring};
+use crate::cli::{CliError, KeySources, key_source, open_keyring};
 use crate::encryption::EncryptionConfig;
 use crate::{EncryptedObjectStorageClient, ObjectStorageClient};
 
@@ -23,13 +23,13 @@ pub async fn open_client(args: &Args) -> Result<Opened, CliError> {
     } else {
         Encryption::Command
     };
-    let sources = KeySources {
+    let source = key_source(KeySources {
         file: args.keyring.clone(),
         command: args.keyring_command.clone(),
-    };
-    match open_keyring(sources).await? {
-        Some(ring) => Ok(Opened::Encrypted(
-            client.with_encryption(EncryptionConfig::new(ring)),
+    })?;
+    match source {
+        Some(source) => Ok(Opened::Encrypted(
+            client.with_encryption(EncryptionConfig::new(open_keyring(source).await?)),
             encryption,
         )),
         None if args.require_encryption => Err(CliError::EncryptionRequired),

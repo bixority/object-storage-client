@@ -8,9 +8,13 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
-/// Bytes read from a local file per blocking task. `object_store`'s own
-/// stream reads 8 KiB, which makes a large local read dominated by task hops.
-const FILE_CHUNK: u64 = 512 * 1024;
+/// Local file I/O unit: bytes read from a file per blocking task, and the
+/// write buffer of `file://` destinations and `osc` file output. `object_store`'s
+/// own stream reads 8 KiB, which makes local I/O dominated by task hops.
+pub const FILE_BUF: usize = 512 * 1024;
+
+/// [`FILE_BUF`] as a length.
+const FILE_CHUNK: u64 = FILE_BUF as u64;
 
 /// The body of `result` as a stream of chunks.
 ///

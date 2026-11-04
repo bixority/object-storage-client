@@ -1,10 +1,9 @@
 use clap::Parser;
-use object_storage_client::cli::{Cli, drain_pending_aborts, sanitize};
+use object_storage_client::cli::{Cli, build_runtime, drain_pending_aborts, sanitize};
 use std::env;
 use std::error::Error;
 use std::iter;
 use std::process::ExitCode;
-use std::thread;
 use std::time::Duration;
 
 /// Writes a line to standard error, ignoring a failure: a status or error line
@@ -57,20 +56,9 @@ const BLOCKING_SHUTDOWN: Duration = Duration::from_millis(200);
 fn main() -> ExitCode {
     #[cfg(unix)]
     object_storage_client::cli::harden_process();
-    // Built by hand so that after a signal the runtime can be shut down
-    // without waiting for blocking threads, which cannot be cancelled.
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    // One worker per core is more than a transfer can use on a big machine and
-    // costs start-up time; an explicit TOKIO_WORKER_THREADS still wins.
-    if env::var_os("TOKIO_WORKER_THREADS").is_none() {
-        builder.worker_threads(
-            thread::available_parallelism()
-                .map_or(1, usize::from)
-                .min(4),
-        );
-    }
-    let runtime = match builder.build() {
+    // Owned here so that after a signal the runtime can be shut down without
+    // waiting for blocking threads, which cannot be cancelled.
+    let runtime = match build_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
             errln!("Error: failed to start the async runtime: {err}");

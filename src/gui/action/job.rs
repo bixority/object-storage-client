@@ -43,7 +43,9 @@ fn start(state: &mut AppState, batch: Batch) -> Vec<Command> {
         done: 0,
         total: 0,
         current: String::new(),
+        src_dir: batch.src_dir.clone(),
         dst_dir: batch.dst_dir.clone(),
+        cancelled: false,
     });
     vec![Command::Plan { job: id, batch }]
 }
@@ -60,7 +62,7 @@ pub(super) fn transfer(state: &mut AppState, kind: OpKind) -> Vec<Command> {
     }
     let src_dir = state.panels[side.index()].location.clone();
     let dst_dir = state.panels[side.other().index()].location.clone();
-    if dst_dir == src_dir {
+    if dst_dir.same_folder(&src_dir) {
         "Source and destination are the same folder".clone_into(&mut state.status);
         return Vec::new();
     }
@@ -281,29 +283,45 @@ fn current(state: &mut AppState, id: JobId) -> Option<&mut Job> {
 
 /// The worker's plan: confirm it, or run it at once.
 pub(super) fn planned(state: &mut AppState, id: JobId, plan: Plan) -> Vec<Command> {
+    let closing = state.closing != Closing::Open;
     let Some(job) = current(state, id) else {
         return Vec::new();
     };
     if job.phase != JobPhase::Planning {
         return Vec::new();
     }
+    // Closing or cancelled while planning: the plan is not wanted.
+    if job.cancelled || closing {
+        let cancelled = job.cancelled;
+        state.job = None;
+        // Closing: the drain owns the status.
+        if cancelled && !closing {
+            "Cancelled".clone_into(&mut state.status);
+        }
+        return Vec::new();
+    }
     let kind = job.kind;
     if plan.items.is_empty() && !plan.failures.is_empty() {
         state.job = None;
-        state.dialog = Some(Dialog::Failures {
+        let report = Dialog::Failures {
             kind,
             outcome: Outcome {
                 done: 0,
                 cancelled: false,
                 failures: plan.failures,
             },
-        });
+        };
+        // An open `Quit` question stays: the report waits until it is answered.
+        match state.dialog {
+            Some(Dialog::Quit) => state.deferred = Some(report),
+            _ => state.dialog = Some(report),
+        }
         return Vec::new();
     }
     job.phase = JobPhase::Confirming(plan);
     // An open close question stays; the plan's own question follows if the
     // user keeps the window open (`close::quit_answer`).
-    if matches!(state.dialog, Some(Dialog::Quit { .. })) {
+    if matches!(state.dialog, Some(Dialog::Quit)) {
         return Vec::new();
     }
     resume(state)
@@ -391,12 +409,18 @@ pub(super) fn progress(
     Vec::new()
 }
 
-/// The job ended: report it and refresh both panels.
+/// The job ended: report it and refresh the panels it can have changed.
 pub(super) fn finished(state: &mut AppState, id: JobId, outcome: Outcome) -> Vec<Command> {
-    let Some(job) = current(state, id).map(|job| (job.kind, job.total)) else {
+    let Some(job) = current(state, id).map(|job| {
+        (
+            job.kind,
+            job.total,
+            (job.src_dir.clone(), job.dst_dir.clone()),
+        )
+    }) else {
         return Vec::new();
     };
-    let (kind, total) = job;
+    let (kind, total, (src_dir, dst_dir)) = job;
     state.job = None;
     // Closing: the drain owns the status, and nothing is left to report to.
     if state.closing != Closing::Open {
@@ -419,20 +443,38 @@ pub(super) fn finished(state: &mut AppState, id: JobId, outcome: Outcome) -> Vec
         // An open `Quit` question stays: the report waits until it is answered.
         match state.dialog {
             None => state.dialog = Some(report),
-            Some(Dialog::Quit { .. }) => state.deferred = Some(report),
+            Some(Dialog::Quit) => state.deferred = Some(report),
             Some(_) => {}
         }
     }
     state.status = status;
-    let mut commands = nav::refresh(state, Side::Left);
-    commands.extend(nav::refresh(state, Side::Right));
+    // A copy changes only its destination; a move, rename or delete changes
+    // its source, and a move its destination too. A panel above or below such
+    // a folder shows the change, one elsewhere keeps its pages and selection.
+    let touched: &[&Location] = match kind {
+        OpKind::Copy => &[&dst_dir],
+        OpKind::Move => &[&src_dir, &dst_dir],
+        OpKind::Rename | OpKind::Delete => &[&src_dir],
+    };
+    let mut commands = Vec::new();
+    for side in [Side::Left, Side::Right] {
+        let shown = &state.panels[side.index()].location;
+        if touched
+            .iter()
+            .any(|dir| dir.contains(shown) || shown.contains(dir))
+        {
+            commands.extend(nav::reload(state, side));
+        }
+    }
     commands
 }
 
 /// Asks the worker to stop the planning or running job.
-pub(super) fn cancel(state: &AppState) -> Vec<Command> {
-    match &state.job {
+pub(super) fn cancel(state: &mut AppState) -> Vec<Command> {
+    match &mut state.job {
         Some(job) if matches!(job.phase, JobPhase::Planning | JobPhase::Running) => {
+            // A plan already on its way is dropped when it arrives.
+            job.cancelled = true;
             vec![Command::Abort(job.id)]
         }
         _ => Vec::new(),

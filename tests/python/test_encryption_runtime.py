@@ -1,15 +1,12 @@
 import asyncio
 import json
 import os
-import sys
 import textwrap
 from pathlib import Path
 
 import pytest
-
 from object_storage_client import (
     EncryptedObjectStorageClient,
-    Keyring,
 )
 
 
@@ -318,7 +315,7 @@ async def test_osc_rejects_bad_esdk_context(keyring_path, keyring, store, tmp_pa
         "nofmt": {"osc:key": good},
         "fmt2": {"osc:fmt": "2", "osc:key": good},
     }
-    for label, ctx in cases.items():
+    for ctx in cases.values():
         (tmp_path / "store" / "bad.bin").write_bytes(_esdk_encrypt(master, ctx))
         with pytest.raises(DecryptionError):
             await secure.get_object(f"{store}/bad.bin")

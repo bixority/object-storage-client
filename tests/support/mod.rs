@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use std::path::Path;
 
+pub mod mini_http;
 #[cfg(feature = "cli")]
 pub mod mock;
 
@@ -15,6 +16,13 @@ pub fn pattern(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect()
+}
+
+/// An encryption config over the keyring in `text`.
+#[cfg(feature = "encryption")]
+pub fn config_for(text: &str) -> object_storage_client::encryption::EncryptionConfig {
+    use object_storage_client::encryption::{EncryptionConfig, Keyring};
+    EncryptionConfig::new(std::sync::Arc::new(Keyring::parse(text).expect("parse")))
 }
 
 /// Sorted names of the entries of `dir`.
@@ -91,6 +99,49 @@ impl Osc {
     /// The empty `HOME` of the child.
     pub fn home(&self) -> &Path {
         self.home.path()
+    }
+
+    /// Runs the child to the end with a null stdin and captured output. Fails,
+    /// instead of hanging, if it does not finish within `limit`.
+    pub fn output_within(&mut self, limit: std::time::Duration) -> std::process::Output {
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::time::Instant;
+        self.cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = self.cmd.spawn().expect("spawn osc");
+        // Drained on threads so a full pipe cannot stall the child.
+        let mut out_pipe = child.stdout.take().expect("stdout");
+        let mut err_pipe = child.stderr.take().expect("stderr");
+        let out_reader = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = out_pipe.read_to_end(&mut v);
+            v
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let _ = err_pipe.read_to_end(&mut v);
+            v
+        });
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("osc did not finish within {limit:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        std::process::Output {
+            status,
+            stdout: out_reader.join().expect("stdout reader"),
+            stderr: err_reader.join().expect("stderr reader"),
+        }
     }
 }
 

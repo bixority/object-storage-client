@@ -19,7 +19,7 @@ pub const MAX_CONTEXT_LEN: usize = 12 * 1024;
 
 /// The encryption context of one message.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EncryptionContext(pub(crate) BTreeMap<String, String>);
+pub(crate) struct EncryptionContext(pub(crate) BTreeMap<String, String>);
 
 impl EncryptionContext {
     /// Context holding only the reserved entries.
@@ -78,12 +78,14 @@ impl EncryptionContext {
     }
 
     /// Number of pairs.
+    #[cfg(test)]
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// True when there are no pairs.
+    #[cfg(test)]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()

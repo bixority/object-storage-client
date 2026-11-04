@@ -121,11 +121,11 @@ pub(crate) fn content_binding_unsupported() -> Error {
 /// (path-style vs virtual-hosted), which is why callers derive it from
 /// `object_store`'s own signer rather than reconstructing it here.
 ///
-/// # Panics
+/// # Errors
 ///
-/// If a header value of `options` is not valid in an HTTP header (the client
-/// checks this first and returns an error).
-#[must_use]
+/// Returns [`Error::InvalidInput`] if `base` is not a valid request URI (a
+/// bucket name in the host can make it so) or a header value of `options` is
+/// not valid in an HTTP header.
 pub fn presign_s3(
     base: &Url,
     method: &Method,
@@ -133,18 +133,17 @@ pub fn presign_s3(
     cred: &AwsCredential,
     region: &str,
     options: &SignOptions,
-) -> Url {
+) -> Result<Url> {
     presign_s3_at(base, method, expires_in, cred, region, options, Utc::now())
 }
 
 /// As [`presign_s3`], but with an explicit signing timestamp (for testing
 /// against fixed `SigV4` vectors).
 ///
-/// # Panics
+/// # Errors
 ///
 /// As [`presign_s3`].
 #[doc(hidden)]
-#[must_use]
 pub fn presign_s3_at(
     base: &Url,
     method: &Method,
@@ -153,7 +152,7 @@ pub fn presign_s3_at(
     region: &str,
     options: &SignOptions,
     date: DateTime<Utc>,
-) -> Url {
+) -> Result<Url> {
     let identity = Credentials::new(
         &cred.key_id,
         &cred.secret_key,
@@ -196,12 +195,12 @@ pub fn presign_s3_at(
         headers,
         SignableBody::UnsignedPayload,
     )
-    .expect("a parsed URL is a valid URI");
+    .map_err(|e| Error::InvalidInput(format!("cannot pre-sign the URL: {e}")))?;
     let (instructions, _) = sign(request, &params)
-        .expect("the headers are valid and the credential is set")
+        .map_err(|e| Error::InvalidInput(format!("cannot pre-sign the URL: {e}")))?
         .into_parts();
 
     let mut url = base.clone();
     url.query_pairs_mut().extend_pairs(instructions.params());
-    url
+    Ok(url)
 }

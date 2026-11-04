@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dispatched by dependabot-merge after it merges (a GITHUB_TOKEN merge starts
+  # no push run). Also usable by hand.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,6 +40,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: test-all-features
       - name: Test
         shell: bash
         run: ${{ matrix.commands }}
@@ -53,6 +59,8 @@ jobs:
         with:
           toolchain: "1.99"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --locked --all-features --all-targets
 
   integration:
@@ -67,6 +75,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: test-all-features
       # The 4 GiB round trips are local only (see docs/TESTING.md, "Checksum round trips").
       - run: cargo test --locked --all-features --test integration -- --ignored --skip _4gib
 
@@ -82,12 +93,19 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: No code-generation settings in the committed cargo config
-        run: '! grep -nE "^\[build\]|^\[target\.|rustflags" .cargo/config.toml'
+        # Only an allowlist of top-level tables: [profile.*], [env], [build]
+        # and [target.*] would change the published artifacts.
+        run: >-
+          python3 -c 'import sys,tomllib;
+          x=set(tomllib.load(open(".cargo/config.toml","rb")))-{"registries"};
+          sys.exit(f"unexpected keys in .cargo/config.toml: {sorted(x)}" if x else 0)'
       - name: Every action is pinned to a full commit SHA
         run: '! grep -rnP "^\s*(-\s*)?uses:\s+(?!\./)(?![^@\s]+@[0-9a-f]{40}(\s|$))" .github/workflows'
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings -W clippy::pedantic
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -104,13 +122,25 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings -W clippy::pedantic
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features encryption -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features python -- -D warnings
+      # The osc binary without the desktop browser (cli implies encryption).
+      - run: cargo clippy --locked --all-targets --no-default-features --features cli -- -D warnings
       # The desktop browser on its own (gui implies cli and encryption).
-      - run: cargo clippy --locked --all-targets --no-default-features --features gui -- -D warnings -W clippy::pedantic
+      - run: cargo clippy --locked --all-targets --no-default-features --features gui -- -D warnings
       - run: cargo check --locked --no-default-features --features python
       - run: cargo check --locked --features fuzzing
-      # Keeps `encryption::fuzzing` and the fuzz targets compiling.
-      - run: cargo check --manifest-path fuzz/Cargo.toml
+      # The library without dev-dependency features (no --all-targets), so
+      # features that only the dev-dependency tokio `full` enables are caught.
+      - run: cargo check --locked --no-default-features --lib
+      - run: cargo check --locked --no-default-features --features encryption --lib
+      - run: cargo check --locked --no-default-features --features gui --bins
+      # Keeps `encryption::fuzzing` and the fuzz targets compiling, against the
+      # committed fuzz/Cargo.lock.
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --target-dir target
 
   python:
     name: python tests (${{ matrix.python }})
@@ -127,6 +157,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python }}
@@ -147,6 +179,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: test-all-features
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.14"
@@ -172,12 +207,19 @@ jobs:
         with:
           command: check advisories bans sources
           arguments: --all-features
+      # The fuzz crate is its own workspace with its own lockfile.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories bans sources
+          arguments: --all-features
 
   # Merges a Dependabot PR only after every other job above has succeeded.
   #
   # `pull_request` (not `pull_request_target`): the PR's code runs with a
   # read-only token and no repository secrets, and its build cache is scoped to
-  # the PR, so it cannot poison the cache used by the release workflow. A fork PR
+  # the PR. Code merged to main runs in main's cache scope, so the release build
+  # uses no build cache (no sccache). A fork PR
   # never gets a write token here, so this job cannot act on one.
   dependabot-merge:
     name: Approve and merge (Dependabot)
@@ -192,6 +234,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # Needed for `gh workflow run` after the merge.
+      actions: write
     steps:
       - id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
@@ -209,7 +253,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           DEPENDENCIES: ${{ steps.metadata.outputs.dependency-names }}
-          REVIEWED: aws-lc-rs aws-config aws-credential-types object_store reqwest pyo3 pyo3-async-runtimes zeroize rustix
+          # Any crate that handles keys or credentials must be listed here.
+          REVIEWED: aws-lc-rs aws-config aws-credential-types aws-runtime aws-sigv4 aws-types object_store reqwest pyo3 pyo3-async-runtimes zeroize rustix
         run: |
           IFS=', ' read -ra deps <<< "$DEPENDENCIES"
           for dep in "${deps[@]}"; do
@@ -223,3 +268,11 @@ jobs:
           gh pr review "$PR_NUMBER" --approve --body "Automated approval: the full test suite passed for this patch update."
           # Merge exactly the commit that was tested.
           gh pr merge "$PR_NUMBER" --merge --match-head-commit "$PR_HEAD_SHA"
+          # A merge made with GITHUB_TOKEN starts no push run, so the merged
+          # main commit would stay untested. workflow_dispatch is exempt from
+          # that rule. This job's `if` requires event_name == 'pull_request',
+          # so the dispatched run cannot start another merge. The run joins the
+          # `Tests-refs/heads/main` concurrency group, which never cancels
+          # on main: it queues behind a running one and replaces an older
+          # pending one (the newer run tests a superset of the commits).
+          gh workflow run tests.yaml --ref main

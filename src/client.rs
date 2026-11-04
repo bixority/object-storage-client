@@ -16,7 +16,7 @@ use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
-mod local_delete;
+pub(crate) mod local_delete;
 
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -28,6 +28,14 @@ pub enum Error {
     /// (see the `From<object_store::Error>` impl), so it is safe to log.
     #[error("Object store error: {0}")]
     ObjectStore(#[source] object_store::Error),
+
+    /// The store refused the request as unauthenticated or forbidden (HTTP
+    /// 401 or 403), from any call: object calls, `create_bucket` and
+    /// `bucket_exists`. Python raises `PermissionError`.
+    ///
+    /// The text is escaped and capped like the other provider text.
+    #[error("Access denied: {0}")]
+    Denied(String),
 
     #[error("Invalid URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
@@ -94,8 +102,9 @@ pub enum Error {
     #[error("source changed during move; it was not deleted: {url}")]
     SourceChanged { url: String },
 
-    /// An update was abandoned because the object changed (or vanished)
-    /// after it was read. Nothing was written.
+    /// An update, copy or move was abandoned because the object changed (or
+    /// vanished) after it was read. Nothing was written and a move kept its
+    /// source.
     #[error("the object changed during the update; nothing was written")]
     Changed,
 
@@ -247,6 +256,17 @@ impl<C: Codec> Client<C> {
         self.registry.resolve(url)
     }
 
+    /// Serves the origin of `url` from `store`, for unit tests.
+    #[cfg(all(test, any(feature = "cli", feature = "encryption")))]
+    pub(crate) fn preload_store(&self, url: &str, store: Arc<dyn ObjectStore>) {
+        let backend = crate::backend::TestBackend {
+            store,
+            multipart: true,
+        };
+        self.registry
+            .preload(&parse_url(url).expect("url"), Arc::new(backend));
+    }
+
     /// Number of distinct backends this client's registry has built.
     #[doc(hidden)]
     pub fn backend_count(&self) -> usize {
@@ -280,8 +300,7 @@ impl<C: Codec> Client<C> {
 
     /// Parses and checks `raw` before any backend is built, then resolves it.
     fn resolve_checked(&self, raw: &str, dots: Dots, needs_object: bool) -> Result<Resolved> {
-        let url = parse_url(raw)?;
-        check_input(raw, &url, dots, needs_object)?;
+        let url = parse_checked(raw, dots, needs_object)?;
         let (backend, path) = self.registry.resolve(&url)?;
         Ok(Resolved {
             backend,
@@ -311,10 +330,8 @@ impl<C: Codec> Client<C> {
     /// Resolves both ends of a copy or move, sharing one backend between URLs
     /// of one origin so that a server-side copy stays possible.
     fn resolve_pair(&self, from: &str, to: &str) -> Result<(Resolved, Resolved)> {
-        let (raw_from, raw_to) = (from, to);
-        let (from, to) = (parse_url(raw_from)?, parse_url(raw_to)?);
-        check_input(raw_from, &from, Dots::OffFile, true)?;
-        check_input(raw_to, &to, Dots::OffFile, true)?;
+        let from = parse_checked(from, Dots::OffFile, true)?;
+        let to = parse_checked(to, Dots::OffFile, true)?;
         let ((src, src_path), (dst, dst_path)) = self.registry.resolve_pair(&from, &to)?;
         Ok((
             Resolved {
@@ -386,6 +403,27 @@ impl<C: Codec> Client<C> {
 
     async fn put_inner(&self, url: &str, data: Bytes, ctx: &CallerContext) -> Result<()> {
         let r = self.resolve(url)?;
+        let defaults = UploadOptions::default();
+        // A large body takes the streaming path, so an encrypting codec seals
+        // it in slices beside the upload and never holds the whole ciphertext.
+        // `http(s)` buffers everything anyway, so it keeps the one-shot path.
+        if data.len() >= defaults.part_size
+            && (r.backend.supports_multipart() || r.backend.local_path(&r.loc.path)?.is_some())
+        {
+            let opts = UploadOptions {
+                size_hint: Some(data.len() as u64),
+                ..defaults
+            };
+            let chunk: Result<Bytes> = Ok(data);
+            return self
+                .put_stream_inner(
+                    url,
+                    futures::stream::iter([chunk]).boxed(),
+                    ctx.clone(),
+                    &opts,
+                )
+                .await;
+        }
         let stored = self.codec.encode(&r.loc, ctx, data).await?;
         put_bytes(r.backend.as_ref(), &r.loc.path, stored).await
     }
@@ -420,7 +458,7 @@ impl<C: Codec> Client<C> {
     /// [`Self::put_stream`] of a local file with permission bits `source_mode`:
     /// a new `file://` destination takes them (less the umask), as a copy does,
     /// so uploading a private file does not create a world-readable one.
-    #[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) async fn put_local_file(
         &self,
         url: &str,
@@ -445,22 +483,67 @@ impl<C: Codec> Client<C> {
         opts: &UploadOptions,
     ) -> Result<()> {
         let r = self.resolve(url)?;
+        // Before the upload creates directories or staging files.
+        self.codec.check_write(&r.loc, &ctx)?;
         let stored = self.codec.encode_stream(r.loc.clone(), ctx, data);
         upload_stream(r.backend.as_ref(), &r.loc.path, stored, opts).await
     }
 
     /// Deletes an object at the given URL.
     ///
+    /// On `http(s)://` a `PROPFIND` first checks what the URL names: a
+    /// `WebDAV` collection is refused, because deleting it would remove
+    /// everything in it; see [`delete_by_prefix`](Self::delete_by_prefix).
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The URL is invalid.
     /// - The scheme is unsupported.
+    /// - The URL names a `WebDAV` collection ([`Error::InvalidInput`]), or the
+    ///   server cannot say what it names.
     /// - There is an error deleting the object from the store.
     pub async fn delete(&self, url: &str) -> Result<()> {
         let r = self.resolve(url)?;
+        refuse_collection(
+            &r,
+            "deleting it would remove everything in it; use delete_by_prefix",
+        )
+        .await?;
         r.backend.store().delete(&r.loc.path).await?;
         Ok(())
+    }
+
+    /// Deletes the objects at `urls` through the store's batched
+    /// `delete_stream` (1,000 keys per request on S3 and Azure), and calls
+    /// `each(index, result)` once per URL as its outcome is known. A key that
+    /// is already gone counts as deleted. A URL that does not resolve fails on
+    /// its own. Unlike [`delete`](Self::delete) it does not look for a
+    /// `WebDAV` collection, so callers keep `http(s)://` and `file://` URLs
+    /// on `delete`.
+    ///
+    /// A failure the store does not tie to a key is given to the keys that
+    /// got no result, in order, or to all of them when the counts differ.
+    #[cfg(feature = "gui")]
+    pub(crate) async fn delete_many(
+        &self,
+        urls: &[String],
+        mut each: impl FnMut(usize, Result<()>),
+    ) {
+        type Group = (Arc<dyn Backend>, Vec<(usize, ObjectPath)>);
+        let mut groups: Vec<Group> = Vec::new();
+        for (index, url) in urls.iter().enumerate() {
+            match self.resolve(url) {
+                Err(e) => each(index, Err(e)),
+                Ok(r) => match groups.iter_mut().find(|(b, _)| Arc::ptr_eq(b, &r.backend)) {
+                    Some((_, targets)) => targets.push((index, r.loc.path)),
+                    None => groups.push((r.backend, vec![(index, r.loc.path)])),
+                },
+            }
+        }
+        for (backend, targets) in groups {
+            delete_batch(backend.store().as_ref(), targets, &mut each).await;
+        }
     }
 
     /// Deletes all objects under the given URL prefix.
@@ -473,7 +556,8 @@ impl<C: Codec> Client<C> {
     /// during the run counts as deleted. A `file://` prefix is walked without
     /// following symlinks (links are deleted as links), directories are kept,
     /// `name#<digits>` staging files are skipped and trees deeper than 128
-    /// levels are refused with [`Error::InvalidInput`].
+    /// levels stop the walk with [`Error::InvalidInput`]; files deleted before that
+    /// point stay deleted.
     ///
     /// # Errors
     ///
@@ -496,7 +580,9 @@ impl<C: Codec> Client<C> {
         delete_listed(r.backend.store(), r.loc.path).await
     }
 
-    /// Lists objects under the given URL prefix.
+    /// Lists objects under the given URL prefix. On `file://`, symlinks below
+    /// the prefix are not listed or entered; the prefix itself is resolved as
+    /// named.
     ///
     /// # Errors
     ///
@@ -535,7 +621,8 @@ impl<C: Codec> Client<C> {
     /// and objects, as single-segment names relative to it. `page_token` is a
     /// `next` from an earlier page; stores without paged listing return one
     /// complete page, and an empty one for a token. A missing directory is an
-    /// empty page. The order is the store's.
+    /// empty page. The order is the store's. For `file://`, symlinks are not
+    /// folders or objects: their names are in `links`.
     #[cfg(feature = "gui")]
     pub(crate) async fn list_dir(
         &self,
@@ -566,17 +653,22 @@ impl<C: Codec> Client<C> {
                 Err(e) => return Err(e.into()),
             }
         };
+        let links = if r.backend.scheme() == "file" {
+            local_links(crate::backend::fs_path(&path)?).await?
+        } else {
+            Vec::new()
+        };
         let folders = listed
             .common_prefixes
             .iter()
-            .filter_map(|p| relative_name(p, &path))
+            .filter_map(|p| relative_str(p, &path).map(str::to_owned))
             .collect();
         let objects = listed
             .objects
             .iter()
             .filter_map(|m| {
-                relative_name(&m.location, &path).map(|name| DirObject {
-                    name,
+                relative_str(&m.location, &path).map(|name| DirObject {
+                    name: name.to_owned(),
                     size: m.size,
                     modified: m.last_modified,
                 })
@@ -585,6 +677,7 @@ impl<C: Codec> Client<C> {
         Ok(DirPage {
             folders,
             objects,
+            links,
             next,
         })
     }
@@ -593,8 +686,8 @@ impl<C: Codec> Client<C> {
     ///
     /// The plain client issues a single HEAD request via
     /// [`GetOptions::head`](object_store::GetOptions::head); the encrypted
-    /// client issues one ranged GET of at most
-    /// `DecodeLimits::max_header_len` bytes (16 KiB by default) for the header instead, followed by a HEAD
+    /// client issues one ranged GET of 1 KiB for the header instead (a second of at most
+    /// `DecodeLimits::max_header_len` bytes, 16 KiB by default, when the header is larger), followed by a HEAD
     /// only when that GET fails with an error other than not-found. Either
     /// way it returns the location, last modified time, size, e-tag and version from the object
     /// metadata together with the `Content-Type` read from the object
@@ -656,9 +749,10 @@ impl<C: Codec> Client<C> {
     ///   error for `BucketAlreadyExists` (another account owns the name) and
     ///   for every other failure.
     /// - `gs://`, `gcs://` — GCS JSON API `buckets.insert`, authenticated with
-    ///   the backend's `OAuth2` bearer credential. On HTTP 409 the bucket's
-    ///   metadata is read: the call succeeds only if the caller can see the
-    ///   bucket, and fails if another project owns the name.
+    ///   the backend's `OAuth2` bearer credential. On HTTP 409 the project's
+    ///   bucket list is read: the call succeeds only if `GOOGLE_CLOUD_PROJECT`
+    ///   lists the bucket (it needs `storage.buckets.list`), and fails if
+    ///   another project owns the name.
     /// - `az://`, `wasb(s)://`, `abfs(s)://` — Azure `Create Container`
     ///   (`PUT /<container>?restype=container`), signed with `AzureAuthorizer`.
     ///   Idempotent against `ContainerAlreadyExists` / HTTP 409.
@@ -667,8 +761,14 @@ impl<C: Codec> Client<C> {
     /// endpoint, region, account or project, those are read from configuration
     /// (the same environment the backend was built from):
     /// `S3_REGION` / `AWS_ENDPOINT`(`S3_ENDPOINT`) / `S3_ALLOW_HTTP` for S3,
-    /// `GOOGLE_CLOUD_PROJECT` (`GCS_PROJECT_ID`) for GCS, and
-    /// `AZURE_STORAGE_ACCOUNT_NAME` / `AZURE_STORAGE_ENDPOINT` for Azure.
+    /// `GOOGLE_CLOUD_PROJECT` (`GCS_PROJECT_ID`) and `GCS_BASE_URL` (else
+    /// `GOOGLE_BASE_URL`) for GCS, and the account name and endpoint of the
+    /// Azure store (`AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ENDPOINT` or
+    /// `AZURE_ENDPOINT`) for Azure. The Azure emulator and Fabric modes are
+    /// refused unless an endpoint is set. A store that runs unsigned
+    /// (`*_SKIP_SIGNATURE`) sends these requests unsigned too.
+    ///
+    /// An HTTP 401 or 403 answer is [`Error::Denied`].
     ///
     /// # Errors
     ///
@@ -680,9 +780,7 @@ impl<C: Codec> Client<C> {
     ///   already existing.
     pub async fn create_bucket(&self, url: &str) -> Result<()> {
         let r = self.resolve_prefix(url)?;
-        r.backend
-            .create_bucket(self.registry.http()?, &r.loc.url)
-            .await
+        r.backend.create_bucket(&r.loc.url).await
     }
 
     /// Returns whether the bucket / container identified by `url` exists.
@@ -708,14 +806,18 @@ impl<C: Codec> Client<C> {
     /// - The backend fails for a reason other than the bucket not existing.
     pub async fn bucket_exists(&self, url: &str) -> Result<bool> {
         let r = self.resolve_prefix(url)?;
-        r.backend
-            .bucket_exists(self.registry.http()?, &r.loc.url)
-            .await
+        r.backend.bucket_exists(&r.loc.url).await
     }
 
     /// Copies an object from one URL to another.
     /// Supports cross-provider copies. Copying an object onto itself does
     /// nothing.
+    ///
+    /// The plain client first reads the start of the source with one extra
+    /// ranged request. It refuses an encrypted object that is bound to its
+    /// name when the destination name differs, with [`Error::InvalidInput`]:
+    /// copy it with the encrypted client. The encrypted client always decrypts
+    /// and re-encrypts, never copying server-side, even inside one bucket.
     ///
     /// # Errors
     ///
@@ -728,9 +830,22 @@ impl<C: Codec> Client<C> {
         self.codec.copy(&src, &dst, false).await
     }
 
+    /// [`copy`](Self::copy) of an object whose size a listing gave, so a
+    /// server-side copy on S3 does not `HEAD` the source for it.
+    #[cfg(feature = "gui")]
+    pub(crate) async fn copy_sized(
+        &self,
+        from_url: &str,
+        to_url: &str,
+        size: Option<u64>,
+    ) -> Result<()> {
+        let (src, dst) = self.resolve_pair(from_url, to_url)?;
+        self.codec.copy_sized(&src, &dst, size).await
+    }
+
     /// Moves an object from one URL to another.
     /// Supports cross-provider moves. Moving an object onto itself does
-    /// nothing.
+    /// nothing. The checks and costs of [`copy`](Self::copy) apply.
     ///
     /// Every move, server-side or streamed, deletes the source only if it
     /// still matches what was copied: the object's metadata is compared before
@@ -741,6 +856,9 @@ impl<C: Codec> Client<C> {
     /// in the same second, on a store reporting no e-tag or version, is
     /// indistinguishable. Only a move inside one `file://` file system is an
     /// atomic rename.
+    ///
+    /// On `http(s)://` a `PROPFIND` first checks the source: a `WebDAV`
+    /// collection is refused with [`Error::InvalidInput`].
     ///
     /// # Errors
     ///
@@ -757,6 +875,11 @@ impl<C: Codec> Client<C> {
         if same_name(&src.loc, &dst.loc) {
             return Ok(());
         }
+        refuse_collection(
+            &src,
+            "moving it would remove everything in it; move the objects in it one by one",
+        )
+        .await?;
         self.codec.copy(&src, &dst, true).await
     }
 }
@@ -823,8 +946,10 @@ impl Client<Envelope> {
     /// # Errors
     ///
     /// [`Error::InvalidInput`] if `opts.from` is the active key (rotate the
-    /// keyring first), an error if the object cannot be decrypted (it is left
-    /// untouched), or a storage or key error.
+    /// keyring first), [`Error::Key`] with `UnknownId` if the
+    /// keyring does not hold `opts.from`, both before any I/O, an error if the
+    /// object cannot be decrypted (it is left untouched), or a storage or key
+    /// error.
     pub async fn reencrypt(&self, url: &str, opts: &ReencryptOptions) -> Result<Reencrypted> {
         let r = self.resolve(url)?;
         self.codec.reencrypt(&r, opts).await
@@ -1069,8 +1194,7 @@ impl Client<Plain> {
         paths.push(first.loc.path.clone());
 
         for url in rest {
-            let parsed = Self::parse_url(url)?;
-            check_input(url, &parsed, Dots::Everywhere, true)?;
+            let parsed = parse_checked(url, Dots::Everywhere, true)?;
             if origin(&parsed) != origin(&first.loc.url) {
                 return Err(Error::InvalidInput(
                     "All URLs must belong to the same backend (scheme, userinfo, host and port)"
@@ -1099,9 +1223,9 @@ enum Dots {
 }
 
 /// The most of an object path a converted store error keeps.
-const ERROR_PATH_CAP: usize = 1024;
+pub(crate) const ERROR_PATH_CAP: usize = 1024;
 /// The most of a provider message a converted store error keeps.
-const ERROR_SOURCE_CAP: usize = 4096;
+pub(crate) const ERROR_SOURCE_CAP: usize = 4096;
 
 /// Escaped provider text standing in for a store error's source.
 #[derive(Debug)]
@@ -1125,10 +1249,13 @@ impl From<object_store::Error> for Error {
     fn from(e: object_store::Error) -> Self {
         use object_store::Error as E;
         let source = |s: BoxedSource| -> BoxedSource {
-            Box::new(EscapedText(text::escape(&s.to_string(), ERROR_SOURCE_CAP)))
+            Box::new(EscapedText(text::escape_display(&s, ERROR_SOURCE_CAP)))
         };
         let path = |p: String| text::escape(&p, ERROR_PATH_CAP);
         Self::ObjectStore(match e {
+            e @ (E::PermissionDenied { .. } | E::Unauthenticated { .. }) => {
+                return Self::Denied(text::escape_display(&e, ERROR_SOURCE_CAP));
+            }
             E::NotFound { path: p, source: s } => E::NotFound {
                 path: path(p),
                 source: source(s),
@@ -1145,14 +1272,6 @@ impl From<object_store::Error> for Error {
                 path: path(p),
                 source: source(s),
             },
-            E::PermissionDenied { path: p, source: s } => E::PermissionDenied {
-                path: path(p),
-                source: source(s),
-            },
-            E::Unauthenticated { path: p, source: s } => E::Unauthenticated {
-                path: path(p),
-                source: source(s),
-            },
             E::Generic { store, source: s } => E::Generic {
                 store,
                 source: source(s),
@@ -1165,10 +1284,7 @@ impl From<object_store::Error> for Error {
                 };
                 E::Generic {
                     store,
-                    source: Box::new(EscapedText(text::escape(
-                        &other.to_string(),
-                        ERROR_SOURCE_CAP,
-                    ))),
+                    source: Box::new(EscapedText(text::escape_display(&other, ERROR_SOURCE_CAP))),
                 }
             }
         })
@@ -1187,6 +1303,14 @@ fn check_presign_expiry(expires_in: Duration) -> Result<()> {
     ))
 }
 
+/// Parses `raw` and runs [`check_input`] on it, so no entry point can parse a
+/// URL without checking it.
+fn parse_checked(raw: &str, dots: Dots, needs_object: bool) -> Result<Url> {
+    let url = parse_url(raw)?;
+    check_input(raw, &url, dots, needs_object)?;
+    Ok(url)
+}
+
 /// Rejects input the `url` crate would silently rewrite, before any backend is
 /// built or request sent: tabs, newlines and surrounding whitespace, a query or
 /// fragment (they would be cut off the key), user names and passwords, a `.` or
@@ -1195,18 +1319,7 @@ fn check_presign_expiry(expires_in: Duration) -> Result<()> {
 /// in `/`). The checks run
 /// on the raw string; the messages never quote it, as it may carry tokens.
 fn check_input(raw: &str, url: &Url, dots: Dots, needs_object: bool) -> Result<()> {
-    let is_url = raw.contains("://");
-    // The URL parser drops tabs and newlines anywhere, and the C0 controls
-    // and spaces around the input.
-    if is_url
-        && (raw.contains(['\t', '\n', '\r'])
-            || raw.starts_with(|c: char| c <= ' ')
-            || raw.ends_with(|c: char| c <= ' '))
-    {
-        return Err(Error::InvalidInput(
-            "URLs must not contain tabs, newlines or surrounding whitespace".into(),
-        ));
-    }
+    check_raw_url(raw)?;
     // Local paths never have either: `Url::from_file_path` escapes `?` and `#`.
     if url.query().is_some() || url.fragment().is_some() {
         return Err(Error::InvalidInput(
@@ -1220,8 +1333,9 @@ fn check_input(raw: &str, url: &Url, dots: Dots, needs_object: bool) -> Result<(
                 .into(),
         ));
     }
-    if matches!(dots, Dots::Everywhere) || url.scheme() != "file" {
-        check_dot_segments(raw)?;
+    // `check_raw_url` has refused dots in every URL but `file:`.
+    if matches!(dots, Dots::Everywhere) && url.scheme() == "file" {
+        check_dot_segments(raw, crate::registry::url_form(raw).is_some())?;
     }
     // A trailing `/` would be dropped from the object path, so the operation
     // would address a different object than the one typed.
@@ -1234,17 +1348,45 @@ fn check_input(raw: &str, url: &Url, dots: Dots, needs_object: bool) -> Result<(
     Ok(())
 }
 
+/// The checks of [`check_input`] that need only the raw string, which the URL
+/// parser would rewrite: tabs, newlines and surrounding whitespace, and a `.`
+/// or `..` segment in a URL that is not `file:`. A local path passes. The CLI
+/// runs it on each operand before it parses the operand.
+pub(crate) fn check_raw_url(raw: &str) -> Result<()> {
+    let Some(url) = crate::registry::url_form(raw) else {
+        return Ok(());
+    };
+    // The URL parser drops tabs and newlines anywhere, and the C0 controls
+    // and spaces around the input.
+    if raw.contains(['\t', '\n', '\r'])
+        || raw.starts_with(|c: char| c <= ' ')
+        || raw.ends_with(|c: char| c <= ' ')
+    {
+        return Err(Error::InvalidInput(
+            "URLs must not contain tabs, newlines or surrounding whitespace".into(),
+        ));
+    }
+    if url.scheme() != "file" {
+        check_dot_segments(raw, true)?;
+    }
+    Ok(())
+}
+
 /// Refuses a `.` or `..` path segment in `raw`, also percent-encoded, and a
-/// `.` or `..` bucket or host. `raw` is a URL if it has a scheme separator and
-/// a local path otherwise.
-fn check_dot_segments(raw: &str) -> Result<()> {
+/// `.` or `..` bucket or host. `is_url` tells a URL (see
+/// [`registry::url_form`](crate::registry::url_form)) from a local path.
+fn check_dot_segments(raw: &str, is_url: bool) -> Result<()> {
     let decode = |s: &str| {
         percent_encoding::percent_decode_str(s)
             .decode_utf8_lossy()
             .into_owned()
     };
     let is_dot = |segment: &str| matches!(decode(segment).as_str(), "." | "..");
-    let path = if let Some((_, rest)) = raw.split_once("://") {
+    let path = if is_url {
+        // The scheme ends at the first `:`. The URL parser skips any run of
+        // `/` and `\` after it (`file:/a`, `http:\\h/a`, `s3:///b`).
+        let rest = raw.split_once(':').map_or(raw, |(_, rest)| rest);
+        let rest = rest.trim_start_matches(['/', '\\']);
         // The authority ends at the first `/`. It is the bucket or container
         // for s3/gs/az, and the signed URL is re-parsed with `{bucket}/{key}`,
         // so a `.`/`..` bucket would move the request to another bucket.
@@ -1273,8 +1415,50 @@ fn check_dot_segments(raw: &str) -> Result<()> {
 pub(crate) struct DirPage {
     pub(crate) folders: Vec<String>,
     pub(crate) objects: Vec<DirObject>,
+    /// The symlinks of a `file://` directory; empty for other stores.
+    pub(crate) links: Vec<String>,
     /// The token for the next page; `None` on the last one.
     pub(crate) next: Option<String>,
+}
+
+/// The names of the symlinks directly in the directory `dir`, without the
+/// names a listing hides. A missing path, or one that is not a directory, has
+/// none.
+#[cfg(feature = "gui")]
+async fn local_links(dir: std::path::PathBuf) -> Result<Vec<String>> {
+    tokio::task::spawn_blocking(move || {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let mut links = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            // An entry removed since the read is skipped, as listings do.
+            match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::Io(e)),
+            }
+            if let Some(name) = entry.file_name().to_str()
+                && local_delete::is_listed_name(name)
+            {
+                links.push(name.to_owned());
+            }
+        }
+        Ok(links)
+    })
+    .await
+    .map_err(|e| Error::Generic(format!("list_dir task failed: {e}")))?
 }
 
 /// An object listed by [`Client::list_dir`].
@@ -1289,12 +1473,14 @@ pub(crate) struct DirObject {
 /// The name of `location` relative to `prefix`, or `None` when it is not
 /// strictly below it: the prefix's own marker (`p/` is the path `p`), a key
 /// `/` at the bucket root, or an entry outside the prefix.
-fn relative_name(location: &ObjectPath, prefix: &ObjectPath) -> Option<String> {
-    let parts: Vec<String> = location
-        .prefix_match(prefix)?
-        .map(|part| part.as_ref().to_owned())
-        .collect();
-    (!parts.is_empty()).then(|| parts.join("/"))
+fn relative_str<'a>(location: &'a ObjectPath, prefix: &ObjectPath) -> Option<&'a str> {
+    let rest = location.as_ref().strip_prefix(prefix.as_ref())?;
+    let rest = if prefix.as_ref().is_empty() {
+        rest
+    } else {
+        rest.strip_prefix('/')?
+    };
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// Maps a metadata listing to the names strictly below `prefix` and the
@@ -1306,11 +1492,88 @@ fn relative_listing(
     listing
         .try_filter_map(move |meta| {
             std::future::ready(Ok(
-                relative_name(&meta.location, &prefix).map(|name| (name, meta.size))
+                relative_str(&meta.location, &prefix).map(|name| (name.to_owned(), meta.size))
             ))
         })
         .map_err(Error::from)
         .boxed()
+}
+
+/// Refuses an http(s) URL that names a `WebDAV` collection: a delete of it
+/// removes the collection and all its members. `consequence` finishes the
+/// sentence "... is a `WebDAV` collection; ".
+async fn refuse_collection(r: &Resolved, consequence: &str) -> Result<()> {
+    if r.backend.is_collection(&r.loc.path).await? {
+        return Err(Error::InvalidInput(format!(
+            "{} is a WebDAV collection; {consequence}",
+            crate::codec::redacted(&r.loc.url)
+        )));
+    }
+    Ok(())
+}
+
+/// One `delete_stream` call for `targets` (URL index and key), reporting each
+/// through `each`; see [`Client::delete_many`].
+#[cfg(feature = "gui")]
+async fn delete_batch(
+    store: &dyn ObjectStore,
+    targets: Vec<(usize, ObjectPath)>,
+    each: &mut impl FnMut(usize, Result<()>),
+) {
+    let mut order = Vec::new();
+    let mut waiting: std::collections::HashMap<ObjectPath, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, path) in targets {
+        let indexes = waiting.entry(path.clone()).or_default();
+        if indexes.is_empty() {
+            order.push(path.clone());
+        }
+        indexes.push(index);
+    }
+    let paths = futures::stream::iter(order.clone().into_iter().map(Ok)).boxed();
+    let mut stray = Vec::new();
+    let mut deleted = store.delete_stream(paths);
+    while let Some(result) = deleted.next().await {
+        let path = match result {
+            Ok(path) => path,
+            Err(object_store::Error::NotFound { path, .. })
+                if waiting.contains_key(&ObjectPath::from(path.as_str())) =>
+            {
+                ObjectPath::from(path.as_str())
+            }
+            Err(e) => {
+                stray.push(e);
+                continue;
+            }
+        };
+        for index in waiting.remove(&path).unwrap_or_default() {
+            each(index, Ok(()));
+        }
+    }
+    let left: Vec<ObjectPath> = order
+        .into_iter()
+        .filter(|path| waiting.contains_key(path))
+        .collect();
+    let shared = stray.first().map_or_else(
+        || "the store gave no result for the key".to_owned(),
+        ToString::to_string,
+    );
+    let mut stray: Vec<Option<object_store::Error>> = if stray.len() == left.len() {
+        stray.into_iter().map(Some).collect()
+    } else {
+        left.iter().map(|_| None).collect()
+    };
+    for (path, error) in left.iter().zip(&mut stray) {
+        for index in waiting.remove(path).unwrap_or_default() {
+            let error = error
+                .take()
+                .unwrap_or_else(|| object_store::Error::Generic {
+                    store: "delete_stream",
+                    source: shared.clone().into(),
+                });
+            each(index, Err(error.into()));
+        }
+    }
 }
 
 /// Deletes the keys strictly below `prefix`. A key already gone counts as
@@ -1319,7 +1582,7 @@ async fn delete_listed(store: &dyn ObjectStore, prefix: ObjectPath) -> Result<()
     let owned = prefix.clone();
     let paths = store
         .list(Some(&prefix))
-        .try_filter(move |meta| std::future::ready(relative_name(&meta.location, &owned).is_some()))
+        .try_filter(move |meta| std::future::ready(relative_str(&meta.location, &owned).is_some()))
         .map_ok(|meta| meta.location);
     let mut deleted = store.delete_stream(paths.boxed());
     while let Some(result) = deleted.next().await {
@@ -1349,6 +1612,145 @@ mod tests {
             );
         }
         client().with_s3_profile("dev").expect("a named profile");
+    }
+
+    mod webdav_guard {
+        use super::*;
+        use crate::backend::stub::{Reply, Stub, serve};
+
+        const COLLECTION: &str = "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:propstat>\
+            <D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>\
+            </D:response></D:multistatus>";
+        const FILE: &str = "<D:multistatus xmlns:D=\"DAV:\"><D:response><D:propstat>\
+            <D:prop><D:resourcetype/></D:prop></D:propstat></D:response></D:multistatus>";
+
+        fn lines(stub: &Stub) -> Vec<String> {
+            stub.requests()
+                .iter()
+                .map(|r| r.line.replace(" HTTP/1.1", ""))
+                .collect()
+        }
+
+        fn is_collection_error(err: &Error) -> bool {
+            matches!(err, Error::InvalidInput(m) if m.contains("is a WebDAV collection"))
+        }
+
+        #[tokio::test]
+        async fn delete_refuses_a_collection_and_sends_no_delete() {
+            let stub = serve(vec![Reply::new(207, COLLECTION)]).await;
+            let err = client()
+                .delete(&format!("{}/photos", stub.base))
+                .await
+                .expect_err("collection");
+            assert!(is_collection_error(&err), "{err:?}");
+            assert!(err.to_string().contains("delete_by_prefix"), "{err}");
+            assert_eq!(lines(&stub), ["PROPFIND /photos"]);
+        }
+
+        #[tokio::test]
+        async fn delete_goes_ahead_for_a_file_or_a_server_without_webdav() {
+            for probe in [
+                Reply::new(207, FILE),
+                Reply::new(405, ""),
+                Reply::new(404, ""),
+            ] {
+                let stub = serve(vec![probe, Reply::new(204, "")]).await;
+                client()
+                    .delete(&format!("{}/photos", stub.base))
+                    .await
+                    .expect("delete");
+                assert_eq!(lines(&stub), ["PROPFIND /photos", "DELETE /photos"]);
+            }
+        }
+
+        #[tokio::test]
+        async fn delete_fails_closed_when_the_probe_fails() {
+            let stub = serve(vec![Reply::new(500, "")]).await;
+            let err = client()
+                .delete(&format!("{}/photos", stub.base))
+                .await
+                .expect_err("probe failed");
+            assert!(err.to_string().contains("500"), "{err}");
+            assert_eq!(lines(&stub), ["PROPFIND /photos"]);
+        }
+
+        #[tokio::test]
+        async fn move_refuses_a_collection_before_any_copy_or_delete() {
+            let stub = serve(vec![Reply::new(207, COLLECTION)]).await;
+            let err = client()
+                .move_object(&format!("{}/a", stub.base), &format!("{}/b", stub.base))
+                .await
+                .expect_err("collection");
+            assert!(is_collection_error(&err), "{err:?}");
+            assert_eq!(lines(&stub), ["PROPFIND /a"]);
+        }
+
+        #[tokio::test]
+        async fn move_fails_closed_when_the_probe_fails() {
+            let stub = serve(vec![Reply::new(500, "")]).await;
+            client()
+                .move_object(&format!("{}/a", stub.base), &format!("{}/b", stub.base))
+                .await
+                .expect_err("probe failed");
+            assert_eq!(lines(&stub), ["PROPFIND /a"]);
+        }
+
+        /// A copy onto an existing destination (the server answers 412 to
+        /// `Overwrite: F`) is streamed with a PUT instead.
+        #[tokio::test]
+        async fn copy_onto_an_existing_destination_streams_a_put() {
+            let object = || {
+                Reply::new(200, "hello").header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            };
+            let stub = serve(vec![
+                // The header probe: a ranged read, then a plain one.
+                object(),
+                object(),
+                Reply::new(412, ""),
+                object(),
+                Reply::new(201, ""),
+            ])
+            .await;
+            client()
+                .copy(&format!("{}/a", stub.base), &format!("{}/b", stub.base))
+                .await
+                .expect("copy");
+            let requests = stub.requests();
+            let sent = lines(&stub);
+            assert_eq!(sent[2], "COPY /a");
+            assert!(requests[2].headers.contains("overwrite: F"));
+            assert_eq!(sent[4], "PUT /b");
+            assert_eq!(requests[4].body, b"hello");
+            assert_eq!(sent.len(), 5, "{sent:?}");
+        }
+
+        #[tokio::test]
+        async fn move_goes_ahead_for_a_server_without_webdav() {
+            let object = |status| {
+                Reply::new(status, "hello").header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            };
+            let stub = serve(vec![
+                Reply::new(405, ""),
+                // The header probe (a ranged read, then a plain one), then the
+                // move's own HEAD.
+                object(200),
+                object(200),
+                object(200),
+                Reply::new(201, ""),
+                object(200),
+                Reply::new(204, ""),
+            ])
+            .await;
+            client()
+                .move_object(&format!("{}/a", stub.base), &format!("{}/b", stub.base))
+                .await
+                .expect("move");
+            let sent = lines(&stub);
+            assert_eq!(sent[0], "PROPFIND /a");
+            assert!(sent.contains(&"COPY /a".to_owned()), "{sent:?}");
+            assert_eq!(sent.last().map(String::as_str), Some("DELETE /a"));
+            assert_eq!(sent.len(), 7, "{sent:?}");
+        }
     }
 
     #[test]
@@ -1527,8 +1929,9 @@ mod tests {
             ("", "", None),
         ];
         for (location, prefix, want) in table {
-            let got = relative_name(&ObjectPath::from(location), &ObjectPath::from(prefix));
-            assert_eq!(got.as_deref(), want, "{location:?} under {prefix:?}");
+            let location_path = ObjectPath::from(location);
+            let got = relative_str(&location_path, &ObjectPath::from(prefix));
+            assert_eq!(got, want, "{location:?} under {prefix:?}");
         }
     }
 
@@ -1598,11 +2001,19 @@ mod tests {
         ];
         for original in cases {
             let name = std::mem::discriminant(&original);
+            let denied = matches!(
+                original,
+                E::PermissionDenied { .. } | E::Unauthenticated { .. }
+            );
             let err = Error::from(original);
-            let Error::ObjectStore(inner) = &err else {
-                panic!("not a store error: {err:?}");
-            };
-            assert_eq!(std::mem::discriminant(inner), name, "{err:?}");
+            match &err {
+                Error::Denied(_) => assert!(denied, "{err:?}"),
+                Error::ObjectStore(inner) => {
+                    assert!(!denied, "{err:?}");
+                    assert_eq!(std::mem::discriminant(inner), name, "{err:?}");
+                }
+                _ => panic!("not a store error: {err:?}"),
+            }
             let (display, debug) = (err.to_string(), format!("{err:?}"));
             assert!(display.len() < 6 * 1024, "{} bytes", display.len());
             assert!(debug.len() < 12 * 1024, "{} bytes", debug.len());
@@ -1628,6 +2039,74 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("\\u{a}\\u{1b}[2J"), "{text}");
         assert!(!text.chars().any(crate::text::is_unsafe_char), "{text}");
+    }
+
+    #[cfg(unix)]
+    mod symlinks {
+        use super::*;
+
+        fn dir_url(dir: &std::path::Path) -> String {
+            let mut u = url::Url::from_file_path(dir).expect("file URL").to_string();
+            if !u.ends_with('/') {
+                u.push('/');
+            }
+            u
+        }
+
+        /// `outside/{x,y/z}` beside `top/{real.txt,data -> ../outside,
+        /// f -> ../outside/x}`.
+        fn linked_tree() -> tempfile::TempDir {
+            let t = tempfile::tempdir().expect("tempdir");
+            let root = t.path();
+            std::fs::create_dir_all(root.join("outside/y")).expect("mkdir");
+            std::fs::create_dir_all(root.join("top")).expect("mkdir");
+            std::fs::write(root.join("outside/x"), "x").expect("write");
+            std::fs::write(root.join("outside/y/z"), "z").expect("write");
+            std::fs::write(root.join("top/real.txt"), "r").expect("write");
+            std::os::unix::fs::symlink("../outside", root.join("top/data")).expect("link");
+            std::os::unix::fs::symlink("../outside/x", root.join("top/f")).expect("link");
+            t
+        }
+
+        #[tokio::test]
+        async fn list_skips_links_to_files_and_directories() {
+            let t = linked_tree();
+            let url = dir_url(&t.path().join("top"));
+            let c = client();
+            assert_eq!(c.list(&url).await.expect("list"), ["real.txt"]);
+            let streamed: Vec<_> = c
+                .list_stream(&url)
+                .expect("stream")
+                .try_collect()
+                .await
+                .expect("collect");
+            assert_eq!(streamed, ["real.txt"]);
+        }
+
+        #[tokio::test]
+        async fn list_resolves_a_linked_prefix_as_named() {
+            let t = linked_tree();
+            let mut names = client()
+                .list(&dir_url(&t.path().join("top/data")))
+                .await
+                .expect("list");
+            names.sort();
+            assert_eq!(names, ["x", "y/z"]);
+        }
+
+        #[tokio::test]
+        async fn delete_of_a_link_leaves_its_target() {
+            let t = linked_tree();
+            let url = url::Url::from_file_path(t.path().join("top/f"))
+                .expect("file URL")
+                .to_string();
+            client().delete(&url).await.expect("delete");
+            assert!(t.path().join("top/f").symlink_metadata().is_err());
+            assert_eq!(
+                std::fs::read(t.path().join("outside/x")).expect("read"),
+                b"x"
+            );
+        }
     }
 
     #[cfg(feature = "gui")]
@@ -1691,6 +2170,27 @@ mod tests {
                     .expect("get");
                 assert_eq!(got.as_ref(), o.name.as_bytes());
             }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn list_dir_reports_links_apart() {
+            let t = tempfile::tempdir().expect("tempdir");
+            write(t.path(), "outside/x", b"x");
+            write(t.path(), "top/real.txt", b"r");
+            write(t.path(), "top/sub/y", b"y");
+            std::os::unix::fs::symlink("../outside", t.path().join("top/data")).expect("link");
+            std::os::unix::fs::symlink("../outside/x", t.path().join("top/f")).expect("link");
+            let page = client()
+                .list_dir(&dir_url(&t.path().join("top")), None, 10)
+                .await
+                .expect("list");
+            assert_eq!(page.folders, ["sub"]);
+            let objects: Vec<_> = page.objects.iter().map(|o| o.name.as_str()).collect();
+            assert_eq!(objects, ["real.txt"]);
+            let mut links = page.links.clone();
+            links.sort();
+            assert_eq!(links, ["data", "f"]);
         }
 
         #[tokio::test]

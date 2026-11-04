@@ -38,6 +38,40 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState) -> Vec<Action> {
     actions
 }
 
+/// How often the busy indicator moves.
+const BUSY_STEP: std::time::Duration = std::time::Duration::from_millis(125);
+
+/// A spinner that redraws about 8 times a second. `egui`'s own requests a
+/// repaint every frame, which keeps the whole window drawing at display rate
+/// for as long as a job runs.
+fn busy(ui: &mut egui::Ui) {
+    let size = ui.spacing().interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::Role::ProgressIndicator));
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.request_repaint_after(BUSY_STEP);
+    // The time in whole steps, so the picture is the same until the next one.
+    let step = BUSY_STEP.as_secs_f64();
+    let time = (ui.input(|i| i.time) / step).floor() * step;
+    let radius = rect.height().min(rect.width()).mul_add(0.5, -2.0);
+    let start = time * std::f64::consts::TAU;
+    let end = 240_f64.to_radians().mul_add(time.sin(), start);
+    let points = (0..=16)
+        .map(|i| {
+            let angle = start + (end - start) * f64::from(i) / 16.0;
+            let (sin, cos) = angle.sin_cos();
+            #[allow(clippy::cast_possible_truncation)]
+            let offset = egui::vec2(cos as f32, sin as f32) * radius;
+            rect.center() + offset
+        })
+        .collect();
+    let color = ui.visuals().strong_text_color();
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
+}
+
 /// "1 item", "3 items".
 fn count(n: usize, noun: &str) -> String {
     if n == 1 {

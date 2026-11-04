@@ -34,7 +34,8 @@ pub static PROBE_FAULTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
 /// The umask for a file about to be created at `path`, or `None` when it
 /// cannot be learned.
 ///
-/// It is read from `/proc` where that exists. Elsewhere (macOS, other Unix)
+/// It is read from `/proc` where that exists, unless the directory has a
+/// default ACL (Linux), which the umask does not govern. Elsewhere (macOS, other Unix)
 /// it is learned from a probe: an empty file is created with mode `0o666` in
 /// the nearest existing directory of `path`, its mode is read, and it is
 /// removed again. `umask(2)` is never called, because it is process-wide and
@@ -46,16 +47,56 @@ pub fn umask_near(path: &std::path::Path) -> Option<u32> {
         .is_ok_and(|set| set.iter().any(|p| p == path));
     #[cfg(not(all(test, unix)))]
     let skip_proc = false;
-    if !skip_proc && let Some(umask) = current_umask() {
+    if !skip_proc
+        && !has_default_acl(path)
+        && let Some(umask) = current_umask()
+    {
         return Some(umask);
     }
     probe_umask(path)
 }
 
+/// The nearest existing directory above `path`; the empty path stands for
+/// the current directory.
+#[cfg(unix)]
+fn nearest_dir(path: &std::path::Path) -> Option<&std::path::Path> {
+    let dir = path
+        .ancestors()
+        .skip(1)
+        .find(|p| p.as_os_str().is_empty() || p.is_dir())?;
+    Some(if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    })
+}
+
+/// Whether the directory a file at `path` will be created in has a default
+/// POSIX ACL. The kernel then ignores the umask, so `/proc` cannot say what
+/// mode a new file gets and the probe must.
+fn has_default_acl(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(dir) = nearest_dir(path) else {
+            return false;
+        };
+        // A one-byte buffer: a short ACL fits (`Ok`) and a longer one gives `ERANGE`;
+        // either way it is present.
+        match rustix::fs::getxattr(dir, "system.posix_acl_default", &mut [0_u8; 1]) {
+            Ok(_) => true,
+            Err(e) => e == rustix::io::Errno::RANGE,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(unix)]
 fn probe_umask(path: &std::path::Path) -> Option<u32> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    use std::path::Path;
 
     #[cfg(test)]
     if PROBE_FAULTS
@@ -64,15 +105,7 @@ fn probe_umask(path: &std::path::Path) -> Option<u32> {
     {
         return None;
     }
-    let dir = path
-        .ancestors()
-        .skip(1)
-        .find(|p| p.as_os_str().is_empty() || p.is_dir())?;
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
+    let dir = nearest_dir(path)?;
     for _ in 0..4 {
         let mut suffix = [0_u8; 8];
         aws_lc_rs::rand::fill(&mut suffix).ok()?;
@@ -114,6 +147,10 @@ pub fn owned_mode(existing: Option<(u32, u32)>, euid: u32) -> Option<u32> {
 
 /// Decides `(creation mode, final mode)` of a written file.
 ///
+/// A move (`moving`) with a known `source` takes the source's permission bits
+/// (never setuid, setgid or sticky), whatever it replaces and whatever the
+/// umask, as a rename would keep them.
+///
 /// `existing` is the `(mode, owner)` of the regular file being replaced; its
 /// mode is adopted only when `euid` owns it (see [`owned_mode`]). Otherwise a
 /// copy takes `source` and anything else `0o666`, both less the umask. The
@@ -126,8 +163,12 @@ pub fn modes(
     existing: Option<(u32, u32)>,
     euid: u32,
     source: Option<u32>,
+    moving: bool,
     umask: Option<u32>,
 ) -> (Option<u32>, Option<u32>) {
+    if moving && let Some(s) = source {
+        return (Some(0o600), Some(s & 0o777));
+    }
     if let Some(mode) = owned_mode(existing, euid) {
         return (Some(0o600), Some(mode));
     }
@@ -147,11 +188,11 @@ mod tests {
     #[test]
     fn new_file_gets_default_less_umask_after_private_staging() {
         assert_eq!(
-            modes(None, 1000, None, Some(0o022)),
+            modes(None, 1000, None, false, Some(0o022)),
             (Some(0o600), Some(0o644))
         );
         assert_eq!(
-            modes(None, 1000, None, Some(0o077)),
+            modes(None, 1000, None, false, Some(0o077)),
             (Some(0o600), Some(0o600))
         );
     }
@@ -188,6 +229,62 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
     }
 
+    #[test]
+    fn a_move_takes_the_source_bits_over_an_owned_destination() {
+        // A cross-device move gives what a rename gives: the source's bits,
+        // without setuid, setgid and sticky, whatever it replaces.
+        assert_eq!(
+            modes(
+                Some((0o100_644, 1000)),
+                1000,
+                Some(0o104_600),
+                true,
+                Some(0o022)
+            ),
+            (Some(0o600), Some(0o600))
+        );
+        assert_eq!(
+            modes(None, 1000, Some(0o100_666), true, Some(0o077)),
+            (Some(0o600), Some(0o666))
+        );
+        // The same copy keeps the destination's bits.
+        assert_eq!(
+            modes(
+                Some((0o100_644, 1000)),
+                1000,
+                Some(0o600),
+                false,
+                Some(0o022)
+            ),
+            (Some(0o600), Some(0o644))
+        );
+        // Without a known source a move is not special.
+        assert_eq!(
+            modes(Some((0o100_644, 1000)), 1000, None, true, Some(0o022)),
+            (Some(0o600), Some(0o644))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_default_acl_makes_the_probe_decide_the_umask() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let set = std::process::Command::new("setfacl")
+            .args(["-d", "-m", "o::---"])
+            .arg(dir.path())
+            .output();
+        if !set.is_ok_and(|o| o.status.success()) {
+            eprintln!("skipped: setfacl or ACL support is missing");
+            return;
+        }
+        let path = dir.path().join("new");
+        assert!(has_default_acl(&path));
+        let umask = umask_near(&path).expect("umask");
+        assert_eq!(umask, !default_mode_in(dir.path()) & 0o777);
+        assert_eq!(umask & 0o007, 0o007, "others stay locked out");
+        assert!(!has_default_acl(&std::env::temp_dir().join("x")) || umask != 0);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failed_probe_falls_back_to_the_core_umask_rule() {
@@ -200,28 +297,40 @@ mod tests {
         PROBE_FAULTS.lock().expect("lock").retain(|p| *p != path);
 
         assert_eq!(umask, None);
-        assert_eq!(modes(None, 1000, Some(0o600), umask), (Some(0o600), None));
+        assert_eq!(
+            modes(None, 1000, Some(0o600), false, umask),
+            (Some(0o600), None)
+        );
         assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 0);
     }
 
     #[test]
     fn an_unknown_umask_creates_with_the_source_bits() {
-        assert_eq!(modes(None, 1000, Some(0o600), None), (Some(0o600), None));
         assert_eq!(
-            modes(None, 1000, Some(0o104_755), None),
+            modes(None, 1000, Some(0o600), false, None),
+            (Some(0o600), None)
+        );
+        assert_eq!(
+            modes(None, 1000, Some(0o104_755), false, None),
             (Some(0o755), None)
         );
-        assert_eq!(modes(None, 1000, None, None), (None, None));
+        assert_eq!(modes(None, 1000, None, false, None), (None, None));
     }
 
     #[test]
     fn own_destination_keeps_its_mode_without_special_bits() {
         assert_eq!(
-            modes(Some((0o104_600, 1000)), 1000, None, None),
+            modes(Some((0o104_600, 1000)), 1000, None, false, None),
             (Some(0o600), Some(0o600))
         );
         assert_eq!(
-            modes(Some((0o100_640, 1000)), 1000, Some(0o600), Some(0o022)),
+            modes(
+                Some((0o100_640, 1000)),
+                1000,
+                Some(0o600),
+                false,
+                Some(0o022)
+            ),
             (Some(0o600), Some(0o640))
         );
     }
@@ -229,7 +338,7 @@ mod tests {
     #[test]
     fn foreign_destination_is_treated_as_new() {
         assert_eq!(
-            modes(Some((0o100_666, 0)), 1000, None, Some(0o022)),
+            modes(Some((0o100_666, 0)), 1000, None, false, Some(0o022)),
             (Some(0o600), Some(0o644))
         );
     }
@@ -237,11 +346,11 @@ mod tests {
     #[test]
     fn copy_takes_source_mode_less_umask() {
         assert_eq!(
-            modes(None, 1000, Some(0o104_755), Some(0o022)),
+            modes(None, 1000, Some(0o104_755), false, Some(0o022)),
             (Some(0o600), Some(0o755))
         );
         assert_eq!(
-            modes(None, 1000, Some(0o600), Some(0o022)),
+            modes(None, 1000, Some(0o600), false, Some(0o022)),
             (Some(0o600), Some(0o600))
         );
     }

@@ -3,9 +3,7 @@
 Optional client-side envelope encryption (Cargo feature `encryption`, on by
 default). Each object gets a fresh data key, which is wrapped by a
 key-encryption key from a keyring you hold; the storage provider only sees
-ciphertext. Plain clients behave exactly as before. Full design:
-[the encryption spec](superpowers/specs/2026-10-26-client-side-encryption-design.md)
-and [the key rotation spec](superpowers/specs/2026-10-27-key-rotation-design.md).
+ciphertext. Plain clients behave exactly as before.
 
 ## What it protects, and what it does not
 
@@ -40,23 +38,26 @@ Caveats:
   authenticates each frame as it arrives, so damage or appended data fails the
   read as soon as it is downloaded; it still returns nothing until the final
   frame verified.
-- With object-key binding on (the default), an encrypted copy or move to
-  another name always downloads, decrypts and re-encrypts the object: its
-  header names its path (the object-key binding) and cannot be rewritten
-  safely. The source is read once, with no separate header request. A client
-  with binding off reads the header first and, for an object on the active key,
-  copies the bytes as they are; see the byte-copy caveat below.
+- An encrypted copy or move always downloads, decrypts and re-encrypts the
+  object with a fresh data key and message ID, whatever the destination: another
+  name, another bucket or store, or a `file://` move. It never copies bytes or
+  asks the store to copy or rename, because the header names the object's path
+  (the object-key binding) and cannot be rewritten safely. This costs a full
+  download and upload even inside one bucket. The source is read once, with no
+  separate header request, and a source that fails verification is never
+  committed.
+- The plain client (`without_encryption`, or a build without the feature)
+  refuses to copy or move an encrypted object to another name, because the
+  copy would be unreadable; copy it with the encrypted client. It reads the
+  start of the source first, which costs one extra request.
 - A lost key with no other copy means permanent data loss.
 - With object-key binding (the default) the bound key of a `file://` object is
   its absolute path. Moving such a file outside `osc` (for example with `mv`)
   makes it undecryptable; copy it with `osc` instead, which re-encrypts.
-- A byte copy inside one store (server-side copy or rename) does not verify the
-  source; a tampered source is copied as is and detected when the destination is
-  read. A copy between stores streams the bytes through a decryptor and commits
-  only if they verify.
-- `NotEncrypted` can also mean the first byte of an encrypted object was
-  damaged. `UnknownKey` is derived from unauthenticated header data, so it can
-  also indicate tampering.
+- `NotEncrypted` can also mean one of the first three bytes of an encrypted
+  object was damaged. Reads still fail, but `osc enc scan` and `reencrypt`
+  count such an object as not encrypted. `UnknownKey` is derived from
+  unauthenticated header data, so it can also indicate tampering.
 - AWS-LC wipes key schedules when their key objects are freed, but not the
   short-lived copies it makes on the stack while encrypting or decrypting.
 - **Core dumps.** A process that loaded a keyring keeps every KEK in memory
@@ -97,13 +98,19 @@ key=kek-2025-10-8be01d44 created=2025-10-20 material=<64 hex> check=<16 hex>
   cannot write and others cannot access; group read is allowed (for
   `fsGroup`), so Kubernetes `defaultMode: 0440` keeps working. Windows and
   other platforms check nothing: keep the keyring under `%USERPROFILE%` or in
-  a directory without inherited access.
+  a directory without inherited access. Like OpenSSH, the check reads the
+  owner and the mode bits only. ACL grants (`getfacl`, including inherited
+  default ACLs, and macOS ACEs) are not detected, so keep the keyring in a
+  directory without them.
 - A file-backed keyring reloads itself: on use, including `status()`, at most every 5 seconds, it
   checks whether the file changed and swaps in the new keys, and a read that
   meets an unknown key ID checks at once (at most once a second). A broken
   update keeps the previous keys and is reported by `status()` until a valid
   file arrives. Mount the whole Secret volume: a `subPath` mount is never
-  updated by the kubelet.
+  updated by the kubelet. Keep the keyring file on a local or tmpfs
+  filesystem: a reload runs a synchronous `stat` on the calling thread, which a
+  stalled network or FUSE mount can block. `status()` never waits for a reload
+  that another task is running.
 - `status()` (Rust and Python) returns the active key, every key's ID and
   creation date, the active key's age in days and the last reload error. It
   checks the file first (rate-limited like any use), so an idle process still
@@ -131,6 +138,8 @@ osc keyring status < keyring                     # IDs, dates, ages; exit 3 if t
 osc keyring status --configured                  # the same for the configured key source
 ```
 
+Every helper that reads standard input refuses a terminal, so a forgotten
+`< keyring` fails at once instead of waiting for input.
 `status` reads standard input like the other helpers, even when a key source is
 configured, so `osc keyring status < keyring.new` checks the new file. On a
 terminal it refuses and points at `--configured`, which checks the key source
@@ -238,7 +247,9 @@ the re-check is the protection). A concurrently changed object is reported as
 `changed` and left as the other writer made it; a store that reports neither
 an e-tag nor a version is refused. Like a re-encrypting copy, it does not carry
 over content type or user metadata. Re-running is safe: rewritten objects are
-then `skipped`.
+then `skipped`. A `--from` key that the keyring does not hold is refused before
+any object is listed or read (Rust `Error::Key`, Python `EncryptionError`), as
+is the active key.
 
 `reencrypt` keeps the object's encryption context and its object-key binding
 whatever the client's `bind_object_key`: an object written without binding
@@ -252,6 +263,9 @@ the noncurrent versions (the client cannot see them); confirm with
 `osc enc scan` that no object uses it, which holds only if the scan exits 0; then
 `osc keyring retire` through the same pipeline as a rotation. Keep an offline
 copy while backups may still need it.
+
+Zero-byte entries, such as the folder markers the S3 and GCS consoles create
+(listed as an empty `p/sub`), are counted as not encrypted without being read.
 
 A scan or re-encryption is complete only when it exits 0. Exit 1 means objects
 were unreadable (`osc enc scan` names each on standard error with the reason)
@@ -287,7 +301,10 @@ path. Remove that object with the provider's tools and run again; see
    [Unaddressable object names](BEHAVIOR.md#unaddressable-object-names), and
    treat it as possibly planted.
 5. Delete old versions, confirm with `osc enc scan` (it must exit 0, as must
-   every `reencrypt` run), retire the leaked key.
+   every `reencrypt` run), retire the leaked key. On an `http(s)://` store, do
+   not trust an exit 0 unless the server answers `PROPFIND` with `Depth:
+   infinity` in full (see [Listing](BEHAVIOR.md#listing)); some WebDAV servers
+   silently list one level only and the scan then misses nested objects.
 
 Ciphertext an attacker already copied stays readable to them; the response
 protects what is stored and stops forged objects from being accepted.
@@ -315,7 +332,7 @@ secure.put_stream("s3://bucket/copy.bin", stream).await?;      // bounded memory
 use std::collections::BTreeMap;
 let ctx = BTreeMap::from([("tenant".to_owned(), "acme".to_owned())]);
 secure.put_with_context("s3://bucket/a", data, &ctx).await?;
-let info = secure.inspect_encryption("s3://bucket/a").await?; // header only, no keys
+let info = secure.inspect_encryption("s3://bucket/a").await?; // header only, no keys; unauthenticated
 ```
 
 ```rust
@@ -327,8 +344,8 @@ let stream = secure.get_stream_with_context("s3://bucket/a", &ctx).await?;
 
 Context keys starting with `osc:` or `aws-crypto-` are reserved; the match is
 ASCII case-insensitive, so `OSC:key` is rejected too. Reading a
-non-encrypted object with an encrypted client fails with `Error::NotEncrypted`;
-read it with the plain view (`secure.without_encryption()`).
+non-encrypted object with an encrypted client fails with `Error::NotEncrypted`
+(an object is judged by its first three bytes); read it with the plain view (`secure.without_encryption()`).
 
 ### Requiring a context on reads
 
@@ -364,7 +381,7 @@ await secure.put_object("s3://bucket/a.txt", b"data", context={"tenant": "acme"}
 data = await secure.get_object("s3://bucket/a.txt")          # verified before returning
 data = await secure.get_object("s3://bucket/a.txt", context={"tenant": "acme"})  # must carry it
 await secure.put_object_stream("s3://bucket/big.bin", chunks)  # any async iterable of bytes
-info = await secure.inspect_encryption("s3://bucket/a.txt")
+info = await secure.inspect_encryption("s3://bucket/a.txt")  # unauthenticated header: do not trust its context
 
 # Between modes, pipe the streams (bounded memory):
 await plain.put_object_stream("file:///tmp/a.txt", await secure.get_object_stream("s3://bucket/a.txt"))
@@ -395,12 +412,18 @@ With a keyring (`--keyring FILE`, `OSC_KEYRING_FILE` or
 `get-stream`, `cp` and `mv` encrypt and decrypt transparently, and `sign` is
 rejected. `ls`, `rm`, `exists`, `mb` and `bucket-exists` never read the
 keyring: the key command does not run and no key is loaded (setting both kinds
-of source is still an error). `OSC_KEYRING_COMMAND` runs through `sh -c` with no standard input
-(log in to `kubectl`/`bao` beforehand); its output is kept in memory that is
+of source is still an error, and so is it for `enc inspect`, `enc scan` and
+the `keyring` helpers). `OSC_KEYRING_COMMAND` runs through `sh -c` with no
+standard input (log in to `kubectl`/`bao` beforehand); its output is kept in memory that is
 wiped after use, and a non-zero exit, more than 64 KiB of output or more than
 30 seconds is an error. `osc` disables core dumps and same-user `ptrace` for
 itself (Unix; `PR_SET_DUMPABLE` on Linux), so a crash writes no keys to disk,
 and the key command inherits the zero core limit.
+
+When the command times out, or `osc` is interrupted while it runs, the shell is
+killed, but processes it started (the stages of a pipeline) may keep running.
+Prefer a single command, or `exec` the last one:
+`OSC_KEYRING_COMMAND="exec vault kv get -field=keyring secret/osc"`.
 
 Set `OSC_REQUIRE_ENCRYPTION=1` (or `--require-encryption`) in CI and in
 Kubernetes jobs, so a missing key source is an error and never a silent
@@ -412,6 +435,9 @@ Objects are AWS Encryption SDK message format version 2, algorithm suite
 `0x0478` (AES-256-GCM with key commitment), framed with 64 KiB frames. They can
 be decrypted by the AWS Encryption SDK with a raw AES keyring using key
 namespace `osc-file` and key name = the key ID, with the 256-bit key from the
-keyring's `material=` field. Byte layout and the `osc:` context entries are in
-[the encryption spec](superpowers/specs/2026-10-26-client-side-encryption-design.md)
-(section 6).
+keyring's `material=` field. The byte layout is the public
+[AWS Encryption SDK message format](https://docs.aws.amazon.com/encryption-sdk/latest/developer-guide/message-format.html).
+The encryption context holds the reserved entries `osc:fmt=1` and, when object
+key binding is on, `osc:key=<object path>`, plus the caller's own entries. A
+key's check value is the first 8 bytes of `HMAC-SHA256(material,
+"osc-key-check-v1")`.

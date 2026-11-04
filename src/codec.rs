@@ -60,6 +60,9 @@ pub(crate) mod sealed {
             data: Bytes,
         ) -> impl Future<Output = Result<Bytes>> + Send;
 
+        /// Rejects a write context the codec would refuse, before any I/O.
+        fn check_write(&self, loc: &Location, ctx: &CallerContext) -> Result<()>;
+
         /// Encodes a stream of plaintext chunks into stored bytes.
         fn encode_stream(&self, loc: Location, ctx: CallerContext, plain: ByteStream)
         -> ByteStream;
@@ -94,10 +97,34 @@ pub(crate) mod sealed {
             dst: &Resolved,
             delete_source: bool,
         ) -> impl Future<Output = Result<()>> + Send;
+
+        /// Copies an object whose size the caller knows from a listing. The
+        /// plain codec skips the `HEAD` that otherwise finds the size; a
+        /// codec that streams every copy ignores it.
+        fn copy_sized(
+            &self,
+            src: &Resolved,
+            dst: &Resolved,
+            _size: Option<u64>,
+        ) -> impl Future<Output = Result<()>> + Send {
+            self.copy(src, dst, false)
+        }
     }
 }
 
 pub(crate) use sealed::{Location, Resolved};
+
+impl Location {
+    /// The `osc:key` an encrypted message written to this location carries
+    /// when keys are bound: the object path, which for `file://` is the
+    /// absolute path.
+    pub(crate) fn bound_key(&self) -> &str {
+        self.path.as_ref()
+    }
+}
+
+/// The first bytes of every envelope message: version 2 and suite `0x0478`.
+const OSC_PREFIX: [u8; 3] = [0x02, 0x04, 0x78];
 
 /// Transforms object bytes on their way to and from a store. Sealed: only this
 /// crate provides implementations, and the seam methods are private to it.
@@ -119,6 +146,10 @@ impl sealed::CodecImpl for Plain {
         std::future::ready(Ok(data))
     }
 
+    fn check_write(&self, _loc: &Location, _ctx: &CallerContext) -> Result<()> {
+        Ok(())
+    }
+
     fn encode_stream(&self, _loc: Location, _ctx: CallerContext, plain: ByteStream) -> ByteStream {
         plain
     }
@@ -138,12 +169,25 @@ impl sealed::CodecImpl for Plain {
         // The range is the provider's claim: reserve a bounded amount and
         // grow as data arrives instead of trusting it.
         let declared = usize::try_from(result.range.end - result.range.start).unwrap_or(usize::MAX);
-        let mut out = BytesMut::with_capacity(declared.min(MAX_PREALLOC));
+        let mut out = Vec::with_capacity(declared.min(MAX_PREALLOC));
         let mut stream = body_stream(result);
         while let Some(chunk) = stream.next().await {
-            out.extend_from_slice(&chunk?);
+            let chunk = chunk?;
+            if out.capacity() - out.len() < chunk.len() {
+                // Grow by at most the bytes already received, so a false size
+                // cannot force a large allocation; an honest one ends with
+                // no spare room, which `Bytes` would otherwise keep.
+                let left = declared.saturating_sub(out.len());
+                let more = if left > 0 {
+                    left.min(out.len())
+                } else {
+                    out.len()
+                };
+                out.reserve_exact(more.max(chunk.len()));
+            }
+            out.extend_from_slice(&chunk);
         }
-        Ok(out.freeze())
+        Ok(Bytes::from(out))
     }
 
     async fn describe(&self, backend: &dyn Backend, loc: &Location) -> Result<ObjectMetadata> {
@@ -172,12 +216,31 @@ impl sealed::CodecImpl for Plain {
     }
 
     async fn copy(&self, src: &Resolved, dst: &Resolved, delete_source: bool) -> Result<()> {
+        self.copy_known(src, dst, delete_source, None).await
+    }
+
+    async fn copy_sized(&self, src: &Resolved, dst: &Resolved, size: Option<u64>) -> Result<()> {
+        self.copy_known(src, dst, false, size).await
+    }
+}
+
+impl Plain {
+    /// [`copy`](sealed::CodecImpl::copy) with the source size when it is known.
+    async fn copy_known(
+        &self,
+        src: &Resolved,
+        dst: &Resolved,
+        delete_source: bool,
+        size: Option<u64>,
+    ) -> Result<()> {
         // A copy or move onto itself is a no-op: a rename of an object onto
         // itself is copy-then-delete on cloud stores and would destroy it.
-        if same_object(&src.loc, &dst.loc) {
+        if same_object(&src.loc, &dst.loc).await {
             return Ok(());
         }
-        if server_side_copy(src, dst, delete_source, None).await? {
+        refuse_special_source(src).await?;
+        refuse_to_unbind(src, dst).await?;
+        if server_side_copy(src, dst, delete_source, size).await? {
             return Ok(());
         }
         let from_store = src.backend.store();
@@ -192,6 +255,7 @@ impl sealed::CodecImpl for Plain {
             .boxed();
         let options = UploadOptions {
             attributes,
+            move_source: delete_source,
             ..UploadOptions::copying_from(src.backend.as_ref(), &src.loc.path, read.size)
         };
         upload_stream(dst.backend.as_ref(), &dst.loc.path, stored, &options).await?;
@@ -200,6 +264,108 @@ impl sealed::CodecImpl for Plain {
         }
         Ok(())
     }
+}
+
+/// Refuses a byte copy that would leave an encrypted object unreadable, with
+/// a ranged GET of the source's first 1 KiB (more only for a larger header). The header binds the object key
+/// (`osc:key`) in clear text, so no keys are needed. An object that is not an
+/// envelope message passes; so does one with no binding or with the
+/// destination's own key. A header that starts like ours but does not parse
+/// is refused as well.
+///
+/// # Errors
+/// [`Error::InvalidInput`] for an object bound to another name, and storage
+/// errors of the probe.
+async fn refuse_to_unbind(src: &Resolved, dst: &Resolved) -> Result<()> {
+    // A typical header is a few hundred bytes: read 1 KiB, and the rest only
+    // when the header does not fit.
+    #[cfg(feature = "encryption")]
+    let (first, max) = (
+        1024,
+        crate::encryption::DecodeLimits::default().max_header_len,
+    );
+    #[cfg(not(feature = "encryption"))]
+    let first = OSC_PREFIX.len();
+    #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
+    let mut head = read_start(src, first as u64).await?;
+    if !head.starts_with(&OSC_PREFIX) {
+        return Ok(());
+    }
+    #[cfg(feature = "encryption")]
+    if head.len() == first
+        && max > first
+        && matches!(
+            crate::encryption::header::HeaderCodec::parse(
+                &head,
+                &crate::encryption::DecodeLimits::default()
+            ),
+            Ok(crate::encryption::header::HeaderParse::NeedMore)
+        )
+    {
+        head = read_start(src, max as u64).await?;
+    }
+    let url = redacted(&src.loc.url);
+    #[cfg(feature = "encryption")]
+    {
+        use crate::encryption::context::KEY_OBJECT;
+        use crate::encryption::header::{HeaderCodec, HeaderParse};
+        match HeaderCodec::parse(&head, &crate::encryption::DecodeLimits::default()) {
+            Ok(HeaderParse::Done { header, .. }) => {
+                if header
+                    .context
+                    .get(KEY_OBJECT)
+                    .is_none_or(|bound| bound == dst.loc.bound_key())
+                {
+                    return Ok(());
+                }
+                return Err(Error::InvalidInput(format!(
+                    "{url} is encrypted and bound to its name; copy it with the encrypted client, which re-encrypts"
+                )));
+            }
+            Ok(HeaderParse::NeedMore) | Err(_) => {}
+        }
+    }
+    // Without the `encryption` feature the header cannot be read, so any
+    // object that starts like a message is treated as bound to its own name.
+    #[cfg(not(feature = "encryption"))]
+    if src.loc.bound_key() == dst.loc.bound_key() {
+        return Ok(());
+    }
+    Err(Error::InvalidInput(format!(
+        "{url} looks encrypted and may be bound to its name; copy it with the encrypted client, which re-encrypts"
+    )))
+}
+
+/// Up to `len` bytes from the start of an object, with one ranged GET. When
+/// the range is refused (an empty object, which stores refuse to range over,
+/// or an http(s) server without range support), the start of a plain GET is
+/// read instead and the rest of its body is dropped.
+async fn read_start(src: &Resolved, len: u64) -> Result<Bytes> {
+    let options = GetOptions {
+        range: Some(object_store::GetRange::Bounded(0..len)),
+        ..Default::default()
+    };
+    let store = src.backend.store();
+    let result = match store.get_opts(&src.loc.path, options).await {
+        Ok(r) => r,
+        Err(e @ object_store::Error::NotFound { .. }) => return Err(e.into()),
+        Err(e) => match store.get(&src.loc.path).await {
+            Ok(r) => r,
+            Err(_) => return Err(e.into()),
+        },
+    };
+    // A store may answer with more than was asked for: keep only `len`.
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    let mut buf = BytesMut::new();
+    let mut body = body_stream(result);
+    while buf.len() < len
+        && let Some(chunk) = body.next().await
+    {
+        let chunk = chunk?;
+        let take = chunk.len().min(len - buf.len());
+        buf.extend_from_slice(&chunk[..take]);
+    }
+    Ok(buf.freeze())
 }
 
 /// The attributes a streamed copy keeps: the content headers always, user
@@ -271,7 +437,7 @@ pub(crate) fn redacted(url: &Url) -> String {
 /// behind. Text that does not parse as a URL is cut at the first `?` or `#`
 /// and loses any `user:password@` in its authority.
 #[must_use]
-#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn redact_url(text: &str) -> String {
     if let Ok(url) = url::Url::parse(text) {
         let mut out = crate::codec::redacted(&url);
@@ -336,11 +502,6 @@ pub(crate) fn same_store(a: &Url, b: &Url) -> bool {
     store_identity(a) == store_identity(b)
 }
 
-/// The file a `file://` location refers to, as the local backend resolves it.
-fn local_file(loc: &Location) -> std::path::PathBuf {
-    std::path::Path::new("/").join(loc.path.as_ref())
-}
-
 /// Whether two existing paths are the same file, whatever route reaches it
 /// (symlinked directories, a case-insensitive file system). A path that does
 /// not exist is not the same file as anything.
@@ -370,11 +531,59 @@ pub(crate) fn same_name(a: &Location, b: &Location) -> bool {
 
 /// Whether two locations name the same object: the same path in the same
 /// store, or, for `file`, two paths that reach one existing file.
-pub(crate) fn same_object(a: &Location, b: &Location) -> bool {
+/// The file system is read on a blocking thread.
+pub(crate) async fn same_object(a: &Location, b: &Location) -> bool {
     if !same_store(&a.url, &b.url) {
         return false;
     }
-    a.path == b.path || (a.url.scheme() == "file" && same_file(&local_file(a), &local_file(b)))
+    if a.path == b.path {
+        return true;
+    }
+    if a.url.scheme() != "file" {
+        return false;
+    }
+    // A path with no file system mapping is never the same object.
+    let (Ok(a), Ok(b)) = (
+        crate::backend::fs_path(&a.path),
+        crate::backend::fs_path(&b.path),
+    ) else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || same_file(&a, &b))
+        .await
+        .unwrap_or(false)
+}
+
+/// Refuses a `file` source that is a directory, FIFO, socket or device with
+/// [`Error::InvalidInput`], before anything reads it. A symlink passes: a move
+/// renames the link, a copy reads its target.
+async fn refuse_special_source(src: &Resolved) -> Result<()> {
+    let Some(path) = src.backend.local_path(&src.loc.path)? else {
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || {
+        match std::fs::symlink_metadata(&path) {
+            // A source that cannot be examined is left to the read to report.
+            Ok(m) if !(m.is_file() || m.is_symlink()) => Err(Error::InvalidInput(format!(
+                "{} is not a regular file",
+                path.display()
+            ))),
+            _ => Ok(()),
+        }
+    })
+    .await
+    .map_err(|e| Error::Generic(format!("Local stat task failed: {e}")))?
+}
+
+/// Whether a `file` move may be a plain `rename(2)`: the source is a regular
+/// file or a symlink (renamed as a link, as `mv(1)` does), and the
+/// destination, if it exists, is a regular file or a symlink. Otherwise the
+/// streamed path decides and refuses what cannot be replaced. A path that
+/// cannot be examined is left to the rename to report.
+fn plain_rename(from: &std::path::Path, to: &std::path::Path) -> bool {
+    let movable = |m: &std::fs::Metadata| m.is_file() || m.is_symlink();
+    std::fs::symlink_metadata(from).map_or_else(|_| true, |m| movable(&m))
+        && std::fs::symlink_metadata(to).map_or_else(|_| true, |m| movable(&m))
 }
 
 /// The largest source a single S3 `CopyObject` accepts (5 GiB).
@@ -383,13 +592,18 @@ const S3_MAX_COPY_SOURCE: u64 = 5 << 30;
 /// Copies or renames inside one store. Returns `false` when the caller must
 /// stream instead: the locations are not served by the very same backend
 /// (the same registry entry, not merely equal-looking names, which may differ
-/// in bucket case or credentials), a `file` copy (`object_store` makes it a hard
+/// in bucket case or credentials) and the destination backend does not
+/// accept the source's ([`Backend::copies_from`]) or cannot copy it
+/// ([`Backend::copy_from`]), a `file` copy (`object_store` makes it a hard
 /// link, so file copies always stream through the private-staging writer), a
-/// `file` rename crossed devices, or an S3 source is too large for one
-/// `CopyObject`. `size` is the source size when the caller knows it; S3 looks
+/// `file` rename crossed devices, an S3 source is too large for one
+/// `CopyObject`, or an http(s) destination already exists. `size` is the source
+/// size when the caller knows it; S3 looks
 /// it up otherwise.
 ///
-/// A `file` move is an atomic rename. Every other move is a copy followed by
+/// A `file` move is an atomic rename when both ends are regular files or
+/// symlinks (see [`plain_rename`]); the file keeps its inode and its mode. The
+/// check and the rename are not atomic together. Every other move is a copy followed by
 /// a delete that happens only if the source is still what was copied
 /// ([`delete_unchanged_source`]), because `object_store`'s default rename
 /// deletes unconditionally.
@@ -399,7 +613,9 @@ pub(crate) async fn server_side_copy(
     delete_source: bool,
     size: Option<u64>,
 ) -> Result<bool> {
-    if !Arc::ptr_eq(&src.backend, &dst.backend) {
+    // Two backends of one provider may still copy server-side across buckets.
+    let same_backend = Arc::ptr_eq(&src.backend, &dst.backend);
+    if !same_backend && !dst.backend.copies_from(src.backend.as_ref()) {
         return Ok(false);
     }
     let store = src.backend.store();
@@ -407,6 +623,17 @@ pub(crate) async fn server_side_copy(
     if scheme == "file" {
         if !delete_source {
             return Ok(false);
+        }
+        if let (Some(from), Some(to)) = (
+            src.backend.local_path(&src.loc.path)?,
+            dst.backend.local_path(&dst.loc.path)?,
+        ) {
+            let plain = tokio::task::spawn_blocking(move || plain_rename(&from, &to))
+                .await
+                .map_err(|e| Error::Generic(format!("Local stat task failed: {e}")))?;
+            if !plain {
+                return Ok(false);
+            }
         }
         return match store.rename(&src.loc.path, &dst.loc.path).await {
             Ok(()) => Ok(true),
@@ -419,18 +646,66 @@ pub(crate) async fn server_side_copy(
     } else {
         None
     };
+    let mut looked_up = None;
     if scheme == "s3" {
         let known = match (size, &before) {
             (Some(size), _) => size,
             (None, Some(meta)) => meta.size,
-            (None, None) => store.head(&src.loc.path).await?.size,
+            (None, None) => {
+                let meta = store.head(&src.loc.path).await?;
+                let size = meta.size;
+                looked_up = Some(meta);
+                size
+            }
         };
         if known > S3_MAX_COPY_SOURCE {
             return Ok(false);
         }
     }
-    store.copy(&src.loc.path, &dst.loc.path).await?;
+    if !same_backend {
+        let known = before.as_ref().or(looked_up.as_ref());
+        let copied = dst
+            .backend
+            .copy_from(src.backend.as_ref(), &src.loc.path, &dst.loc.path, known)
+            .await;
+        match copied {
+            Ok(true) => {}
+            Ok(false) => return Ok(false),
+            Err(Error::SourceChanged { .. }) => {
+                return Err(Error::SourceChanged {
+                    url: redacted(&src.loc.url),
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    } else if matches!(scheme, "http" | "https") {
+        // A WebDAV COPY without `Overwrite: F` replaces the destination,
+        // and a collection there is deleted with all its members. Overwriting
+        // an existing file is left to a streamed PUT, which a server refuses
+        // on a collection.
+        match store.copy_if_not_exists(&src.loc.path, &dst.loc.path).await {
+            Ok(()) => {}
+            Err(object_store::Error::AlreadyExists { .. }) => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        store.copy(&src.loc.path, &dst.loc.path).await?;
+    }
+    dst.backend.finish_copy(&dst.loc.path).await?;
     if let Some(before) = before {
+        if !same_backend {
+            // A second guard before the source goes: the destination must
+            // exist and be as large as the source that was read.
+            let written = dst.backend.store().head(&dst.loc.path).await?;
+            if written.size != before.size {
+                return Err(Error::Generic(format!(
+                    "The copy to {} has {} bytes, the source {}; the source was kept",
+                    redacted(&dst.loc.url),
+                    written.size,
+                    before.size
+                )));
+            }
+        }
         delete_unchanged_source(src, &before).await?;
     }
     Ok(true)
@@ -470,8 +745,8 @@ mod tests {
         Location { url, path }
     }
 
-    #[test]
-    fn file_urls_are_the_same_store_whatever_the_host() {
+    #[tokio::test]
+    async fn file_urls_are_the_same_store_whatever_the_host() {
         // `same_object` stats file paths: keep them in a private tempdir.
         let tmp = tempfile::tempdir().expect("tempdir");
         let file = |name: &str| {
@@ -481,10 +756,10 @@ mod tests {
         };
         let x = file("x");
         let (a, b) = (at(&x), at(&x.replacen("file://", "file://127.0.0.1", 1)));
-        assert!(same_object(&a, &b));
-        assert!(!same_object(&a, &at(&file("y"))));
-        assert!(!same_object(&at("s3://one/x"), &at("s3://two/x")));
-        assert!(same_object(&at("s3://one/x"), &at("s3://one/x")));
+        assert!(same_object(&a, &b).await);
+        assert!(!same_object(&a, &at(&file("y"))).await);
+        assert!(!same_object(&at("s3://one/x"), &at("s3://two/x")).await);
+        assert!(same_object(&at("s3://one/x"), &at("s3://one/x")).await);
         assert!(!same_store(
             &Url::parse("s3://b/x").expect("url"),
             &Url::parse("gs://b/x").expect("url")
@@ -514,6 +789,44 @@ mod tests {
             .await
             .expect("bytes");
         assert_eq!(got.as_ref(), b"abcd");
+    }
+
+    /// A streamed result that declares `declared` bytes and sends `chunks`.
+    fn declared_result(declared: u64, chunks: Vec<Bytes>) -> GetResult {
+        let chunks: Vec<object_store::Result<Bytes>> = chunks.into_iter().map(Ok).collect();
+        GetResult {
+            payload: GetResultPayload::Stream(futures::stream::iter(chunks).boxed()),
+            meta: ObjectMeta {
+                location: ObjectPath::from("a"),
+                last_modified: chrono::DateTime::UNIX_EPOCH,
+                size: declared,
+                e_tag: None,
+                version: None,
+            },
+            range: 0..declared,
+            attributes: object_store::Attributes::new(),
+            extensions: http::Extensions::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_bytes_of_an_honest_length_holds_no_spare_capacity() {
+        let chunk = Bytes::from(vec![7_u8; 64 * 1024]);
+        let total = 20 << 20;
+        let count = total / chunk.len();
+        for declared in [total as u64, total as u64 / 2, 1] {
+            let result = declared_result(declared, vec![chunk.clone(); count]);
+            let got = Plain
+                .get_bytes(&at("test://b/a"), result)
+                .await
+                .expect("bytes");
+            assert_eq!(got.len(), total);
+            // Only a declared length that was true ends with an exact fit.
+            let spare = got.try_into_mut().expect("unique").capacity() - total;
+            if declared == total as u64 {
+                assert_eq!(spare, 0);
+            }
+        }
     }
 
     fn store_eq(a: &str, b: &str) -> bool {
@@ -546,25 +859,25 @@ mod tests {
         assert!(!store_eq("s3://one/x", "s3://two/x"));
     }
 
-    #[test]
-    fn aliased_urls_name_the_same_object() {
-        assert!(same_object(&at("gs://b/x"), &at("gcs://b/x")));
-        assert!(!same_object(&at("gs://b/x"), &at("gcs://b/y")));
+    #[tokio::test]
+    async fn aliased_urls_name_the_same_object() {
+        assert!(same_object(&at("gs://b/x"), &at("gcs://b/x")).await);
+        assert!(!same_object(&at("gs://b/x"), &at("gcs://b/y")).await);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn file_paths_through_a_symlink_are_the_same_object() {
+    #[tokio::test]
+    async fn file_paths_through_a_symlink_are_the_same_object() {
         let dir = tempfile::tempdir().expect("tempdir");
         let real = dir.path().join("real");
         std::fs::create_dir(&real).expect("mkdir");
         std::os::unix::fs::symlink(&real, dir.path().join("link")).expect("symlink");
         std::fs::write(real.join("a"), b"x").expect("write");
         let url = |p: &str| format!("file://{}/{p}", dir.path().display());
-        assert!(same_object(&at(&url("link/a")), &at(&url("real/a"))));
+        assert!(same_object(&at(&url("link/a")), &at(&url("real/a"))).await);
         // The destination must exist to be the same file.
-        assert!(!same_object(&at(&url("link/a")), &at(&url("real/b"))));
-        assert!(!same_object(&at(&url("link/missing")), &at(&url("real/b"))));
+        assert!(!same_object(&at(&url("link/a")), &at(&url("real/b"))).await);
+        assert!(!same_object(&at(&url("link/missing")), &at(&url("real/b"))).await);
     }
 
     use crate::codec::sealed::CodecImpl as _;
@@ -650,6 +963,45 @@ mod tests {
         assert!(other_store.head(&ObjectPath::from("c")).await.is_err());
     }
 
+    /// A same-origin http copy sends `Overwrite: F`, so a server never
+    /// replaces a destination collection; a 412 means the destination exists
+    /// and the caller must stream.
+    #[tokio::test]
+    async fn http_copy_never_overwrites_and_streams_onto_an_existing_destination() {
+        use crate::backend::stub::{Reply, serve};
+        let stub = serve(vec![Reply::new(201, ""), Reply::new(412, "")]).await;
+        let url = Url::parse(&format!("{}/a", stub.base)).expect("url");
+        let backend = crate::backend::build(
+            &url,
+            &crate::backend::Vars::Env,
+            None,
+            &crate::backend::Shared::default(),
+        )
+        .expect("backend");
+        let (src, dst) = (
+            resolved(&backend, &format!("{}/a", stub.base)),
+            resolved(&backend, &format!("{}/b", stub.base)),
+        );
+        assert!(
+            server_side_copy(&src, &dst, false, None)
+                .await
+                .expect("copy")
+        );
+        assert!(
+            !server_side_copy(&src, &dst, false, None)
+                .await
+                .expect("exists")
+        );
+        let requests = stub.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.line, "COPY /a HTTP/1.1");
+            let headers = request.headers.to_ascii_lowercase();
+            assert!(headers.contains("overwrite: f"), "{headers}");
+            assert!(headers.contains("destination: "), "{headers}");
+        }
+    }
+
     #[tokio::test]
     async fn plain_copy_between_backends_with_equal_names_streams() {
         let (store, one) = memory_backend();
@@ -684,6 +1036,7 @@ mod tests {
         inner: InMemory,
         heads: std::sync::atomic::AtomicUsize,
         copies: std::sync::atomic::AtomicUsize,
+        ranges: std::sync::Mutex<Vec<Option<object_store::GetRange>>>,
         after_copy: AfterCopy,
     }
 
@@ -693,74 +1046,44 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl object_store::ObjectStore for Spy {
-        async fn put_opts(
-            &self,
-            location: &ObjectPath,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &ObjectPath,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &ObjectPath,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            if options.head {
-                self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
-        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&ObjectPath>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.inner.list(prefix)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&ObjectPath>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &ObjectPath,
-            to: &ObjectPath,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.copies
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.copy_opts(from, to, options).await?;
-            match self.after_copy {
-                AfterCopy::Nothing => {}
-                AfterCopy::Rewrite => {
-                    self.inner.put(from, "newer bytes".into()).await?;
+    forward_object_store! {
+        impl ObjectStore for Spy => inner;
+        forward [put_opts, put_multipart_opts, delete_stream, list, list_with_delimiter];
+        {
+            async fn get_opts(
+                &self,
+                location: &ObjectPath,
+                options: GetOptions,
+            ) -> object_store::Result<GetResult> {
+                if options.head {
+                    self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    self.ranges
+                        .lock()
+                        .expect("ranges")
+                        .push(options.range.clone());
                 }
-                AfterCopy::Delete => self.inner.delete(from).await?,
+                self.inner.get_opts(location, options).await
             }
-            Ok(())
+
+            async fn copy_opts(
+                &self,
+                from: &ObjectPath,
+                to: &ObjectPath,
+                options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                self.copies
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.copy_opts(from, to, options).await?;
+                match self.after_copy {
+                    AfterCopy::Nothing => {}
+                    AfterCopy::Rewrite => {
+                        self.inner.put(from, "newer bytes".into()).await?;
+                    }
+                    AfterCopy::Delete => self.inner.delete(from).await?,
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1062,5 +1385,191 @@ mod tests {
             e.to_string(),
             "source changed during move; it was not deleted: http://h/a"
         );
+    }
+
+    /// Puts `bytes` at `a` of a fresh counting store.
+    async fn spy_with(bytes: Bytes) -> (Arc<Spy>, Arc<dyn Backend>) {
+        let (spy, backend) = spy_backend(AfterCopy::Nothing).await;
+        spy.inner
+            .put(&ObjectPath::from("a"), bytes.into())
+            .await
+            .expect("put");
+        (spy, backend)
+    }
+
+    /// A plain copy, then a plain move, of `a` to `c` in one store.
+    async fn plain_copies(spy: &Spy, backend: &Arc<dyn Backend>) -> Vec<Result<()>> {
+        let (src, dst) = (resolved(backend, "s3://b/a"), resolved(backend, "s3://b/c"));
+        let mut out = Vec::new();
+        for delete in [false, true] {
+            let result = Plain.copy(&src, &dst, delete).await;
+            if result.is_ok() && !delete {
+                spy.inner.delete(&ObjectPath::from("c")).await.expect("rm");
+            }
+            out.push(result);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_plain_object_copies_server_side() {
+        let (spy, backend) = spy_backend(AfterCopy::Nothing).await;
+        for result in plain_copies(&spy, &backend).await {
+            result.expect("copied");
+        }
+        assert_eq!(Spy::count(&spy.copies), 2);
+        // A source starting like a message but too short to be one is plain.
+        let (spy, backend) = spy_with(Bytes::from_static(&[0x02, 0x04])).await;
+        for result in plain_copies(&spy, &backend).await {
+            result.expect("copied");
+        }
+        // The empty object is plain too.
+        let (spy, backend) = spy_with(Bytes::new()).await;
+        for result in plain_copies(&spy, &backend).await {
+            result.expect("copied");
+        }
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    #[tokio::test]
+    async fn without_the_feature_the_prefix_alone_blocks_a_copy_to_another_name() {
+        let message = Bytes::from_static(&[0x02, 0x04, 0x78, 0, 0, 0]);
+        let (spy, backend) = spy_with(message).await;
+        for result in plain_copies(&spy, &backend).await {
+            let err = result.expect_err("refused");
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        }
+        assert_eq!(Spy::count(&spy.copies), 0);
+        assert!(spy.inner.head(&ObjectPath::from("c")).await.is_err());
+        assert!(spy.inner.head(&ObjectPath::from("a")).await.is_ok());
+
+        // The same name in another store stays copyable, and so does an object
+        // that only starts with two of the three bytes.
+        let (other, other_backend) = memory_backend();
+        let (src, dst) = (
+            resolved(&backend, "s3://one/a"),
+            resolved(&other_backend, "s3://two/a"),
+        );
+        Plain.copy(&src, &dst, false).await.expect("same name");
+        assert!(other.head(&ObjectPath::from("a")).await.is_ok());
+        let (spy, backend) = spy_with(Bytes::from_static(&[0x02, 0x04, 0x79])).await;
+        for result in plain_copies(&spy, &backend).await {
+            result.expect("copied");
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    mod encrypted {
+        use super::*;
+        use crate::encryption::keys::Keyring;
+        use crate::encryption::{EncryptionConfig, Envelope};
+
+        fn envelope(bind: bool) -> Envelope {
+            let ring = Keyring::from_material("kek-1", &[("kek-1", &[7; 32])]);
+            Envelope::new(EncryptionConfig::new(Arc::new(ring)).bind_object_key(bind))
+        }
+
+        async fn message(env: &Envelope, name: &str) -> Bytes {
+            env.encode(
+                &at(&format!("s3://b/{name}")),
+                &CallerContext::new(),
+                Bytes::from_static(b"payload"),
+            )
+            .await
+            .expect("encode")
+        }
+
+        #[tokio::test]
+        async fn a_bound_object_is_not_copied_or_moved_to_another_name() {
+            let bytes = message(&envelope(true), "a").await;
+            let (spy, backend) = spy_with(bytes.clone()).await;
+            for result in plain_copies(&spy, &backend).await {
+                let err = result.expect_err("refused");
+                assert!(
+                    matches!(&err, Error::InvalidInput(m) if m.contains("bound")),
+                    "{err:?}"
+                );
+            }
+            assert_eq!(Spy::count(&spy.copies), 0);
+            assert!(spy.inner.head(&ObjectPath::from("c")).await.is_err());
+            let kept = spy.inner.get(&ObjectPath::from("a")).await.expect("kept");
+            assert_eq!(kept.bytes().await.expect("bytes"), bytes);
+        }
+
+        #[tokio::test]
+        async fn the_copy_guard_reads_1_kib_and_more_only_for_a_large_header() {
+            use object_store::GetRange::Bounded;
+            let env = envelope(false);
+            let max = crate::encryption::DecodeLimits::default().max_header_len as u64;
+            let ctx = CallerContext::from([("big".to_owned(), "x".repeat(6000))]);
+            for (ctx, want) in [
+                (CallerContext::new(), vec![Some(Bounded(0..1024))]),
+                (ctx, vec![Some(Bounded(0..1024)), Some(Bounded(0..max))]),
+            ] {
+                let bytes = env
+                    .encode(&at("s3://b/a"), &ctx, Bytes::from_static(b"payload"))
+                    .await
+                    .expect("encode");
+                let (spy, backend) = spy_with(bytes).await;
+                let (s, d) = (
+                    resolved(&backend, "s3://b/a"),
+                    resolved(&backend, "s3://b/c"),
+                );
+                Plain.copy(&s, &d, false).await.expect("copied");
+                assert_eq!(*spy.ranges.lock().expect("ranges"), want);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_bound_object_copies_under_its_own_name_to_another_store() {
+            let env = envelope(true);
+            let bytes = message(&env, "a").await;
+            let (spy, backend) = spy_with(bytes).await;
+            let (other, other_backend) = memory_backend();
+            let (src, dst) = (
+                resolved(&backend, "s3://one/a"),
+                resolved(&other_backend, "s3://two/a"),
+            );
+            Plain.copy(&src, &dst, true).await.expect("move");
+            assert!(spy.inner.head(&ObjectPath::from("a")).await.is_err());
+            let got = other.get(&ObjectPath::from("a")).await.expect("get");
+            let plain = env.get_bytes(&dst.loc, got).await.expect("decrypt");
+            assert_eq!(plain.as_ref(), b"payload");
+        }
+
+        #[tokio::test]
+        async fn an_unbound_object_copies_to_another_name() {
+            let env = envelope(false);
+            let (spy, backend) = spy_with(message(&env, "a").await).await;
+            for result in plain_copies(&spy, &backend).await {
+                result.expect("copied");
+            }
+            assert_eq!(Spy::count(&spy.copies), 2);
+        }
+
+        #[tokio::test]
+        async fn a_header_that_starts_like_ours_but_does_not_parse_is_refused() {
+            let good = message(&envelope(true), "a").await;
+            let truncated = good.slice(..40);
+            let garbage = Bytes::from_static(&[0x02, 0x04, 0x78, 0xff, 0xff, 0xff, 0xff]);
+            for damaged in [truncated, garbage] {
+                let (spy, backend) = spy_with(damaged).await;
+                for result in plain_copies(&spy, &backend).await {
+                    let err = result.expect_err("refused");
+                    assert!(
+                        matches!(&err, Error::InvalidInput(m) if m.contains("looks encrypted")),
+                        "{err:?}"
+                    );
+                }
+                assert_eq!(Spy::count(&spy.copies), 0);
+                assert!(spy.inner.head(&ObjectPath::from("c")).await.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn the_message_prefix_matches_the_format() {
+            let bytes = message(&envelope(true), "a").await;
+            assert!(bytes.starts_with(&OSC_PREFIX));
+        }
     }
 }

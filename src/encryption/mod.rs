@@ -19,11 +19,11 @@ pub(crate) mod suite;
 #[cfg(test)]
 mod tamper_tests;
 
-pub use context::{CallerContext, EncryptionContext};
+pub use context::CallerContext;
 pub use envelope::{EncryptionConfig, Envelope};
-pub use header::{DecodeLimits, EncryptedDataKey, FormatError};
+pub use header::{DecodeLimits, FormatError};
 pub use keys::{
-    DataKey, KeyInfo, Keyring, KeyringStatus, activate_key, add_key, new_keyring, retire_key,
-    rotate_keyring,
+    KeyInfo, Keyring, KeyringStatus, activate_key, add_key, add_key_with_id, new_keyring,
+    retire_key, rotate_keyring,
 };
 pub use suite::DecryptError;

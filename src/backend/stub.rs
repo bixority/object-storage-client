@@ -11,6 +11,20 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// A client for the stubs: it ignores the proxy variables.
+pub fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client")
+}
+
+/// A loopback port nothing listens on.
+pub fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("addr").port()
+}
+
 /// A canned response.
 pub struct Reply {
     status: u16,
@@ -120,6 +134,26 @@ async fn read_request(conn: &mut tokio::net::TcpStream) -> Request {
         headers: headers.trim_end().to_owned(),
         body: buf[split..split + length].to_vec(),
     }
+}
+
+/// Starts a stub that answers its first connection with `200` and a
+/// `Content-Length` of 1 MiB, sends `prefix` and then drops the connection, so
+/// the body ends early.
+pub async fn serve_cut(prefix: String) -> Stub {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.expect("accept");
+        let request = read_request(&mut conn).await;
+        seen.lock().expect("lock").push(request);
+        let head = "HTTP/1.1 200 Stub\r\nContent-Length: 1048576\r\n\r\n";
+        let _ = conn.write_all(head.as_bytes()).await;
+        let _ = conn.write_all(prefix.as_bytes()).await;
+        let _ = conn.shutdown().await;
+    });
+    Stub { base, requests }
 }
 
 /// The bytes [`serve_slow`] sends per chunk.

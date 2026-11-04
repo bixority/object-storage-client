@@ -29,13 +29,15 @@ Repository = "https://github.com/bixority/object-storage-client"
 Documentation = "https://github.com/bixority/object-storage-client/blob/main/README.md"
 
 [tool.maturin]
+# Explicit: with a [[bin]] target and no cdylib in [lib], maturin would guess bin bindings.
+bindings = "pyo3"
 no-default-features = true
-features = ["python", "encryption"]
+features = ["python"]
 python-source = "python"
 module-name = "object_storage_client._object_storage_client"
 
 [dependency-groups]
-dev = ["maturin>=1.15,<2", "pytest>=8", "pytest-asyncio>=0.24", "testcontainers>=4.15"]
+dev = ["maturin>=1.15,<2", "pytest>=8", "pytest-asyncio>=0.24", "testcontainers>=4.15", "ruff", "ty", "pyright"]
 oracle = ["aws-encryption-sdk>=4,<5"]
 
 [tool.pytest.ini_options]
@@ -46,3 +48,14 @@ markers = [
     "integration: needs a container runtime (docker or podman)",
     "large: 4 GiB round trips; local only",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# These tests stall the event loop with time.sleep on purpose.
+"tests/python/test_plain_client.py" = ["ASYNC251"]
+
+[[tool.ty.overrides]]
+# The native module is compiled and has no source ty can read.
+include = ["python/object_storage_client/__init__.py"]
+
+[tool.ty.overrides.rules]
+unresolved-import = "ignore"

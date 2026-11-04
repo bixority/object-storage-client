@@ -18,10 +18,8 @@ use args::Args;
 use location::Location;
 use model::{AppState, Encryption};
 use startup::Opened;
-use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use worker::Repaint;
 
@@ -32,7 +30,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// client or the window could not be opened.
 #[must_use]
 pub fn run(args: Args) -> ExitCode {
-    let runtime = match build_runtime() {
+    let runtime = match crate::cli::build_runtime() {
         Ok(runtime) => runtime,
         Err(err) => {
             return startup_error(&format!("failed to start the async runtime: {err}"));
@@ -82,21 +80,6 @@ pub fn run(args: Args) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// The multi-thread runtime, with `osc`'s worker count rule.
-fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-    builder.enable_all();
-    // As `osc`: an explicit TOKIO_WORKER_THREADS still wins.
-    if env::var_os("TOKIO_WORKER_THREADS").is_none() {
-        builder.worker_threads(
-            thread::available_parallelism()
-                .map_or(1, usize::from)
-                .min(4),
-        );
-    }
-    builder.build()
 }
 
 /// A panel's first folder: `arg`, or the current directory with the parse

@@ -6,7 +6,6 @@ import asyncio
 import weakref
 from typing import Any
 
-
 # Cap on the items one batch pulls, for sources that yield tiny chunks.
 _BATCH_ITEMS = 1024
 
@@ -65,10 +64,10 @@ class _Stream:
       failure.
     """
 
-    __slots__ = ("_raw", "_owner")
+    __slots__ = ("_owner", "_raw")
 
     def __init__(self, raw: Any) -> None:
-        self._raw = raw
+        self._raw: Any = raw
         # Token of the pending read: a one-element list holding a weak
         # reference to the loop it runs on (a fresh list per read, because
         # CPython reuses weakref objects).
@@ -152,10 +151,25 @@ class ByteStream(_Stream):
         async for chunk in stream:
             process(chunk)
 
-    Reads follow the rules of ``_Stream`` (see the type stub).
+    Reads follow the rules of ``_Stream`` (see the type stub). A ``ByteStream``
+    passed to ``put_object_stream`` is consumed and closed.
     """
 
     __slots__ = ()
+
+    def _detach_native(self) -> Any:
+        """Hand the native stream to ``put_object_stream`` and close this one.
+
+        Runs the checks of a read: a closed stream, or a read pending on a
+        running loop, raises ``RuntimeError``. The native stream keeps any
+        chunks parked by an earlier cancelled read, so the upload gets exactly
+        the bytes not read yet.
+        """
+        if self._raw is None:
+            raise RuntimeError(f"{type(self).__name__} is closed")
+        self._check_idle()
+        raw, self._raw, self._owner = self._raw, None, None
+        return raw
 
     async def __anext__(self) -> bytes:
         chunk = await self._read()

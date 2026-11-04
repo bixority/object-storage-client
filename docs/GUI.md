@@ -16,8 +16,9 @@ cargo install object-storage-client --registry bixority --features gui
 # or, from a checkout: cargo install --path . --features gui
 ```
 
-This installs `osc` and `osc-gui`. Linux needs no extra system packages: the
-window opens on X11 or Wayland, whichever is running.
+This installs `osc` and `osc-gui`. On Linux the window needs a Wayland session;
+X11 (including `ssh -X` forwarding) is not supported. Use waypipe to run it
+remotely. No extra system packages are needed.
 
 ## Launch
 
@@ -77,10 +78,24 @@ and Shift-click select entries; double-click opens a folder.
 ## Operations
 
 - **Folders are handled recursively.** Copying, moving, renaming or deleting a
-  folder works on every object under it.
+  folder works on every object under it, except console folder markers (see
+  below). A zero-size entry that is listed but cannot be read, such as a
+  console folder marker below the folder, is skipped without a failure.
+- **Symlinks are shown as links and acted on as links.** A local symlink is
+  listed with a link mark (🔗), never as a folder or an object, and Enter or a
+  double-click does not open it. Delete removes only the link. Rename renames
+  the link. Move to a local folder renames the link; if that folder is on
+  another file system, it fails with "symbolic link skipped (other file
+  system)". Copy, and Move to any other store, fail with "symbolic link
+  skipped". Links inside a folder are skipped when the folder is copied, moved
+  or renamed, and never followed. See "Listing" in BEHAVIOR.md for the limit of
+  this check.
 - **One operation runs at a time.** You can keep browsing while it runs. The
   status bar shows how far it got, and Cancel stops it. Objects already done
   stay done.
+- **Jobs run 4 items at a time.** Objects selected for deletion on a bucket
+  store are deleted in batches instead; the count then advances in bursts, and
+  Cancel can leave a batch partly applied.
 - **A failure does not stop the job.** At the end, a list of the failed items
   and their errors is shown, and it can be copied.
 - **Existing destinations are checked first**, for up to 1,000 items: one
@@ -92,13 +107,25 @@ and Shift-click select entries; double-click opens a folder.
   already is in.
 - **Empty directories can stay behind.** Moving or deleting a local folder can
   leave empty directories behind, as deleting a prefix with the client does.
+- **Console-created cloud folders can stay listed.** The S3 and GCS consoles
+  and MinIO make a folder as a zero-byte `name/` key, which object_store cannot
+  address. After a delete, move or rename the folder (and any such subfolders)
+  stays listed, though the job reports success. Remove those keys with the
+  provider's tools. See "Deleting by prefix" in BEHAVIOR.md.
 
 ## Limits
 
 - Listings load 1,000 entries per page; **Load more** fetches the next page. A
   panel holds at most 50,000 entries. Past that, a banner says the listing is
   incomplete; open a deeper folder to see the rest.
+- Copying, moving or renaming folders plans at most 1,000,000 objects in all.
+  A larger job fails before anything runs; select a deeper folder.
 - Local folders and `http(s)://` listings arrive in one page.
+- After a job, only the panels it can have changed are listed again: a copy
+  changes its destination folder, a move its source and destination, a rename
+  or delete its source. A panel inside or above such a folder is refreshed and
+  starts again at the first page; the other keeps its loaded pages, selection
+  and cursor.
 - Sizes of encrypted objects are their stored sizes, as in `osc ls`.
 - Nothing is saved between runs: no settings, history or credentials.
 

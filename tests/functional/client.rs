@@ -6,6 +6,18 @@ use std::time::Duration;
 use tempfile::tempdir;
 use url::Url;
 
+/// An S3 client with static keys whose endpoint refuses connections: it signs
+/// offline, and a request that escapes an input check fails to connect.
+fn offline_s3_client() -> ObjectStorageClient {
+    ObjectStorageClient::with_vars(HashMap::from([
+        ("S3_ENDPOINT".into(), "http://127.0.0.1:1".into()),
+        ("S3_REGION".into(), "us-east-1".into()),
+        ("S3_ACCESS_KEY_ID".into(), "AKIDEXAMPLE".into()),
+        ("S3_SECRET_ACCESS_KEY".into(), "secret".into()),
+        ("S3_ALLOW_HTTP".into(), "true".into()),
+    ]))
+}
+
 #[tokio::test]
 async fn test_create_bucket_unsupported_scheme() {
     let client = ObjectStorageClient::new();
@@ -160,145 +172,11 @@ async fn test_concurrent_first_use_builds_one_backend() -> Result<()> {
     Ok(())
 }
 
-/// A tiny in-memory HTTP object server (GET, HEAD, PUT, DELETE) for tests of
-/// aliased origins: `127.0.0.1` and `localhost` reach the same server.
-pub mod mini_http {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpListener;
-
-    type Objects = Arc<Mutex<HashMap<String, (Vec<u8>, u64)>>>;
-
-    pub struct Server {
-        pub port: u16,
-        objects: Objects,
-    }
-
-    impl Server {
-        pub async fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-            let port = listener.local_addr().expect("addr").port();
-            let objects = Objects::default();
-            let shared = Arc::clone(&objects);
-            tokio::spawn(async move {
-                let version = Arc::new(AtomicU64::new(0));
-                loop {
-                    let Ok((sock, _)) = listener.accept().await else {
-                        return;
-                    };
-                    tokio::spawn(serve(sock, Arc::clone(&shared), Arc::clone(&version)));
-                }
-            });
-            Self { port, objects }
-        }
-
-        pub fn contents(&self, path: &str) -> Option<Vec<u8>> {
-            let objects = self.objects.lock().expect("lock");
-            objects.get(path).map(|(body, _)| body.clone())
-        }
-    }
-
-    async fn serve(sock: tokio::net::TcpStream, objects: Objects, version: Arc<AtomicU64>) {
-        let (read, mut write) = sock.into_split();
-        let mut read = BufReader::new(read);
-        loop {
-            let mut request = String::new();
-            if read.read_line(&mut request).await.unwrap_or(0) == 0 {
-                return;
-            }
-            let mut parts = request.split_whitespace();
-            let (method, path) = (
-                parts.next().unwrap_or_default().to_owned(),
-                parts.next().unwrap_or_default().to_owned(),
-            );
-            let mut length = 0usize;
-            let mut range: Option<(usize, usize)> = None;
-            loop {
-                let mut line = String::new();
-                if read.read_line(&mut line).await.unwrap_or(0) == 0 {
-                    return;
-                }
-                if line.trim().is_empty() {
-                    break;
-                }
-                if let Some((name, value)) = line.split_once(':') {
-                    if name.eq_ignore_ascii_case("content-length") {
-                        length = value.trim().parse().unwrap_or(0);
-                    } else if name.eq_ignore_ascii_case("range") {
-                        // Only `bytes=a-b` is understood.
-                        range = value
-                            .trim()
-                            .strip_prefix("bytes=")
-                            .and_then(|r| r.split_once('-'))
-                            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
-                    }
-                }
-            }
-            let mut body = vec![0u8; length];
-            if read.read_exact(&mut body).await.is_err() {
-                return;
-            }
-            let reply = {
-                let mut objects = objects.lock().expect("lock");
-                match method.as_str() {
-                    "PUT" => {
-                        let v = version.fetch_add(1, Ordering::SeqCst) + 1;
-                        objects.insert(path, (body, v));
-                        b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_vec()
-                    }
-                    "DELETE" => {
-                        objects.remove(&path);
-                        b"HTTP/1.1 204 No Content\r\n\r\n".to_vec()
-                    }
-                    "GET" | "HEAD" => match objects.get(&path) {
-                        Some((data, v)) if method == "GET" && range.is_some() => {
-                            let (from, to) = range.unwrap_or_default();
-                            let from = from.min(data.len());
-                            let to = to.min(data.len().saturating_sub(1)) + 1;
-                            let part = &data[from..to.max(from)];
-                            let mut head = format!(
-                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
-                                 Content-Range: bytes {from}-{}/{}\r\nETag: \"v{v}\"\r\n\
-                                 Last-Modified: Tue, 01 Jan 2030 00:00:00 GMT\r\n\r\n",
-                                part.len(),
-                                to.max(from + 1) - 1,
-                                data.len()
-                            )
-                            .into_bytes();
-                            head.extend_from_slice(part);
-                            head
-                        }
-                        Some((data, v)) => {
-                            let mut head = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v{v}\"\r\n\
-                                 Last-Modified: Tue, 01 Jan 2030 00:00:00 GMT\r\n\r\n",
-                                data.len()
-                            )
-                            .into_bytes();
-                            if method == "GET" {
-                                head.extend_from_slice(data);
-                            }
-                            head
-                        }
-                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
-                    },
-                    _ => b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n".to_vec(),
-                }
-            };
-            if write.write_all(&reply).await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
 /// Two names of one origin cannot be told apart by URL; the move streams the
 /// object onto itself and must then keep it, and say so.
 #[tokio::test]
 async fn move_between_two_names_of_one_origin_keeps_the_object() -> Result<()> {
-    let server = mini_http::Server::start().await;
+    let server = crate::support::mini_http::Server::start().await;
     let client = ObjectStorageClient::new();
     let (ip, name) = (
         format!("http://127.0.0.1:{}/x", server.port),
@@ -320,8 +198,8 @@ async fn move_between_two_names_of_one_origin_keeps_the_object() -> Result<()> {
 #[tokio::test]
 async fn move_between_origins_deletes_the_source() -> Result<()> {
     let (one, two) = (
-        mini_http::Server::start().await,
-        mini_http::Server::start().await,
+        crate::support::mini_http::Server::start().await,
+        crate::support::mini_http::Server::start().await,
     );
     let client = ObjectStorageClient::new();
     let (from, to) = (
@@ -462,13 +340,7 @@ mod url_input {
     /// An S3 client whose endpoint refuses connections: a request that escapes
     /// the input check fails to connect and can never yield `InvalidInput`.
     fn client() -> ObjectStorageClient {
-        ObjectStorageClient::with_vars(HashMap::from([
-            ("S3_ENDPOINT".into(), "http://127.0.0.1:1".into()),
-            ("S3_REGION".into(), "us-east-1".into()),
-            ("S3_ACCESS_KEY_ID".into(), "AKIDEXAMPLE".into()),
-            ("S3_SECRET_ACCESS_KEY".into(), "secret".into()),
-            ("S3_ALLOW_HTTP".into(), "true".into()),
-        ]))
+        super::offline_s3_client()
     }
 
     fn assert_invalid<T: std::fmt::Debug>(what: &str, result: Result<T>) {
@@ -599,6 +471,41 @@ mod url_input {
         }
     }
 
+    /// A URL without `//` is still a URL: the parser rewrites it the same way.
+    #[tokio::test]
+    async fn urls_written_without_slashes_are_checked_too() {
+        let client = client();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().display();
+        for prefix in [
+            format!("file:{root}/u/.\t."),
+            format!("file:{root}/u/.. "),
+            format!("file:{root}/u/../x"),
+            "http:127.0.0.1:1/a/.\t./b".to_owned(),
+        ] {
+            assert_invalid(&prefix, client.delete_by_prefix(&prefix).await);
+        }
+        let put = format!("file:{root}/a\tb");
+        assert_invalid("put", client.put(&put, &b"x"[..]).await);
+        assert!(!tmp.path().join("ab").exists());
+        assert_invalid("get", client.get("http:127.0.0.1:1/a/.\t./b").await);
+        assert_invalid("slash only", client.get("s3:/\t/b/k").await);
+        assert_invalid(
+            "backslashes",
+            client.get("http:\\\\127.0.0.1:1\\a\\..\\b").await,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_file_name_with_surrounding_whitespace_is_accepted() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join(" a b ");
+        let path = path.to_str().expect("utf-8");
+        let client = client();
+        client.put(path, &b"x"[..]).await.expect("put");
+        assert_eq!(client.get(path).await.expect("get").as_ref(), b"x");
+    }
+
     #[tokio::test]
     async fn ordinary_keys_still_reach_the_store() {
         let client = client();
@@ -627,17 +534,8 @@ mod url_input {
 
 mod presign_input {
     use super::*;
-    use std::collections::HashMap;
-
-    /// An S3 client that signs offline: nothing here sends a request.
     fn s3_client() -> ObjectStorageClient {
-        ObjectStorageClient::with_vars(HashMap::from([
-            ("S3_ENDPOINT".into(), "http://127.0.0.1:1".into()),
-            ("S3_REGION".into(), "us-east-1".into()),
-            ("S3_ACCESS_KEY_ID".into(), "AKIDEXAMPLE".into()),
-            ("S3_SECRET_ACCESS_KEY".into(), "secret".into()),
-            ("S3_ALLOW_HTTP".into(), "true".into()),
-        ]))
+        super::offline_s3_client()
     }
 
     async fn sign(url: &str) -> Result<String> {
@@ -957,7 +855,8 @@ mod modes {
             .await
             .expect("send");
         let staging = dir.path().join("obj#1");
-        wait_for(|| fs::metadata(&staging).is_ok_and(|m| m.len() == 6)).await;
+        // The bytes sit in a write buffer until the end; the file is private from creation.
+        wait_for(|| fs::metadata(&staging).is_ok()).await;
         assert_eq!(mode(&staging), 0o600);
         assert!(!dest.exists());
         drop(tx);
@@ -1107,6 +1006,137 @@ mod modes {
         let mut left = names(dir.path());
         left.retain(|n| n.contains('#'));
         assert!(left.is_empty(), "staging files left: {left:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_move_onto_a_special_destination_is_refused_and_changes_nothing() -> Result<()> {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempdir()?;
+        let client = ObjectStorageClient::new();
+        let src = dir.path().join("src");
+        fs::write(&src, b"keep")?;
+
+        let socket = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let err = client
+            .move_object(&url(&src), &url(&socket))
+            .await
+            .expect_err("socket");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(fs::symlink_metadata(&socket)?.file_type().is_socket());
+
+        let directory = dir.path().join("d");
+        fs::create_dir(&directory)?;
+        fs::write(directory.join("inner"), b"inner")?;
+        let err = client
+            .move_object(&url(&src), &url(&directory))
+            .await
+            .expect_err("directory");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(fs::read(directory.join("inner"))?, b"inner");
+
+        #[cfg(target_os = "linux")]
+        {
+            let fifo = dir.path().join("fifo");
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .map_err(std::io::Error::from)?;
+            let err = client
+                .move_object(&url(&src), &url(&fifo))
+                .await
+                .expect_err("fifo");
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+            assert!(fs::symlink_metadata(&fifo)?.file_type().is_fifo());
+        }
+
+        assert_eq!(fs::read(&src)?, b"keep");
+        let mut left = names(dir.path());
+        left.retain(|n| n.contains('#'));
+        assert!(left.is_empty(), "staging files left: {left:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_move_of_a_directory_or_special_file_is_refused() -> Result<()> {
+        let dir = tempdir()?;
+        let client = ObjectStorageClient::new();
+        let tree = dir.path().join("tree");
+        fs::create_dir(&tree)?;
+        fs::write(tree.join("inner"), b"inner")?;
+        let err = client
+            .move_object(&url(&tree), &url(&dir.path().join("moved")))
+            .await
+            .expect_err("directory");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(fs::read(tree.join("inner"))?, b"inner");
+
+        #[cfg(target_os = "linux")]
+        {
+            let fifo = dir.path().join("fifo");
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .map_err(std::io::Error::from)?;
+            let err = client
+                .move_object(&url(&fifo), &url(&dir.path().join("moved")))
+                .await
+                .expect_err("fifo");
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        }
+        assert_eq!(
+            names(dir.path()).iter().filter(|n| *n == "moved").count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_move_of_a_symlink_renames_the_link() -> Result<()> {
+        let dir = tempdir()?;
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        let moved = dir.path().join("moved");
+        fs::write(&target, b"keep")?;
+        std::os::unix::fs::symlink(&target, &link)?;
+
+        ObjectStorageClient::new()
+            .move_object(&url(&link), &url(&moved))
+            .await?;
+
+        assert!(fs::symlink_metadata(&moved)?.file_type().is_symlink());
+        assert_eq!(fs::read_link(&moved)?, target);
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(&target)?, b"keep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_move_on_one_file_system_keeps_the_inode_and_mode() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir()?;
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        fs::write(&src, b"data")?;
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o640))?;
+        let inode = fs::metadata(&src)?.ino();
+        fs::write(&dst, b"old")?;
+
+        ObjectStorageClient::new()
+            .move_object(&url(&src), &url(&dst))
+            .await?;
+
+        assert_eq!(fs::metadata(&dst)?.ino(), inode);
+        assert_eq!(mode(&dst), 0o640);
+        assert_eq!(names(dir.path()), ["dst"]);
         Ok(())
     }
 

@@ -3,8 +3,9 @@ name: Performance
 # Not part of the PR checks: the deterministic guards in `tests/perf_guards.rs`
 # run with `cargo test` in tests.yaml. This workflow measures the release
 # binary. Peak RSS over budget fails it; throughput is compared with the
-# previous successful run (restored from the cache) and only warns, because
-# shared runners are noisy.
+# previous run that raised no warning (restored from the cache) and only warns,
+# because shared runners are noisy. A run that warned never becomes the
+# baseline, so a regression keeps warning until it is fixed.
 on:
   workflow_dispatch:
   schedule:
@@ -46,6 +47,7 @@ jobs:
           key: perf-smoke-${{ github.run_id }}
           restore-keys: perf-smoke-
       - name: Smoke (512 MiB file://, plain and encrypted)
+        id: smoke
         run: |
           mkdir -p target/perf-smoke
           python3 scripts/perf_smoke.py \
@@ -55,8 +57,10 @@ jobs:
             --baseline perf-baseline.json \
             --out perf-smoke.json
       - name: Keep this result as the next baseline
+        if: steps.smoke.outputs.warned == 'false'
         run: cp perf-smoke.json perf-baseline.json
       - name: Save the baseline
+        if: steps.smoke.outputs.warned == 'false'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: perf-baseline.json

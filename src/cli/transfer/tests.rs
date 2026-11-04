@@ -10,7 +10,7 @@ async fn temp_file_for_an_existing_0600_file_is_never_more_permissive() {
     let w = tempdir().expect("work");
     let tmp = w.path().join("dst.bin.osc-tmp-test");
 
-    let file = create_temp_file(&tmp, Some(0o600)).await.expect("create");
+    let (file, _guard) = create_temp_file(&tmp, Some(0o600)).await.expect("create");
     let mode = file.metadata().await.expect("meta").permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "mode right after creation");
     assert_eq!(
@@ -20,9 +20,25 @@ async fn temp_file_for_an_existing_0600_file_is_never_more_permissive() {
     );
 
     // Exclusive: an existing temp path is refused.
-    create_temp_file(&tmp, Some(0o600))
-        .await
-        .expect_err("create_new");
+    assert!(
+        create_temp_file(&tmp, Some(0o600)).await.is_err(),
+        "create_new"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_temp_file_creation_leaves_no_file() {
+    let w = tempfile::tempdir().expect("work");
+    let tmp = w.path().join("dst.bin.osc-tmp-test");
+    {
+        let mut create = std::pin::pin!(create_temp_file(&tmp, None));
+        // Start the open, then drop the future before it is awaited.
+        let _ = futures::poll!(create.as_mut());
+    }
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!tmp.exists(), "a cancelled create leaves nothing behind");
 }
 
 #[test]
@@ -50,8 +66,7 @@ async fn large_jobs_share_the_budget() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 running.fetch_sub(1, Ordering::SeqCst);
             })
-            .await
-            .expect("permits");
+            .await;
         })
         .buffer_unordered(8)
         .count()
@@ -155,9 +170,10 @@ async fn download_temp_file_is_private_without_proc() {
     );
     assert_eq!((create, last), (Some(0o600), Some(want)));
     let tmp = w.path().join("dst.bin.osc-tmp-test");
-    create_temp_file(&tmp, create).await.expect("create");
+    let (_file, guard) = create_temp_file(&tmp, create).await.expect("create");
     assert_eq!(mode_of(&tmp), 0o600);
-    std::fs::remove_file(&tmp).expect("remove");
+    drop(guard);
+    assert!(!tmp.exists(), "the guard removes the temp file");
 
     let done = get(
         &crate::Client::<crate::Plain>::default(),
@@ -182,4 +198,135 @@ async fn download_temp_file_is_private_without_proc() {
         ["dst.bin", "src.bin"],
         "no temp or probe file is left"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn put_refuses_a_destination_inside_the_source() {
+    let w = tempdir().expect("work");
+    let src = w.path().join("d");
+    std::fs::create_dir(&src).expect("dir");
+    std::fs::write(src.join("a.txt"), b"data").expect("write");
+    let client = crate::Client::<crate::Plain>::default();
+
+    for dst in [
+        src.display().to_string(),
+        format!("{}/", src.display()),
+        format!("{}/sub/", src.display()),
+        format!("{}/sub/deeper", src.display()),
+        // Through a link to the source.
+        {
+            let link = w.path().join("link");
+            std::os::unix::fs::symlink(&src, &link).expect("link");
+            format!("{}/sub", link.display())
+        },
+    ] {
+        let got = put(&client, &src, &dst, true).await;
+        assert!(
+            matches!(got, Err(CliError::UnsafePath { .. })),
+            "{dst}: {got:?}"
+        );
+    }
+    let mut left: Vec<_> = std::fs::read_dir(&src)
+        .expect("dir")
+        .map(|e| e.expect("entry").file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["a.txt"], "nothing was written");
+
+    // A sibling with a similar name is outside the source.
+    let out = w.path().join("d2");
+    put(&client, &src, &out.display().to_string(), true)
+        .await
+        .expect("put");
+    assert_eq!(std::fs::read(out.join("a.txt")).expect("copy"), b"data");
+}
+
+/// A file of four read chunks, for the shrink and growth tests.
+#[cfg(unix)]
+fn four_chunk_file(dir: &Path) -> (PathBuf, std::fs::File) {
+    let path = dir.join("log");
+    std::fs::write(&path, vec![7u8; 4 * FILE_BUF]).expect("write");
+    let handle = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open");
+    (path, handle)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_that_shrinks_during_the_upload_is_an_error_and_commits_nothing() {
+    let w = tempdir().expect("work");
+    let (path, handle) = four_chunk_file(w.path());
+    let size = 4 * FILE_BUF as u64;
+
+    // The stream itself: the first chunk reads, then the file is cut short.
+    let file = tokio::fs::File::open(&path).await.expect("open");
+    let mut chunks = file_chunks(file, Some(size), "log".into()).await;
+    assert!(chunks.next().await.expect("first").is_ok());
+    handle.set_len(FILE_BUF as u64).expect("truncate");
+    let mut failure = None;
+    while let Some(chunk) = chunks.next().await {
+        if let Err(e) = chunk {
+            failure = Some(e.to_string());
+        }
+    }
+    let failure = failure.expect("a shrunk file ends in an error");
+    assert!(
+        failure.contains("log shrank during the upload"),
+        "{failure}"
+    );
+
+    // The upload: nothing is committed.
+    let (path, handle) = {
+        std::fs::remove_file(&path).expect("remove");
+        four_chunk_file(w.path())
+    };
+    let dst = w.path().join("out");
+    let file = tokio::fs::File::open(&path).await.expect("open");
+    // The size is known from before the cut, as in `put_file`.
+    let chunks = file_chunks(file, Some(size), "log".into()).await;
+    handle.set_len(0).expect("truncate");
+    let client = crate::Client::<crate::Plain>::default();
+    let url = format!("file://{}", dst.display());
+    let got = client.put_local_file(&url, chunks, None, Some(size)).await;
+    assert!(got.is_err(), "{got:?}");
+    assert!(!dst.exists(), "a short object must not be committed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_that_grows_after_open_uploads_in_full() {
+    use std::io::Write;
+    let w = tempdir().expect("work");
+    let (path, _handle) = four_chunk_file(w.path());
+    let file = tokio::fs::File::open(&path).await.expect("open");
+    let mut appender = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("append");
+    appender.write_all(&[9u8; 1000]).expect("append");
+
+    let dst = w.path().join("out");
+    let client = crate::Client::<crate::Plain>::default();
+    // The size was taken before the append in a real run; here it is taken
+    // after, so the stream is also checked directly with the smaller size.
+    put_file(&client, file, &format!("file://{}", dst.display()), &path)
+        .await
+        .expect("put");
+    assert_eq!(
+        std::fs::metadata(&dst).expect("meta").len(),
+        4 * FILE_BUF as u64 + 1000
+    );
+
+    let file = tokio::fs::File::open(&path).await.expect("open");
+    let chunks = file_chunks(file, Some(4 * FILE_BUF as u64 - 1), "log".into()).await;
+    let total: usize = chunks
+        .map(|c| c.expect("chunk").len())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .sum();
+    assert_eq!(total, 4 * FILE_BUF + 1000);
 }

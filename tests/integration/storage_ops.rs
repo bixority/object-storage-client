@@ -176,6 +176,114 @@ async fn copy_and_move(p: Provider) -> TestResult {
 }
 per_provider!(copies, copy_and_move);
 
+/// Copies and moves between two buckets (containers) of one provider, which
+/// run server-side (`CopyObject`, `Copy Blob`) when the credentials allow it.
+async fn copy_and_move_across_buckets(p: Provider) -> TestResult {
+    let client = both_client();
+    let (one, two) = match p {
+        Provider::Garage => {
+            let (one, two) = (unique_bucket(), unique_bucket());
+            client.create_bucket(&one).await?;
+            client.create_bucket(&two).await?;
+            (one, two)
+        }
+        Provider::Azure => (
+            base(&client, p, "across-one").await?,
+            base(&client, p, "across-two").await?,
+        ),
+    };
+    let data = pattern(3 << 20);
+    let src = format!("{one}dir/src file.bin");
+    client.put(&src, data.clone()).await?;
+
+    let copied = format!("{two}copied/a b.bin");
+    client.copy(&src, &copied).await?;
+    assert!(
+        client.get(&copied).await?.as_ref() == data.as_slice(),
+        "copied content"
+    );
+    assert!(client.exists(&src).await?, "copy keeps the source");
+
+    let moved = format!("{two}moved.bin");
+    client.move_object(&src, &moved).await?;
+    assert!(!client.exists(&src).await?, "move removes the source");
+    assert!(
+        client.get(&moved).await?.as_ref() == data.as_slice(),
+        "moved content"
+    );
+
+    // A missing source fails and writes nothing.
+    assert!(client.copy(&src, &format!("{two}never")).await.is_err());
+    assert!(!client.exists(&format!("{two}never")).await?);
+
+    server_side_marker(&client, p, &one, &two).await
+}
+
+/// Proves that a copy between buckets ran inside the provider, with something
+/// a streamed copy cannot produce.
+async fn server_side_marker(
+    client: &object_storage_client::ObjectStorageClient,
+    p: Provider,
+    one: &str,
+    two: &str,
+) -> TestResult {
+    match p {
+        Provider::Garage => {
+            // The traffic between the client and Garage tells the two paths
+            // apart: a CopyObject moves a few KiB, a streamed copy the object.
+            let mut vars = crate::common::garage_vars();
+            let target = vars["S3_ENDPOINT"].clone();
+            let proxy = crate::common::counting_proxy(&target).await;
+            vars.insert("S3_ENDPOINT".into(), proxy.endpoint.clone());
+            let through = object_storage_client::ObjectStorageClient::with_vars(vars);
+            let src = format!("{one}proxied.bin");
+            through.put(&src, pattern(4 << 20)).await?;
+            let before = proxy.bytes();
+            assert!(before >= 4 << 20, "the put went through the proxy");
+            let dst = format!("{two}proxied-copy.bin");
+            through.copy(&src, &dst).await?;
+            let copied = proxy.bytes() - before;
+            assert!(
+                copied < 64 * 1024,
+                "a CopyObject moves no data: {copied} bytes"
+            );
+            assert_eq!(through.get(&dst).await?.len(), 4 << 20);
+        }
+        Provider::Azure => {
+            // Copy Blob leaves `x-ms-copy-id` and `x-ms-copy-status` on the
+            // destination; a blob written by a PUT has neither.
+            let src = format!("{one}marker.bin");
+            let dst = format!("{two}marker-copy.bin");
+            client.put(&src, &b"marker"[..]).await?;
+            client.copy(&src, &dst).await?;
+            let head = |url: String| async move {
+                let signed = client
+                    .get_pre_signed_url(
+                        &url,
+                        SignMethod::Get,
+                        Duration::from_mins(5),
+                        &SignOptions::default(),
+                    )
+                    .await?;
+                let response = reqwest::Client::new().head(signed).send().await?;
+                Ok::<_, Box<dyn std::error::Error>>(response)
+            };
+            let copied = head(dst).await?;
+            assert_eq!(
+                copied
+                    .headers()
+                    .get("x-ms-copy-status")
+                    .and_then(|v| v.to_str().ok()),
+                Some("success")
+            );
+            assert!(copied.headers().contains_key("x-ms-copy-id"));
+            assert!(!head(src).await?.headers().contains_key("x-ms-copy-id"));
+        }
+    }
+    Ok(())
+}
+per_provider!(across_buckets, copy_and_move_across_buckets);
+
 /// A move of an object onto itself must keep the object: a store rename is
 /// copy then delete, which would destroy it.
 async fn move_onto_itself(p: Provider) -> TestResult {

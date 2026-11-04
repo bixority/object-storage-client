@@ -81,7 +81,7 @@ def _fake_s3(marker, aborted):
             aborted.set()
             self._reply(204)
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

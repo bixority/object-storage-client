@@ -46,7 +46,7 @@ export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages
 
 ```toml
 [dependencies]
-object-storage-client = { version = "0.3", registry = "bixority" }
+object-storage-client = { version = "0.4", registry = "bixority" }
 # or: object-storage-client = { git = "https://codeberg.org/bixority/object-storage-client" }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -55,7 +55,7 @@ The `encryption` and `cli` features are on by default. A library that does not
 need the CLI can drop `clap` and `tokio-util`:
 
 ```toml
-object-storage-client = { version = "0.3", registry = "bixority", default-features = false, features = ["encryption"] }
+object-storage-client = { version = "0.4", registry = "bixority", default-features = false, features = ["encryption"] }
 ```
 
 ```rust
@@ -66,7 +66,7 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ObjectStorageClient::new();
 
-    // Create a bucket (S3/GCS/Azure, or a directory for file:// URLs); idempotent
+    // Create a bucket (S3/GCS/Azure, or a directory for file:// URLs); success if it is already yours
     client.create_bucket("s3://my-bucket").await?;
 
     // Upload data to S3
@@ -174,7 +174,7 @@ from object_storage_client import ObjectStorageClient
 async def main():
     client = ObjectStorageClient()
 
-    # Create a bucket (S3/GCS/Azure, or a directory for file:// URLs); idempotent
+    # Create a bucket (S3/GCS/Azure, or a directory for file:// URLs); success if it is already yours
     await client.create_bucket("s3://my-bucket")
 
     # Check whether a bucket exists (returns a bool; never raises for a miss).
@@ -271,7 +271,7 @@ osc get-stream gs://my-bucket/large_file.bin > large_file.bin   # stream to stdo
 osc --profile dev ls s3://my-bucket/                            # credentials from the AWS profile "dev"
 osc cp s3://source-bucket/image.png az://dest-container/image.png   # copy between providers
 osc mv s3://my-bucket/old_name.txt s3://my-bucket/new_name.txt
-osc ls s3://my-bucket/logs/
+osc ls s3://my-bucket/logs/                                     # names; --url prints full object URLs
 osc rm s3://my-bucket/temp_file.tmp
 osc exists s3://my-bucket/report.pdf                            # prints true or false
 osc mb s3://my-new-bucket                                       # create a bucket (a directory for local paths)
@@ -340,7 +340,7 @@ Or from a checkout:
 cargo install --path . --features gui
 ```
 
-Linux needs no extra packages: the window opens on X11 or Wayland.
+On Linux, `osc-gui` needs a Wayland session; X11 is not supported.
 
 ### Run
 

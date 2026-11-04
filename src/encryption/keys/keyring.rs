@@ -19,12 +19,17 @@
 //! (Kubernetes mounts every Secret key as one), opens the file without
 //! blocking, and requires a regular file owned by the effective user or root
 //! that its group cannot write and others cannot access (Unix; group read
-//! stays allowed). Other platforms check neither the owner nor the
-//! permissions. It notices a changed file on use, including
+//! stays allowed). Only the owner and the mode bits are read, as OpenSSH does:
+//! ACL grants are not detected. Other platforms check neither the owner nor
+//! the permissions. It notices a changed file on use, including
 //! [`Keyring::status`]: at
 //! most every 5 seconds, and at once when an unwrap meets an unknown key (at
 //! most once a second). An invalid replacement keeps the
 //! previous keys and is reported by [`KeyringStatus::last_reload_error`].
+//!
+//! Keep the keyring file on a local or tmpfs filesystem: a reload runs a
+//! synchronous `stat` on the calling thread, which a stalled network or FUSE
+//! mount can block.
 //!
 //! This is the only part of the encryption module that touches the file
 //! system. Key bytes live in zeroizing buffers and never reach an error,
@@ -35,7 +40,8 @@ use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -87,7 +93,23 @@ struct Source {
     path: PathBuf,
     interval: Duration,
     forced_interval: Duration,
+    /// Set while one task reloads, so reloads are single-flight. The file is
+    /// read with no lock held.
+    reloading: AtomicBool,
+    /// Held only for short reads and writes, never across file I/O.
     state: Mutex<ReloadState>,
+    /// Runs before a reload touches the file (tests).
+    #[cfg(test)]
+    io_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// Clears [`Source::reloading`] when a reload ends, even by a panic.
+struct Reloading<'a>(&'a AtomicBool);
+
+impl Drop for Reloading<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 struct ReloadState {
@@ -187,6 +209,9 @@ impl Keyring {
                 path,
                 interval,
                 forced_interval,
+                reloading: AtomicBool::new(false),
+                #[cfg(test)]
+                io_hook: Mutex::new(None),
                 state: Mutex::new(ReloadState {
                     identity,
                     last_check: Instant::now(),
@@ -264,6 +289,12 @@ impl Keyring {
         }
     }
 
+    /// ID of the active key in the current snapshot. Passive: never checks
+    /// the file.
+    pub(crate) fn active_id(&self) -> String {
+        self.current().active.clone()
+    }
+
     /// Number of wrap operations with the current active key in this process
     /// (not persisted; it survives a reload that keeps the key).
     #[must_use]
@@ -279,38 +310,56 @@ impl Keyring {
     /// Looks at the file if a check is due (or, for [`Check::Forced`], if
     /// the last forced one is old enough) and swaps in a changed, valid
     /// keyring. A task that finds the check running carries on with the
-    /// current snapshot.
+    /// current snapshot. The state lock is not held while the file is read.
     fn check(&self, mode: Check) {
         let Some(src) = &self.source else { return };
-        let mut st = match src.state.try_lock() {
-            Ok(guard) => guard,
-            Err(TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        let now = Instant::now();
-        match mode {
-            Check::Due if now.duration_since(st.last_check) < src.interval => return,
-            Check::Forced
-                if st
-                    .last_forced
-                    .is_some_and(|t| now.duration_since(t) < src.forced_interval) =>
-            {
-                return;
-            }
-            Check::Forced => st.last_forced = Some(now),
-            Check::Due => {}
+        if src
+            .reloading
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
         }
-        st.last_check = now;
+        let _reloading = Reloading(&src.reloading);
+        let known = {
+            let mut st = src.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let now = Instant::now();
+            match mode {
+                Check::Due if now.duration_since(st.last_check) < src.interval => return,
+                Check::Forced
+                    if st
+                        .last_forced
+                        .is_some_and(|t| now.duration_since(t) < src.forced_interval) =>
+                {
+                    return;
+                }
+                Check::Forced => st.last_forced = Some(now),
+                Check::Due => {}
+            }
+            st.last_check = now;
+            st.identity
+        };
 
+        #[cfg(test)]
+        {
+            let hook = src
+                .io_hook
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let meta = match std::fs::metadata(&src.path) {
             Ok(meta) => meta,
             Err(e) => {
-                st.last_error = Some(KeyError::io(&src.path)(e).to_string());
+                Self::record(src, None, Some(KeyError::io(&src.path)(e).to_string()));
                 return;
             }
         };
-        if Identity::of(&meta) == st.identity {
-            st.last_error = None;
+        if Identity::of(&meta) == known {
+            Self::record(src, None, None);
             return;
         }
         let loaded = read_file(&src.path).and_then(|(raw, identity)| {
@@ -324,11 +373,20 @@ impl Keyring {
                     .snapshot
                     .write()
                     .unwrap_or_else(PoisonError::into_inner) = fresh;
-                st.identity = identity;
-                st.last_error = None;
+                Self::record(src, Some(identity), None);
             }
-            Err(e) => st.last_error = Some(e.to_string()),
+            Err(e) => Self::record(src, None, Some(e.to_string())),
         }
+    }
+
+    /// Stores the outcome of a reload: a new file identity (if one was
+    /// loaded) and the error, if any.
+    fn record(src: &Source, identity: Option<Identity>, error: Option<String>) {
+        let mut st = src.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(identity) = identity {
+            st.identity = identity;
+        }
+        st.last_error = error;
     }
 }
 
@@ -347,7 +405,13 @@ impl KeyProvider for Keyring {
     }
 
     fn active_key_name(&self) -> String {
-        self.current().active.clone()
+        self.check(Check::Due);
+        self.active_id()
+    }
+
+    fn holds_key(&self, id: &str) -> bool {
+        self.check(Check::Due);
+        self.current().keys.contains_key(id)
     }
 
     async fn wrap(
@@ -673,9 +737,24 @@ pub fn rotate_keyring(
 /// # Errors
 /// The errors of [`rotate_keyring`].
 pub fn add_key(text: &str, prefix: &str, today: NaiveDate) -> Result<Zeroizing<String>, KeyError> {
+    add_key_with_id(text, prefix, today).map(|(added, _)| added)
+}
+
+/// Like [`add_key`], and also returns the ID of the new key.
+///
+/// [`Keyring::status`] lists keys newest first, so its last entry is not the
+/// new key: take the ID from here.
+///
+/// # Errors
+/// The errors of [`rotate_keyring`].
+pub fn add_key_with_id(
+    text: &str,
+    prefix: &str,
+    today: NaiveDate,
+) -> Result<(Zeroizing<String>, String), KeyError> {
     let mut doc = parse_document(text)?;
-    push_fresh(&mut doc, prefix, today)?;
-    serialize(&doc)
+    let id = push_fresh(&mut doc, prefix, today)?;
+    Ok((serialize(&doc)?, id))
 }
 
 /// `text` with the key `id` made active: second step of a rollout. Activating

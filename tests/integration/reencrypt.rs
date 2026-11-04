@@ -4,10 +4,10 @@
 
 use crate::common::both_client;
 use crate::common::provider::{Provider, base, per_provider};
-use crate::support::{TestResult, chunked, pattern};
+use crate::support::{TestResult, chunked, config_for, pattern};
 use bytes::Bytes;
 use chrono::NaiveDate;
-use object_storage_client::encryption::{EncryptionConfig, Envelope, Keyring};
+use object_storage_client::encryption::{Envelope, Keyring};
 use object_storage_client::encryption::{new_keyring, rotate_keyring};
 use object_storage_client::{Client, ReencryptOptions, Reencrypted};
 use object_store::{ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
@@ -18,10 +18,6 @@ type Secure = Client<Envelope>;
 
 const fn day(d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 10, d).expect("date")
-}
-
-fn config_for(text: &str) -> EncryptionConfig {
-    EncryptionConfig::new(Arc::new(Keyring::parse(text).expect("parse")))
 }
 
 fn active_id(text: &str) -> String {

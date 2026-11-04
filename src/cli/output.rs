@@ -8,15 +8,18 @@ use std::path::Path;
 /// Writes one line to standard output. A closed pipe is an error, not a
 /// panic as with `println!`, so the command stops and drops its in-flight work
 /// (which cleans up) instead of aborting.
-pub(super) fn out(args: std::fmt::Arguments<'_>) -> Result<(), CliError> {
-    use std::io::Write;
-    writeln!(std::io::stdout().lock(), "{args}").map_err(CliError::Output)
+///
+/// The write runs on the blocking pool, so a full pipe leaves the task
+/// cancellable: a signal can drop the command while the write waits.
+pub(super) async fn out(mut line: String) -> Result<(), CliError> {
+    line.push('\n');
+    write_stdout(&line).await
 }
 
-/// [`out`] with `println!` syntax.
+/// [`out`] with `println!` syntax; await the result.
 macro_rules! outln {
     ($($arg:tt)*) => {
-        $crate::cli::output::out(format_args!($($arg)*))
+        $crate::cli::output::out(format!($($arg)*))
     };
 }
 
@@ -30,13 +33,13 @@ macro_rules! errln {
 }
 
 /// Writes `text` to standard output exactly, without a trailing newline.
-#[cfg(feature = "encryption")]
-pub(super) fn write_stdout(text: &str) -> Result<(), CliError> {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
+pub(super) async fn write_stdout(text: &str) -> Result<(), CliError> {
+    use tokio::io::AsyncWriteExt;
+    let mut out = tokio::io::stdout();
     out.write_all(text.as_bytes())
-        .and_then(|()| out.flush())
-        .map_err(CliError::Output)
+        .await
+        .map_err(CliError::Output)?;
+    out.flush().await.map_err(CliError::Output)
 }
 
 /// Escapes control characters (C0, DEL, C1) and bidirectional controls as

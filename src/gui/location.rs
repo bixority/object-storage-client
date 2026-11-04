@@ -1,7 +1,8 @@
 //! The GUI's address model: always a folder URL.
 
 use super::display;
-use crate::registry::{child_url, parse_url};
+use crate::registry::{child_url, origin, parse_url};
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 /// Whether `scheme` names a bucket or container store.
@@ -78,23 +79,20 @@ impl Location {
         let mut url = self.url.clone();
         let path = url.path().trim_end_matches('/');
         let cut = path.rfind('/').map_or(0, |i| i + 1);
-        let parent = path[..cut].to_owned();
+        // An empty path would drop the trailing slash and the root check.
+        let parent = if cut == 0 { "/" } else { &path[..cut] }.to_owned();
         url.set_path(&parent);
         Some(Self { url })
     }
 
     /// The bucket or container name, for schemes that have one.
     pub(crate) fn bucket(&self) -> Option<String> {
-        match self.url.scheme() {
-            scheme if is_bucket_scheme(scheme) => {
-                let user = self.url.username();
-                if user.is_empty() {
-                    self.url.host_str().map(str::to_owned)
-                } else {
-                    Some(user.to_owned())
-                }
-            }
-            _ => None,
+        // A URL with user information is refused by the library, so the host
+        // is always the bucket.
+        if is_bucket_scheme(self.url.scheme()) {
+            self.url.host_str().map(str::to_owned)
+        } else {
+            None
         }
     }
 
@@ -120,9 +118,25 @@ impl Location {
             .then(|| child_url(self.as_str(), name.split('/')))
     }
 
+    /// The origin and percent-decoded path, so `(` and `%28` compare equal.
+    fn key(&self) -> (&str, Vec<u8>) {
+        (
+            origin(&self.url),
+            percent_decode_str(self.url.path()).collect(),
+        )
+    }
+
     /// Whether `other` is this folder or lies below it.
     pub(crate) fn contains(&self, other: &Self) -> bool {
-        other.as_str().starts_with(self.as_str())
+        let (origin, path) = self.key();
+        let (other_origin, other_path) = other.key();
+        // Both paths end in `/`, so the prefix stays on segment boundaries.
+        origin == other_origin && other_path.starts_with(&path)
+    }
+
+    /// Whether `other` is the same folder, however its path is encoded.
+    pub(crate) fn same_folder(&self, other: &Self) -> bool {
+        self.key() == other.key()
     }
 }
 
@@ -132,6 +146,20 @@ mod tests {
 
     fn loc(text: &str) -> Location {
         Location::parse(text).expect("parses")
+    }
+
+    #[test]
+    fn contains_ignores_how_a_path_is_encoded() {
+        // `parse` keeps `(` and `+`; `child_dir` encodes them.
+        for name in ["a (1)", "a+b"] {
+            let child = loc("file:///u/").child_dir(name).expect("valid name");
+            let below = loc(&format!("file:///u/{name}/b/"));
+            assert!(child.contains(&below), "{name}: {below:?}");
+            assert!(child.same_folder(&loc(&format!("file:///u/{name}/"))));
+        }
+        assert!(!loc("file:///u/a/").contains(&loc("file:///u/ab/")));
+        assert!(!loc("file:///u/a/").same_folder(&loc("file:///u/a/b/")));
+        assert!(!loc("s3://b/a/").contains(&loc("gs://b/a/")));
     }
 
     #[test]
@@ -166,12 +194,6 @@ mod tests {
         assert_eq!(loc("s3://media/").bucket().as_deref(), Some("media"));
         assert_eq!(loc("file:///tmp/").bucket(), None);
         assert_eq!(loc("https://h/x/").bucket(), None);
-        assert_eq!(
-            loc("abfss://c@acct.dfs.core.windows.net/")
-                .bucket()
-                .as_deref(),
-            Some("c")
-        );
     }
 
     #[test]
@@ -219,5 +241,18 @@ mod tests {
     #[test]
     fn windows_drive_path() {
         assert!(loc(r"C:\data").as_str().starts_with("file:///C:/data/"));
+    }
+
+    #[test]
+    fn parent_chain_of_empty_segments_ends_at_the_bucket_root() {
+        let mut at = loc("s3://b//p/");
+        let mut chain = vec![at.as_str().to_owned()];
+        while let Some(up) = at.parent() {
+            chain.push(up.as_str().to_owned());
+            at = up;
+        }
+        assert_eq!(chain, ["s3://b//p/", "s3://b//", "s3://b/"]);
+        assert!(at.is_root());
+        assert_eq!(at.bucket().as_deref(), Some("b"));
     }
 }

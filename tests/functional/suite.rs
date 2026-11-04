@@ -396,49 +396,41 @@ macro_rules! client_suite {
 
 /// Tests that only hold for the plain client: sizes of encrypted objects are
 /// covered in `encryption.rs`.
-macro_rules! plain_only_suite {
-    ($m:ident, $ctor:expr) => {
-        mod $m {
-            use object_storage_client::{Error, Result};
-            use tempfile::tempdir;
+mod plain_only {
+    use object_storage_client::{Error, ObjectStorageClient, Result};
+    use tempfile::tempdir;
 
-            fn url_of(dir: &tempfile::TempDir, name: &str) -> String {
-                format!("file://{}/{name}", dir.path().display())
-            }
+    fn url_of(dir: &tempfile::TempDir, name: &str) -> String {
+        format!("file://{}/{name}", dir.path().display())
+    }
 
-            #[tokio::test]
-            async fn metadata_reports_size() -> Result<()> {
-                let dir = tempdir()?;
-                let client = $ctor;
-                let url = url_of(&dir, "m.bin");
-                client.put(&url, &b"12345"[..]).await?;
+    #[tokio::test]
+    async fn metadata_reports_size() -> Result<()> {
+        let dir = tempdir()?;
+        let client = ObjectStorageClient::new();
+        let url = url_of(&dir, "m.bin");
+        client.put(&url, &b"12345"[..]).await?;
 
-                let meta = client.get_object_metadata(&url).await?;
-                assert_eq!(meta.size_bytes, 5);
-                assert_eq!(meta.stored_size_bytes, 5);
-                assert!(meta.encryption.is_none());
-                // LocalFileSystem reports no content type.
-                assert!(meta.location.ends_with("m.bin"));
-                assert_eq!(meta.content_type, None);
+        let meta = client.get_object_metadata(&url).await?;
+        assert_eq!(meta.size_bytes, 5);
+        assert_eq!(meta.stored_size_bytes, 5);
+        assert!(meta.encryption.is_none());
+        // LocalFileSystem reports no content type.
+        assert!(meta.location.ends_with("m.bin"));
+        assert_eq!(meta.content_type, None);
 
-                // Metadata for a missing object errors with NotFound.
-                client.delete(&url).await?;
-                let err = client
-                    .get_object_metadata(&url)
-                    .await
-                    .expect_err("metadata for a missing object must error");
-                assert!(matches!(
-                    err,
-                    Error::ObjectStore(object_store::Error::NotFound { .. })
-                ));
-                Ok(())
-            }
-        }
-    };
+        // Metadata for a missing object errors with NotFound.
+        client.delete(&url).await?;
+        let err = client
+            .get_object_metadata(&url)
+            .await
+            .expect_err("metadata for a missing object must error");
+        assert!(matches!(
+            err,
+            Error::ObjectStore(object_store::Error::NotFound { .. })
+        ));
+        Ok(())
+    }
 }
 
 client_suite!(plain, object_storage_client::ObjectStorageClient::new());
-plain_only_suite!(
-    plain_only,
-    object_storage_client::ObjectStorageClient::new()
-);

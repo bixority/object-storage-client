@@ -9,6 +9,15 @@ updates:
   # Security updates are not delayed by the cooldown.
   cooldown:
     default-days: 7
+# The fuzz crate is its own workspace with its own lockfile.
+- package-ecosystem: cargo
+  directory: "/fuzz"
+  schedule:
+    interval: daily
+    time: "08:00"
+  open-pull-requests-limit: 10
+  cooldown:
+    default-days: 7
 # Action bumps are never auto-merged (see dependabot-merge in tests.yaml).
 - package-ecosystem: github-actions
   directory: "/"

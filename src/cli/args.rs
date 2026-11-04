@@ -1,7 +1,6 @@
 //! The command-line grammar.
 
-#[cfg(feature = "encryption")]
-use super::{enc, keyring};
+use super::keyring;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -12,14 +11,12 @@ pub struct Cli {
     /// Keyring file; enables encryption. The environment variable
     /// `OSC_KEYRING_COMMAND` (a shell command that prints a keyring) is the
     /// alternative source; setting both is an error.
-    #[cfg(feature = "encryption")]
     #[arg(long, global = true, env = "OSC_KEYRING_FILE", value_name = "FILE")]
     pub(super) keyring: Option<PathBuf>,
 
     /// The shell command of `OSC_KEYRING_COMMAND`, set by the binary only
     /// ([`Cli::with_keyring_command`]), so that tests never read the
     /// environment.
-    #[cfg(feature = "encryption")]
     #[arg(skip)]
     pub(super) keyring_command: Option<std::ffi::OsString>,
 
@@ -53,13 +50,11 @@ pub(super) enum Commands {
     /// Generate a pre-signed URL (S3, GCS and Azure only).
     Sign(SignArgs),
     /// Create, rotate and inspect keyrings (standard input to standard output).
-    #[cfg(feature = "encryption")]
     #[command(subcommand)]
     Keyring(keyring::KeyringCommand),
     /// Inspect and re-encrypt encrypted objects.
-    #[cfg(feature = "encryption")]
     #[command(subcommand)]
-    Enc(EncCommand),
+    Enc(super::enc::EncCommand),
 }
 
 #[derive(Args)]
@@ -136,11 +131,19 @@ pub(super) enum ObjectCommand {
         dst: Option<PathBuf>,
     },
     /// List the objects under a URL, one name per line.
+    ///
+    /// Names are the literal names in the store. A name with `%` in it is not
+    /// a URL: use --url to print URLs that address the listed objects, for
+    /// example to pass them to `osc rm`.
     Ls {
         /// Bucket or prefix URL.
         url: String,
+        /// Print the full URL of each object instead of its name.
+        #[arg(long = "url", id = "url_output")]
+        url_output: bool,
     },
-    /// Delete an object.
+    /// Delete an object. An http(s) URL that is a `WebDAV` collection is
+    /// refused: deleting it would remove everything in it.
     Rm {
         /// Object URL.
         url: String,
@@ -172,53 +175,4 @@ impl ObjectCommand {
             | Self::BucketExists { .. } => false,
         }
     }
-}
-
-#[cfg(feature = "encryption")]
-#[derive(Subcommand)]
-pub(super) enum EncCommand {
-    /// Print the envelope details of an encrypted object. Needs no keys, and
-    /// the output is not authenticated.
-    Inspect { url: String },
-    /// Count the objects under a prefix per key ID, from their headers. Needs
-    /// no keys, and the key IDs are not authenticated. The scan is complete
-    /// only when it exits 0: unreadable objects or a listing error give exit
-    /// 1 (a listing error names the offending key; remove that object with
-    /// the provider's tools and run again).
-    Scan {
-        prefix: String,
-        /// Objects inspected at once.
-        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..))]
-        jobs: u16,
-        /// Print only the URLs of the objects that name this key ID.
-        #[arg(long, value_name = "ID", conflicts_with = "json")]
-        key: Option<String>,
-        /// One JSON object per object, then a summary object.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Rewrite the objects under a prefix that are encrypted with key `--from`
-    /// under the active key. Needs a keyring. Prints one JSON line per object
-    /// and a summary; the exit code is 1 if any object failed, changed while
-    /// it was rewritten, or is after `--before`, or if the listing failed.
-    Reencrypt {
-        prefix: String,
-        /// The key ID to move objects away from (not the active key).
-        #[arg(long, value_name = "ID")]
-        from: String,
-        /// Leave objects last modified at or after this RFC 3339 time alone
-        /// (also objects whose store reports no time). The store's time is not
-        /// authenticated: a provider or anyone who can set file times can
-        /// backdate it, so check candidates against an independent record.
-        #[arg(long, value_name = "TIME", value_parser = enc::parse_rfc3339)]
-        before: Option<chrono::DateTime<chrono::Utc>>,
-        /// Objects rewritten at once. A rewrite of an object of 8 MiB or more
-        /// holds about 40 MiB, so at most JOBS/4 (at least one) of those run
-        /// together.
-        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
-        jobs: u16,
-        /// Report what would be rewritten; write nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
 }

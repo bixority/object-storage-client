@@ -5,14 +5,21 @@ import sys
 import time
 import weakref
 from datetime import datetime
+from typing import Any
 
 import pytest
-
 from object_storage_client import (
-    ByteStream,
     EncryptedObjectStorageClient,
     ObjectStorageClient,
+    _stream,
 )
+
+
+async def test_client_methods_return_a_future(plain, tmp_url):
+    future = plain.object_exists(f"{tmp_url}/none.bin")
+    assert isinstance(future, asyncio.Future)
+    assert not asyncio.iscoroutine(future)
+    assert await future is False
 
 
 async def test_metadata_keys(plain, tmp_url):
@@ -30,8 +37,9 @@ def test_profile_argument_is_accepted():
     ObjectStorageClient()
     ObjectStorageClient(profile=None)
     ObjectStorageClient(profile="x")
+    bad_profile: Any = 1
     with pytest.raises(TypeError):
-        ObjectStorageClient(profile=1)
+        ObjectStorageClient(profile=bad_profile)
 
 
 @pytest.mark.parametrize("profile", ["", "  "])
@@ -121,7 +129,7 @@ def test_forbidden_is_permission_error(run_isolated, status):
 
         do_GET = do_HEAD = _deny
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -129,6 +137,62 @@ def test_forbidden_is_permission_error(run_isolated, status):
     thread.start()
     try:
         proc = run_isolated(_FORBIDDEN_SCRIPT, str(server.server_address[1]), timeout=60)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["PermissionError", "PermissionError"], proc.stdout
+
+
+_BUCKET_SCRIPT = """
+import asyncio
+from object_storage_client import ObjectStorageClient
+
+async def main():
+    client = ObjectStorageClient()
+    for call in (client.bucket_exists, client.create_bucket):
+        try:
+            await call("s3://bkt")
+        except PermissionError:
+            print("PermissionError")
+        except BaseException as e:
+            print(f"{type(e).__name__}: {e}")
+        else:
+            print("no error")
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_forbidden_bucket_calls_are_permission_errors(run_isolated, status):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _deny(self):
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_PUT = do_HEAD = _deny
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    env = {
+        "S3_ENDPOINT": f"http://127.0.0.1:{server.server_address[1]}",
+        "S3_ALLOW_HTTP": "true",
+        "S3_REGION": "us-east-1",
+        "S3_ACCESS_KEY_ID": "k",
+        "S3_SECRET_ACCESS_KEY": "s",
+    }
+    try:
+        proc = run_isolated(_BUCKET_SCRIPT, env=env, timeout=60)
     finally:
         server.shutdown()
         server.server_close()
@@ -227,7 +291,7 @@ async def test_timeout_retry_with_loop_stall_loses_nothing(method):
     # (a) asyncio.timeout + loop stall + retry with fresh reads.
     data = bytes(i % 251 for i in range(2_000_000))
     raw = _GatedRaw([data])
-    stream = ByteStream(raw)
+    stream = _stream.ByteStream(raw)
     got = b""
     timeouts = 0
 
@@ -434,7 +498,7 @@ def test_superseded_read_on_resumed_loop_raises_and_loses_nothing():
     data = bytes(i % 251 for i in range(2_000_000))
     half = len(data) // 2
     raw = _GatedRaw([data[:half], data[half:]])
-    stream = ByteStream(raw)
+    stream = _stream.ByteStream(raw)
     loop_a = asyncio.new_event_loop()
     loop_b = asyncio.new_event_loop()
     try:
@@ -520,7 +584,7 @@ class _GatedRaw(_FakeRaw):
 
 async def test_midstream_error_surfaces_once_and_maps():
     # (j) wrapper-level: an error taken from the slot is raised exactly once.
-    stream = ByteStream(
+    stream = _stream.ByteStream(
         _FakeRaw([b"a", FileNotFoundError("gone"), RuntimeError("boom"), b"z"])
     )
     assert await stream.next() == b"a"
@@ -559,6 +623,7 @@ async def test_many_sequential_reads_do_not_leak(plain, tmp_url):
     await plain.put_object(url, b"x" * 100)
     names = ("ByteStream", "_RawByteStream", "Task")
     before = _live(*names)
+    stream = None
     for _ in range(100):
         stream = await plain.get_object_stream(url)
         for _ in range(200):
@@ -736,10 +801,24 @@ async def test_put_object_stream_cancelled_error_from_iterator(plain, tmp_url):
 
 
 async def test_put_object_stream_piped_stream_error_keeps_type(plain, tmp_url):
-    stream = ByteStream(_FakeRaw([b"a", FileNotFoundError("gone")]))
+    # A ByteStream around a non-native raw object takes the generic path.
+    stream = _stream.ByteStream(_FakeRaw([b"a", FileNotFoundError("gone")]))
     url = f"{tmp_url}/out.bin"
     with pytest.raises(FileNotFoundError, match="gone"):
         await plain.put_object_stream(url, stream)
+    assert not await plain.object_exists(url)
+
+
+async def test_put_object_stream_relayed_stream_error_keeps_type(plain, tmp_url):
+    stream = _stream.ByteStream(_FakeRaw([b"a", FileNotFoundError("gone")]))
+
+    async def relay():
+        async for chunk in stream:
+            yield chunk
+
+    url = f"{tmp_url}/out.bin"
+    with pytest.raises(FileNotFoundError, match="gone"):
+        await plain.put_object_stream(url, relay())
     assert not await plain.object_exists(url)
 
 
@@ -905,7 +984,7 @@ def test_byte_stream_cannot_be_copied_or_pickled():
     import copy
     import pickle
 
-    stream = ByteStream(_FakeRaw([b"a"]))
+    stream = _stream.ByteStream(_FakeRaw([b"a"]))
     for op in (
         copy.copy,
         copy.deepcopy,
@@ -1000,7 +1079,7 @@ async def test_put_object_stream_size_hint_is_validated(any_client, tmp_url):
     # Keyword-only: the encrypted client takes `context` before it, so give
     # that a value and put the hint in the next positional slot.
     if isinstance(any_client, EncryptedObjectStorageClient):
-        positional = (None, 3)
+        positional: tuple[Any, ...] = (None, 3)
     else:
         positional = (3,)
     with pytest.raises(TypeError):

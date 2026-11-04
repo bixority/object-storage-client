@@ -4,7 +4,6 @@ import asyncio
 import sys
 
 import pytest
-
 from object_storage_client import ListStream
 
 BATCH_NAMES = 1024
@@ -150,7 +149,7 @@ async def test_aclose_before_any_read(listing):
 
 
 async def test_aclose_during_a_pending_read_raises(listing):
-    client, prefix, names = listing
+    client, prefix, _ = listing
     stream = await client.list_objects_stream(prefix)
     read = asyncio.ensure_future(stream.__anext__())
     await asyncio.sleep(0)

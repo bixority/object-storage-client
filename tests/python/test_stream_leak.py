@@ -7,7 +7,6 @@ import os
 import traceback
 
 import pytest
-
 from object_storage_client import DecryptionError
 
 

@@ -165,6 +165,20 @@ async fn scenarios(dir: &Path, mib: usize, runs: usize) -> Vec<Row> {
         }
     }
 
+    // A file:// to file:// copy streams through user space (F057/F196).
+    let src_plain = url(&out, "plain.bin");
+    let dst_plain = url(&out, "plain-copy.bin");
+    bench(
+        &mut rows,
+        &format!("plain copy {label}"),
+        size,
+        runs,
+        async || {
+            plain.copy(&src_plain, &dst_plain).await.expect("copy");
+        },
+    )
+    .await;
+
     // Reads with enc, writes with enc_b: a new data key and message id.
     let src = url(&out, "enc.bin");
     let dst = url(&out, "recrypt.bin");
@@ -175,6 +189,45 @@ async fn scenarios(dir: &Path, mib: usize, runs: usize) -> Vec<Row> {
         runs,
         async || {
             enc_b.copy(&src, &dst).await.expect("copy");
+        },
+    )
+    .await;
+    // Eight re-encrypting copies at once, as `osc enc reencrypt --jobs 8` runs
+    // them: all polled by one task, and one task each. A gap shows the one
+    // polling thread limiting the envelope crypto (F064).
+    let jobs = 8;
+    let dsts: Vec<String> = (0..jobs)
+        .map(|i| url(&out, &format!("par-{i}.bin")))
+        .collect();
+    bench(
+        &mut rows,
+        &format!("enc copy x{jobs} one task {label}"),
+        size * jobs,
+        runs,
+        async || {
+            let copies = dsts.iter().map(|d| enc_b.copy(&src, d));
+            for r in futures::future::join_all(copies).await {
+                r.expect("copy");
+            }
+        },
+    )
+    .await;
+    bench(
+        &mut rows,
+        &format!("enc copy x{jobs} spawned {label}"),
+        size * jobs,
+        runs,
+        async || {
+            let tasks: Vec<_> = dsts
+                .iter()
+                .map(|d| {
+                    let (c, s, d) = (enc_b.clone(), src.clone(), d.clone());
+                    tokio::spawn(async move { c.copy(&s, &d).await })
+                })
+                .collect();
+            for t in tasks {
+                t.await.expect("join").expect("copy");
+            }
         },
     )
     .await;

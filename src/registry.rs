@@ -1,14 +1,13 @@
 //! Shared backend cache and HTTP client used by every [`Client`](crate::Client).
 
-use crate::backend::{self, AwsProfile, Backend, Vars};
-use crate::client::{Error, Result};
+use crate::backend::{self, AwsProfile, Backend, Shared, Vars};
+use crate::client::{ERROR_SOURCE_CAP, Error, Result};
 use object_store::path::Path as ObjectPath;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use url::{Position, Url};
 
 /// Everything that changes the store built for a URL: scheme, credentials
@@ -20,8 +19,11 @@ pub fn origin(url: &Url) -> &str {
 /// The object a URL names: its percent-decoded path. A bucket-only URL (e.g.
 /// `s3://bucket`) has an empty path, which yields the root path.
 pub fn object_path(url: &Url) -> Result<ObjectPath> {
-    ObjectPath::from_url_path(url.path())
-        .map_err(|e| Error::InvalidInput(format!("Invalid object path in URL: {e}")))
+    ObjectPath::from_url_path(url.path()).map_err(|e| {
+        // The decoded path may hold control characters.
+        let e = crate::text::escape_display(&e, ERROR_SOURCE_CAP);
+        Error::InvalidInput(format!("Invalid object path in URL: {e}"))
+    })
 }
 
 /// What stays unescaped when a relative file path is appended to a URL.
@@ -32,7 +34,7 @@ pub const URL_PATH_SEGMENTS: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b
 
 /// `dir` (ending in `/`) followed by each segment percent-encoded with
 /// [`URL_PATH_SEGMENTS`] and joined by `/`.
-#[cfg_attr(not(any(feature = "cli", feature = "gui")), allow(dead_code))]
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub fn child_url<'a>(dir: &str, segments: impl IntoIterator<Item = &'a str>) -> String {
     debug_assert!(dir.ends_with('/'), "directory URL must end in `/`: {dir}");
     let encoded: Vec<String> = segments
@@ -45,8 +47,8 @@ pub fn child_url<'a>(dir: &str, segments: impl IntoIterator<Item = &'a str>) -> 
 /// A resolved backend and the object path within it.
 type Located = (Arc<dyn Backend>, ObjectPath);
 
-/// How many backends a registry keeps. An application that forwards user URLs
-/// would otherwise grow the cache without bound; at the cap the least recently
+/// How many backends a registry keeps. An application that addresses many
+/// origins would otherwise grow the cache without bound; at the cap the least recently
 /// used backend is dropped to make room (calls already holding it keep it).
 const MAX_CACHED_STORES: usize = 256;
 
@@ -69,19 +71,21 @@ impl Cache {
 }
 
 /// Cache of resolved backends keyed on [`origin`], so each provider's
-/// `object_store` is built once and reused across calls, plus the shared HTTP
-/// client for bucket operations and other direct requests. The cache holds at
+/// `object_store` is built once and reused across calls. The cache holds at
 /// most [`MAX_CACHED_STORES`] backends and evicts the least recently used one.
 pub struct StoreRegistry {
     stores: Mutex<Cache>,
     capacity: usize,
-    http: OnceLock<reqwest::Client>,
     vars: Vars,
     /// The named AWS profile for S3 credentials, shared by every S3 backend.
     /// It is fixed for the registry's lifetime: [`Self::with_profile`] starts
     /// a new, empty cache, which is what isolates profiles, so the profile is
     /// not part of the cache key.
     profile: Option<Arc<AwsProfile>>,
+    /// The HTTP clients and credential providers the backends share. Outside
+    /// the cache, so evicting a backend does not drop them; a new registry
+    /// starts with its own, like the profile.
+    shared: Shared,
 }
 
 impl Default for StoreRegistry {
@@ -97,8 +101,9 @@ impl StoreRegistry {
     ///
     /// Concurrent first uses of a key may each build a backend, but all of
     /// them get the one that was stored first. Building is synchronous but not
-    /// free of I/O (GCS reads its service-account file, the HTTP backend
-    /// builds a TLS client), so it runs outside the lock.
+    /// free of I/O (GCS reads its service-account file, and a first client of
+    /// each kind loads the system CA store), so it runs outside the lock. The
+    /// registry's backends share their HTTP clients and credential providers.
     ///
     /// # Errors
     ///
@@ -113,7 +118,7 @@ impl StoreRegistry {
         if let Some(backend) = cached {
             return Ok((backend, object_path));
         }
-        let built = backend::build(url, &self.vars, self.profile.as_deref())?;
+        let built = backend::build(url, &self.vars, self.profile.as_deref(), &self.shared)?;
         Ok((self.keep(key, built), object_path))
     }
 
@@ -131,6 +136,12 @@ impl StoreRegistry {
             return Ok((first.clone(), (first.0, object_path(to)?)));
         }
         Ok((first, self.resolve(to)?))
+    }
+
+    /// Caches `backend` as the one for the origin of `url`.
+    #[cfg(all(test, any(feature = "cli", feature = "encryption")))]
+    pub(crate) fn preload(&self, url: &Url, backend: Arc<dyn Backend>) {
+        self.keep(origin(url), backend);
     }
 
     /// Stores `built` under `key` unless the key is already cached (that
@@ -181,42 +192,15 @@ impl StoreRegistry {
         Self {
             stores: Mutex::default(),
             capacity,
-            http: OnceLock::new(),
             vars,
             profile: None,
+            shared: Shared::default(),
         }
     }
 
     /// Number of distinct backends built so far.
     pub fn len(&self) -> usize {
         self.lock().entries.len()
-    }
-
-    /// The shared HTTP client for bucket operations, built on first use. A
-    /// server that does not answer cannot hang a call: connecting is given 5
-    /// seconds and a whole request 30.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Generic`] if the client cannot be built (for example
-    /// TLS or resolver initialisation fails).
-    pub fn http(&self) -> Result<&reqwest::Client> {
-        if let Some(client) = self.http.get() {
-            return Ok(client);
-        }
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30));
-        // Injected variables never read the process environment, and neither
-        // do their proxy settings. Production keeps honouring the proxies.
-        if matches!(self.vars, Vars::Map(_)) {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .build()
-            .map_err(|e| Error::Generic(format!("HTTP client: {e}")))?;
-        // A racing builder simply loses; `OnceLock::get_or_try_init` is unstable.
-        Ok(self.http.get_or_init(|| client))
     }
 }
 
@@ -225,6 +209,13 @@ impl StoreRegistry {
 /// the `file://` URL of its absolute path, so `..` is resolved lexically.
 pub fn parse_url(url: &str) -> Result<Url> {
     parse_url_with(url, std::env::home_dir, std::env::current_dir)
+}
+
+/// The parsed `raw` if [`parse_url`] takes it as a URL: it parses and its
+/// scheme has more than one character (`C:\x` is a Windows path). Anything
+/// else is a local path.
+pub fn url_form(raw: &str) -> Option<Url> {
+    Url::parse(raw).ok().filter(|u| u.scheme().len() > 1)
 }
 
 /// [`parse_url`] with the home and working directories supplied by the caller;
@@ -336,6 +327,52 @@ mod tests {
     }
 
     #[test]
+    fn a_control_character_in_a_path_is_escaped_in_the_error() {
+        let url = Url::parse("s3://b/%1b]52;c;x%07").expect("url");
+        let Err(Error::InvalidInput(message)) = object_path(&url) else {
+            panic!("a control character in the path is invalid");
+        };
+        assert!(message.contains("\\u{1b}"), "{message}");
+        assert!(
+            !message.chars().any(crate::text::is_unsafe_char),
+            "{message}"
+        );
+    }
+
+    /// A stub that answers bucket calls with 302 to a second stub: they fail
+    /// and the second stub receives nothing.
+    #[tokio::test]
+    async fn bucket_calls_do_not_follow_redirects() {
+        use crate::backend::stub::{Reply, serve};
+        let target = serve(vec![Reply::new(200, "")]).await;
+        let location: &'static str = Box::leak(format!("{}/bkt", target.base).into_boxed_str());
+        let first = serve(vec![
+            Reply::new(302, "").header("Location", location),
+            Reply::new(302, "").header("Location", location),
+        ])
+        .await;
+        let vars = HashMap::from(
+            [
+                ("S3_ENDPOINT", first.base.as_str()),
+                ("S3_ALLOW_HTTP", "true"),
+                ("S3_REGION", "us-east-1"),
+                ("S3_ACCESS_KEY_ID", "k"),
+                ("S3_SECRET_ACCESS_KEY", "s"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        );
+        let registry = StoreRegistry::with_vars(vars);
+        let url = Url::parse("s3://bkt").expect("url");
+        let (backend, _) = registry.resolve(&url).expect("resolve");
+        let err = backend.bucket_exists(&url).await.expect_err("302");
+        assert!(err.to_string().contains("302"), "{err}");
+        let err = backend.create_bucket(&url).await.expect_err("302");
+        assert!(err.to_string().contains("302"), "{err}");
+        assert_eq!(first.requests().len(), 2);
+        assert!(target.requests().is_empty());
+    }
+
+    #[test]
     fn url_paths_are_percent_decoded_once() {
         let got = parts("file:///tmp/dir%20a/x%20%25%C3%BC.bin").expect("resolve");
         assert_eq!(got, ["tmp", "dir a", "x %\u{fc}.bin"]);
@@ -393,6 +430,27 @@ mod tests {
     }
 
     #[test]
+    fn credentials_survive_eviction_and_belong_to_one_registry() {
+        let vars = || {
+            Vars::Map(Arc::new(HashMap::from([
+                ("AWS_REGION".to_owned(), "eu-west-1".to_owned()),
+                ("AWS_ACCESS_KEY_ID".to_owned(), "k".to_owned()),
+                ("AWS_SECRET_ACCESS_KEY".to_owned(), "s".to_owned()),
+            ])))
+        };
+        let registry = StoreRegistry::with_capacity(1, vars());
+        let first = s3(&registry, "a").s3_signing().expect("s3 backend");
+        // Each of these evicts the previous backend.
+        let (b, c) = (s3(&registry, "b"), s3(&registry, "c"));
+        assert_eq!(registry.len(), 1);
+        assert_eq!(b.s3_signing(), Some(first.clone()));
+        assert_eq!(c.s3_signing(), Some(first.clone()));
+        assert_eq!(s3(&registry, "a").s3_signing(), Some(first.clone()));
+        let other = StoreRegistry::with_capacity(1, vars());
+        assert_ne!(s3(&other, "a").s3_signing().expect("s3 backend").0, first.0);
+    }
+
+    #[test]
     fn profile_files_are_read_once_per_registry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (path, vars) = profile_vars(&dir);
@@ -446,40 +504,6 @@ mod tests {
             .expect("pair");
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(registry.len(), 1);
-    }
-
-    #[test]
-    fn the_http_client_is_built_once_on_first_use() {
-        let registry = StoreRegistry::default();
-        assert!(registry.http.get().is_none());
-        assert!(std::ptr::eq(
-            registry.http().expect("client"),
-            registry.http().expect("client")
-        ));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_silent_server_cannot_hang_a_bucket_request() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        // Accepts and then says nothing.
-        let silent = tokio::spawn(async move {
-            let (conn, _) = listener.accept().await.expect("accept");
-            std::future::pending::<()>().await;
-            drop(conn);
-        });
-        let registry = StoreRegistry::with_vars(HashMap::new());
-        let err = registry
-            .http()
-            .expect("client")
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect_err("timed out");
-        assert!(err.is_timeout(), "{err}");
-        silent.abort();
     }
 
     #[test]

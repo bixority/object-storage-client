@@ -9,10 +9,10 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.3.0"
+version = "0.4.0"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# maturin adds the cdylib crate type itself; do not list it here.
 name = "object_storage_client"
 
 
@@ -40,11 +40,13 @@ percent-encoding = "2.3"
 reqwest = { version = "0.13", features = ["rustls"], default-features = false }
 pyo3 = { version = "0.30", features = ["bytes"], optional = true }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"], optional = true }
+serde_json = "1"
 thiserror = "2.0"
 tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "fs", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 tracing = "0.1"
 url = "2.5"
+walkdir = "2"
 zeroize = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -52,11 +54,12 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [features]
 default = ["encryption", "cli"]
-# The `osc` binary and its `cli` module; the Python wheel does not need it.
-cli = ["dep:clap", "dep:tokio-util", "tokio/signal", "tokio/io-std", "tokio/macros"]
+# The `osc` binary and its `cli` module (implies `encryption`); the Python
+# wheel does not need it.
+cli = ["dep:clap", "dep:tokio-util", "tokio/signal", "tokio/io-std", "tokio/macros", "tokio/process", "encryption"]
 encryption = ["dep:zeroize"]
 # The `osc-gui` binary and its `gui` module (a two-pane desktop browser).
-gui = ["cli", "encryption", "dep:eframe", "dep:egui", "dep:egui_extras"]
+gui = ["cli", "dep:eframe", "dep:egui", "dep:egui_extras"]
 # Exposes `encryption::fuzzing` harness entry points for the `fuzz/` crate.
 fuzzing = ["encryption"]
 python = ["dep:pyo3", "dep:pyo3-async-runtimes", "encryption"]
@@ -86,7 +89,6 @@ alloc-counter = { path = "benches/alloc-counter" }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
 proptest = "1"
-serde_json = "1"
 tempfile = "3.27"
 testcontainers = { version = "0.28", default-features = false, features = ["aws-lc-rs", "reusable-containers"] }
 tokio = { version = "1.54", features = ["full", "test-util"] }
@@ -100,18 +102,15 @@ enum_glob_use = "deny"
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 unwrap_used = "deny"
-needless_for_each = { level = "allow", priority = 1 }
 
-[profile.dev]
-debug = true
-incremental = true
-opt-level = 0
+# Dependencies keep only line tables: backtraces stay useful and test binaries
+# shrink by hundreds of MB. The crate itself keeps full debug info.
+[profile.dev.package."*"]
+debug = "line-tables-only"
 
 [profile.release]
 # No panic = "abort": the cdylib must unwind so pyo3 turns panics into
 # exceptions, and drop guards must run.
 codegen-units = 1
-debug = false
 lto = "fat"
-opt-level = 3
 strip = true

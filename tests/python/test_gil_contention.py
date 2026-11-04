@@ -110,7 +110,7 @@ def _head_server():
             self.send_header("Last-Modified", "Wed, 21 Oct 2015 07:28:00 GMT")
             self.end_headers()
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

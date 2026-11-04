@@ -189,10 +189,33 @@ fn put_stream_allocates_per_frame_and_holds_a_few_mib() {
 }
 
 #[test]
+fn put_of_a_buffer_holds_a_few_mib_beside_it() {
+    let f = fixture(SIZE);
+    runtime().block_on(async {
+        let (up, ue) = (url(&f.out, "p"), url(&f.out, "e"));
+        let ((), plain_use) =
+            measure(async || f.plain.put(&up, f.data.clone()).await.expect("put")).await;
+        let ((), enc_use) =
+            measure(async || f.enc.put(&ue, f.data.clone()).await.expect("put")).await;
+        show("plain put 64 MiB", &plain_use);
+        show("enc put 64 MiB", &enc_use);
+
+        // The caller's buffer is not counted: the ciphertext is never held whole.
+        at_most("plain put peak", plain_use.peak_above_base, 4 * MIB);
+        at_most("enc put peak", enc_use.peak_above_base, 4 * MIB);
+
+        let n = drain_len(f.enc.get_stream(&ue).await.expect("stream")).await;
+        assert_eq!(n, SIZE);
+    });
+}
+
+#[test]
 fn small_caller_chunks_do_not_multiply_allocations() {
     let f = fixture(8 * MIB);
+    // The file:// writer buffers 512 KiB, so 4 KiB chunks cost no blocking-pool
+    // hop each (measured 2108 plain allocations before, 77 after).
     runtime().block_on(async {
-        for (chunk, plain_max, enc_max) in [(4 * 1024, 3200, 3800), (MIB, 70, 140)] {
+        for (chunk, plain_max, enc_max) in [(4 * 1024, 120, 350), (MIB, 70, 140)] {
             let (up, ue) = (url(&f.out, "p"), url(&f.out, "e"));
             let ((), p) = measure(async || {
                 f.plain

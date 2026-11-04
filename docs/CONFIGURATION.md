@@ -16,8 +16,11 @@ Also covers S3-compatible stores such as Garage and SeaweedFS.
 export S3_ACCESS_KEY_ID="AKIA..."
 export S3_SECRET_ACCESS_KEY="..."
 export AWS_REGION="eu-north-1"
-# Optional: temporary credentials
-export AWS_SESSION_TOKEN="..."
+# Temporary credentials (STS, SSO) do not go with the S3_* keys: use the
+# AWS_* variables instead, or a profile.
+#   export AWS_ACCESS_KEY_ID="ASIA..."
+#   export AWS_SECRET_ACCESS_KEY="..."
+#   export AWS_SESSION_TOKEN="..."
 # Optional: custom endpoint for S3-compatible stores (e.g. Garage)
 export AWS_ENDPOINT_URL_S3="http://localhost:3900"
 
@@ -28,6 +31,12 @@ export AWS_ENDPOINT_URL_S3="http://localhost:3900"
 # (It never applies to the AWS default endpoint: bucket operations against
 #  AWS always use https.)
 ```
+
+`S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` are long-lived keys. They are
+never sent with a session token, and `AWS_SESSION_TOKEN` is ignored while
+`S3_ACCESS_KEY_ID` is set, because that token belongs to the ambient `AWS_*`
+identity of another account. `AWS_SESSION_TOKEN` pairs only with
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 Without a named profile, `s3://` uses these variables: static keys, then web
 identity, container credentials and, on AWS only, the instance-metadata
@@ -109,7 +118,19 @@ region: `AWS_REGION`, `AWS_DEFAULT_REGION`, the profile's `region` (through
 The profile files are read on first use and again after a failed lookup, so
 fixing the file or running `aws sso login` needs no restart. A credential
 lookup gives up after 30 seconds. Resolved credentials are cached and renewed
-when less than 5 minutes remain.
+when less than 5 minutes remain. While the cached credential has at least 1
+minute left, a refresh that is running, slow or failed does not hold requests
+back: they use the cached credential, and a failed refresh is retried after 30
+seconds. Its error is not shown until the credential has run out. Credentials without an expiry (static keys in
+the profile, a `credential_process` that prints no `Expiration`,
+`credential_source = Environment`) are kept until the client is recreated, as
+in the AWS SDKs. After rotating such a key, create a new client or restart the
+process.
+
+A lookup that times out is not cancelled in the helper: a `credential_process`
+program keeps running and is not killed, and it may outlive the process. The
+next call joins that lookup instead of starting another helper, for at most 5
+minutes; after that it starts a new one.
 
 Endpoints. A global `AWS_ENDPOINT_URL` is refused with a profile, because the
 AWS SDK would send the profile's SSO and STS tokens to it; set the S3 endpoint
@@ -177,9 +198,19 @@ export GOOGLE_SERVICE_ACCOUNT="/path/to/service-account.json"
 
 # Optional: JSON API origin for bucket operations (create, exists), for
 # example an emulator. Default https://storage.googleapis.com; the OAuth
-# token is only sent when the origin is https.
+# token is only sent when the origin is https. Without it, bucket operations
+# use GOOGLE_BASE_URL. Object operations need GOOGLE_BASE_URL (or the key's
+# gcs_base_url) to reach an emulator.
 #   export GCS_BASE_URL="http://localhost:4443"
+
+# Bucket creation needs the project:
+#   export GOOGLE_CLOUD_PROJECT="my-project"
 ```
+
+`create_bucket` on an existing name succeeds only if `GOOGLE_CLOUD_PROJECT`
+lists the bucket. The credentials therefore need `storage.buckets.create` and
+`storage.buckets.list` on the project (`roles/storage.admin` has both). A
+bucket owned by another project is an error, even one you can write to.
 
 ## Azure Blob Storage (`az://`, `wasb(s)://`, `abfs(s)://`)
 
@@ -200,6 +231,13 @@ export AZURE_STORAGE_ACCOUNT_KEY="..."
 #   export AZURE_ALLOW_HTTP=true
 ```
 
+Bucket operations (`create_bucket`, `bucket_exists`) use the account name and
+endpoint of the store, so `AZURE_ENDPOINT` works like `AZURE_STORAGE_ENDPOINT`.
+They refuse `AZURE_STORAGE_USE_EMULATOR` and `AZURE_USE_FABRIC_ENDPOINT` unless
+an endpoint is set. With `AZURE_SKIP_SIGNATURE=true` the requests are unsigned,
+and a 404 from `bucket_exists` is an error, because Azure answers an anonymous
+request for a private container with 404.
+
 ## Local filesystem (`file://`)
 
 No environment variables; no credentials are required.
@@ -212,14 +250,41 @@ No environment variables; no credentials are required.
 | `OSC_KEYRING_COMMAND` | `osc`   | A shell command that prints a keyring, as an alternative to the file; setting both is an error. See [Encryption](ENCRYPTION.md#cli).                  |
 | `OSC_WORKER_THREADS`  | Python  | Worker threads of the async runtime, default `min(CPU count, 4)`. Set it before the first call.                                                       |
 
+Set environment variables before the first client call. Do not modify
+`os.environ` while client calls are in flight: backends read the environment
+on worker threads without the GIL.
+
+One client shares HTTP connections and credentials across the buckets of a
+provider, so these variables apply to all of them alike and tokens are not
+fetched again for each bucket. See [Behavior](BEHAVIOR.md).
+
+### Payload signing (S3)
+
+S3 requests sign the SHA-256 of every body, which costs one hashing pass over
+each upload and part. Over HTTPS this can be skipped with
+`AWS_UNSIGNED_PAYLOAD=true` (the AWS name for sending `UNSIGNED-PAYLOAD`),
+which saves CPU on fast links and on CPUs without SHA extensions. TLS then
+protects the body in transit, but no application-level checksum is sent, so
+integrity rests on TLS alone (encrypted objects are authenticated by their
+own frames either way). Do not use it with a plain `http://` endpoint. The
+default stays signed.
+
 ### Request timeouts
 
 Object requests (get, put, list, multipart parts, `http(s)://` stores) connect
 within 5 seconds, have no total deadline shorter than 24 hours, and fail when
 nothing arrives for 5 minutes: the read timeout bounds the time to the response
-headers (including sending the request body) and every gap between body reads.
+headers and every gap between body reads. The time to the headers includes
+sending the request body, so each upload request (one put, or one multipart
+part) must be fully sent and answered within the read timeout, even while bytes
+flow steadily. With the default 4 parts of 8 MiB in flight that takes about
+0.9 Mbit/s of uplink for one upload; a single `http(s)://` put of 1 GiB takes
+about 28.6 Mbit/s. A slower link fails with a timeout, and the upload is
+aborted. Raise the read timeout for the upload.
 Set `AWS_TIMEOUT` / `AWS_READ_TIMEOUT`, `GOOGLE_TIMEOUT` / `GOOGLE_READ_TIMEOUT`
 or `AZURE_TIMEOUT` / `AZURE_READ_TIMEOUT` (for example `90s`, `10m`) to change
 them for S3, GCS and Azure; a value you set is kept. `http(s)://` stores take
-no settings. Bucket operations keep their own limits (5 s to connect, 30 s per
-request), as does the profile credential lookup (30 s).
+no settings, so their read timeout cannot be raised. Bucket operations keep their own limits (5 s to connect, 30 s per
+request), as does the profile credential lookup (30 s). Apart from the limits,
+bucket operations follow the client settings of the store (proxy, certificates,
+user agent, HTTP version), see [Behaviour](BEHAVIOR.md).

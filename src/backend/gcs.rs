@@ -940,7 +940,7 @@ mod tests {
         assert!(stub.requests().is_empty());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn each_rewrite_call_is_retried_up_to_three_attempts() {
         let busy = || Reply::new(503, "{}");
         let (result, requests) =

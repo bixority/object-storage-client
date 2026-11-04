@@ -2180,7 +2180,7 @@ mod tests {
         assert_eq!(lines, ["HEAD /src/a", "PUT /bkt/b", "HEAD /bkt/b"]);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn transient_copy_failures_are_retried_up_to_three_attempts() {
         let busy = || Reply::new(503, error_document("SlowDown", "later"));
         let (done, requests) = cross_copy_all(vec![

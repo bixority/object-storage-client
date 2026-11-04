@@ -18,13 +18,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+// Unit tests run on the real clock against a loopback stub and use shorter
+// values. A paused tokio clock jumps to the HTTP timeouts while a loopback
+// connect is still pending on macOS, so it cannot be used for these.
+
 /// The first pause between two polls of a pending server-side copy.
+#[cfg(not(test))]
 const COPY_POLL_START: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const COPY_POLL_START: Duration = Duration::from_millis(5);
 /// The longest pause between two polls; the pause doubles up to this.
+#[cfg(not(test))]
 const COPY_POLL_MAX: Duration = Duration::from_secs(4);
+#[cfg(test)]
+const COPY_POLL_MAX: Duration = Duration::from_millis(40);
 /// How long a copy may stay pending before the call fails. The copy itself is
 /// not aborted and may still finish.
+#[cfg(not(test))]
 const COPY_WAIT_MAX: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const COPY_WAIT_MAX: Duration = Duration::from_secs(1);
 
 /// Azure backend. Retains the concrete [`MicrosoftAzure`] store so its storage
 /// credentials can be read for the `Create Container` call and for pre-signing.
@@ -777,7 +790,7 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_pending_copy_is_waited_for() {
         let replies = vec![
             Reply::new(202, ""),
@@ -800,7 +813,7 @@ mod tests {
         assert!(head.contains("authorization: sharedkey"), "{head}");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_move_deletes_the_source_only_after_the_copy_succeeded() {
         let replies = vec![
             blob_head(None),
@@ -825,7 +838,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_failed_copy_keeps_the_source() {
         let replies = vec![
             blob_head(None),
@@ -838,7 +851,7 @@ mod tests {
         assert!(lines(&stub).iter().all(|l| !l.starts_with("POST")));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_copy_pending_past_the_bound_is_an_error_and_keeps_the_source() {
         let mut replies = vec![blob_head(None), Reply::new(202, "")];
         replies.extend((0..60).map(|_| blob_head(Some("pending"))));
@@ -855,7 +868,7 @@ mod tests {
         assert!(lines(&stub).iter().all(|l| !l.starts_with("POST")));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_failed_status_check_does_not_print_the_sas() {
         let stub = serve(vec![
             Reply::new(403, "").header("x-ms-error-code", "AuthFailed"),
@@ -1137,7 +1150,7 @@ mod tests {
         (done, lines(&stub))
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_cross_container_move_deletes_the_source_only_after_the_copy_finished() {
         let replies = vec![
             blob_head(None),
@@ -1164,7 +1177,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_failed_or_refused_cross_container_copy_keeps_the_source() {
         let failed = vec![
             blob_head(None),
@@ -1201,7 +1214,7 @@ mod tests {
         assert!(matches!(err, Error::Generic(_)), "{err:?}");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn transient_copy_failures_are_retried_up_to_three_attempts() {
         let busy = || Reply::new(503, "").header("x-ms-error-code", "ServerBusy");
         let stub = serve(vec![busy(), busy(), Reply::new(202, "")]).await;

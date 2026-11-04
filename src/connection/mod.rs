@@ -296,7 +296,10 @@ mod tests {
     fn discovery_lists_local_then_env_then_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path();
-        write(&home.join(".aws/config"), "[profile b]\n[profile a]\n");
+        write(
+            &home.join(".aws/config"),
+            "[profile b]\nrole_arn = r\n[profile a]\nrole_arn = r\n",
+        );
         write(
             &home.join(".config/gcloud/configurations/config_default"),
             "[core]\nproject = p\n",
@@ -448,5 +451,59 @@ mod tests {
                 .folders,
             ["a"]
         );
+    }
+
+    /// A profile with only settings in `~/.aws/config` is a note; once keys
+    /// are added to either file, the next scan lists it and its client signs
+    /// with them, in the profile's region.
+    #[tokio::test]
+    async fn a_profile_is_listed_and_works_once_it_has_keys() {
+        use crate::backend::stub::{Reply, serve};
+        let body = "<ListAllMyBucketsResult><Buckets><Bucket><Name>a</Name></Bucket>\
+                    </Buckets></ListAllMyBucketsResult>";
+        for keys_in in ["credentials", "config"] {
+            let stub = serve(vec![Reply::new(200, body)]).await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let config = dir.path().join(".aws/config");
+            let settings = format!(
+                "[profile clbx]\nregion = eu-north-1\nendpoint_url = {}\n",
+                stub.base
+            );
+            write(&config, &settings);
+            let host = host(dir.path(), &[]);
+            let scan = || {
+                let mut found = Discovery::default();
+                aws::profiles(&host, &mut found);
+                found
+            };
+            let before = scan();
+            assert_eq!(before.connections, Vec::new(), "{keys_in}");
+            assert_eq!(
+                before.notes,
+                ["AWS profiles without credentials: clbx; add keys or SSO settings to use them"]
+            );
+
+            let keys = "aws_access_key_id = AKIDCLBX\naws_secret_access_key = secret\n";
+            if keys_in == "credentials" {
+                write(
+                    &dir.path().join(".aws/credentials"),
+                    &format!("[clbx]\n{keys}"),
+                );
+            } else {
+                write(&config, &format!("{settings}{keys}"));
+            }
+            let after = scan();
+            assert_eq!(after.notes, Vec::<String>::new(), "{keys_in}");
+            assert_eq!(after.connections.len(), 1, "{keys_in}");
+            assert_eq!(after.connections[0].label, "AWS · clbx · keys");
+            let client = after.connections[0].client().expect("client");
+            let listed = client.list_dir("s3:///", None, 10).await;
+            assert_eq!(listed.expect(keys_in).folders, ["a"]);
+            let headers = stub.requests()[0].headers.to_ascii_lowercase();
+            assert!(
+                headers.contains("credential=akidclbx/") && headers.contains("/eu-north-1/s3/"),
+                "{keys_in}: {headers}"
+            );
+        }
     }
 }

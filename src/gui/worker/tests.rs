@@ -363,7 +363,11 @@ async fn a_client_build_error_is_the_error_of_the_command() {
 async fn discovery_reports_the_local_result_then_the_final_one() {
     let home = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(home.path().join(".aws")).expect("mkdir");
-    std::fs::write(home.path().join(".aws/config"), "[profile dev]\n").expect("write");
+    std::fs::write(
+        home.path().join(".aws/config"),
+        "[profile dev]\nrole_arn = r\n",
+    )
+    .expect("write");
     let host = empty_host(home.path());
     let factory: Factory<crate::codec::Plain> = Box::new(Connection::client);
     let mut handle = spawn(&Handle::current(), factory, host, Arc::new(|| {}), false);

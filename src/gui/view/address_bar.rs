@@ -1,4 +1,4 @@
-//! The connection list, Up, the address field and Go.
+//! The connection list, the address field and Go.
 
 use crate::gui::action::Action;
 use crate::gui::display;
@@ -44,12 +44,6 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mu
                     );
                 }
             });
-        let up = ui
-            .add_enabled(panel.location.parent().is_some(), egui::Button::new("⬆ Up"))
-            .on_hover_text("Up one level (Backspace)");
-        if up.clicked() {
-            actions.push(Action::Up(side));
-        }
         // Right to left: Go sits at the right edge, the field fills the rest.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let go = ui.button("Go");

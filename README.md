@@ -1,12 +1,13 @@
 # Object Storage Client
 
 One URL-based API for AWS S3, Google Cloud Storage, Azure Blob Storage,
-HTTP(S) and the local filesystem, as a Rust library, Python bindings and the
-`osc` command-line tool. The scheme of each URL picks the backend, so a single
-client can copy and move objects between providers, stream large objects in
-bounded memory (see [Behaviour](docs/BEHAVIOR.md#large-objects-and-streaming)
-for the limits) and generate pre-signed URLs. Optional client-side encryption
-keeps object contents hidden from the storage provider.
+HTTP(S) and the local filesystem, as a Rust library, Python bindings, the
+`osc` command-line tool and the `osc-gui` desktop browser. The scheme of each
+URL picks the backend, so a single client can copy and move objects between
+providers, stream large objects in bounded memory (see
+[Behaviour](docs/BEHAVIOR.md#large-objects-and-streaming) for the limits) and
+generate pre-signed URLs. Optional client-side encryption keeps object contents
+hidden from the storage provider.
 
 - **One API for every backend**, including cross-provider copy and move.
 - **Streaming** uploads and downloads, with multipart uploads for large objects.
@@ -34,6 +35,120 @@ object key. A bucket-root URL such as `s3://bucket` addresses the bucket
 itself: list it, create it or check that it exists. Credentials come from
 environment variables or, for `s3://`, from a named AWS profile; see
 [Configuration](docs/CONFIGURATION.md).
+
+## Desktop browser (`osc-gui`)
+
+`osc-gui` is a two-panel desktop browser for the same stores as `osc`. Each
+panel shows one folder on its own connection, and you copy, move, rename and
+delete objects and whole folders within a panel or between the two, also across
+accounts and providers. It finds the connections already set up on the machine
+and takes the same encryption options as `osc`.
+
+![osc-gui with Local in the left panel and an S3 connection's bucket list in the right panel](docs/images/osc-gui.png)
+
+### Install
+
+The browser is behind the optional `gui` feature, so `osc` alone is unaffected.
+Install both binaries from the registry:
+
+```bash
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+cargo install object-storage-client --registry bixority --features gui
+```
+
+Or from a checkout:
+
+```bash
+cargo install --path . --features gui
+```
+
+On Linux, `osc-gui` needs a Wayland session; X11 is not supported.
+
+### Run
+
+```bash
+osc-gui                                        # both panels on Local, the current directory
+osc-gui --keyring keyring                      # copies encrypt and decrypt
+```
+
+Each panel has a connection selector for Local and what is found on the
+machine: AWS profiles, provider environment variables, gcloud configurations and
+Azure CLI storage accounts; a cloud connection lists its buckets. Type any
+matching URL or path into a panel's address bar and press Enter. If a
+connection cannot authenticate, an AWS SSO profile can log in from the panel's
+error banner; for gcloud and Azure the banner shows the command to run. The
+keys and shortcuts are listed in [Desktop browser](docs/GUI.md), which also
+covers limits and closing behaviour.
+
+## CLI (`osc`)
+
+### Install
+
+```bash
+export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+cargo install object-storage-client --registry bixority
+# or: cargo install --git https://codeberg.org/bixority/object-storage-client
+# or, from a checkout: cargo install --path .
+```
+
+### Run
+
+```bash
+osc put my_file.txt s3://my-bucket/remote_file.txt              # upload a file
+osc put --recursive my_dir s3://my-bucket/remote_dir/           # upload a directory
+osc get gs://my-bucket/data.json ./local_data.json              # download
+osc get-stream gs://my-bucket/large_file.bin > large_file.bin   # stream to stdout; progress on stderr
+osc --profile dev ls s3://my-bucket/                            # credentials from the AWS profile "dev"
+osc cp s3://source-bucket/image.png az://dest-container/image.png   # copy between providers
+osc mv s3://my-bucket/old_name.txt s3://my-bucket/new_name.txt
+osc ls s3://my-bucket/logs/                                     # names; --url prints full object URLs
+osc rm s3://my-bucket/temp_file.tmp
+osc exists s3://my-bucket/report.pdf                            # prints true or false
+osc mb s3://my-new-bucket                                       # create a bucket (a directory for local paths)
+osc bucket-exists s3://my-bucket                                # prints true or false
+
+# Pre-signed URLs (S3, GCS, Azure): a download link valid for the default
+# 1 hour, and an upload (PUT) link valid for 15 minutes. With temporary
+# credentials (SSO, an assumed role) an s3:// link stops working when that
+# session ends, whatever the expiry
+osc sign s3://my-bucket/report.pdf
+osc sign --method PUT --expires-in 900 s3://my-bucket/upload.bin
+# S3 only: the upload is rejected unless Content-Length and Content-Type match
+osc sign --method PUT --content-length 1048576 \
+    --content-type application/pdf s3://my-bucket/upload.pdf
+```
+
+`get-stream` writes each chunk to standard output as it arrives, so its output
+is complete only if `osc` exits 0. A failed read, or a truncated or tampered
+encrypted object, stops the output part way: every byte written was
+authenticated, but the object may be cut short. In a pipeline use
+`set -o pipefail`, or give a FILE for an all-or-nothing download.
+
+### Encryption
+
+With a keyring, `put`, `get`, `get-stream`, `cp` and `mv` encrypt and decrypt
+transparently:
+
+```bash
+umask 077                                    # keyring files must not be readable by others
+osc keyring new > keyring                    # a keyring with one fresh key
+osc --keyring keyring put report.csv s3://my-bucket/report.csv
+osc --keyring keyring get s3://my-bucket/report.csv report.csv
+osc enc inspect s3://my-bucket/report.csv    # header details; no keys needed
+
+# Rotation: add a key, wait until every reader has it, activate it, then move
+# objects off the old one (a single reader may use `osc keyring rotate`)
+osc keyring add < keyring > keyring.new && mv keyring.new keyring
+osc keyring activate <new key ID> < keyring > keyring.new && mv keyring.new keyring
+osc --keyring keyring enc reencrypt s3://my-bucket/ --from <old key ID>
+osc enc scan s3://my-bucket/                 # objects per key ID; retire the old key only when it has none and the scan exits 0
+```
+
+`--keyring` can also come from `OSC_KEYRING_FILE`, or from a command that
+prints the keyring (`OSC_KEYRING_COMMAND`), so the keyring never touches the
+disk. With `--require-encryption` (or `OSC_REQUIRE_ENCRYPTION=1`), `put`, `get`,
+`get-stream`, `cp`, `mv` and `sign` fail when no keyring is configured, instead
+of sending or reading plaintext.
 
 ## Rust
 
@@ -75,6 +190,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Download it back
     let retrieved = client.get("s3://my-bucket/hello.txt").await?;
     println!("Retrieved: {}", String::from_utf8_lossy(&retrieved));
+
+    // Stream a large object in bounded memory: the download feeds the upload
+    let stream = client.get_stream("s3://my-bucket/hello.txt").await?;
+    client.put_stream("file:///tmp/hello_copy.txt", stream).await?;
 
     // List the whole bucket from a bucket-root URL (flat, recursive: every key
     // is returned). Pass a prefix such as "s3://my-bucket/logs/" to narrow it.
@@ -156,7 +275,7 @@ let health = keyring.status(); // active key, key ages, last reload error
 ## Python
 
 The package is published on [PyPI](https://pypi.org/project/object-storage-client/)
-and needs Python 3.13+:
+and needs Python 3.13.9 to 3.15:
 
 ```bash
 pip install object-storage-client
@@ -211,6 +330,13 @@ async def main():
     async for chunk in stream:
         print(f"Chunk size: {len(chunk)}")
 
+    # Stream an upload from any async iterable of bytes (size_hint= is optional);
+    # a ByteStream from get_object_stream is piped natively
+    await client.put_object_stream(
+        "s3://my-bucket/hello-copy.txt",
+        await client.get_object_stream("s3://my-bucket/hello.txt"),
+    )
+
     # --- Move data across providers with one client ---
 
     # Copy S3 -> Google Cloud Storage (source is left in place)
@@ -253,107 +379,6 @@ await secure.put_object("s3://my-bucket/payroll.csv", b"id,salary")  # only ciph
 data = await secure.get_object("s3://my-bucket/payroll.csv")         # authenticated before it is returned
 health = keyring.status()  # active key, key ages, last reload error
 ```
-
-## CLI (`osc`)
-
-```bash
-export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
-cargo install object-storage-client --registry bixority
-# or: cargo install --git https://codeberg.org/bixority/object-storage-client
-# or, from a checkout: cargo install --path .
-```
-
-```bash
-osc put my_file.txt s3://my-bucket/remote_file.txt              # upload a file
-osc put --recursive my_dir s3://my-bucket/remote_dir/           # upload a directory
-osc get gs://my-bucket/data.json ./local_data.json              # download
-osc get-stream gs://my-bucket/large_file.bin > large_file.bin   # stream to stdout; progress on stderr
-osc --profile dev ls s3://my-bucket/                            # credentials from the AWS profile "dev"
-osc cp s3://source-bucket/image.png az://dest-container/image.png   # copy between providers
-osc mv s3://my-bucket/old_name.txt s3://my-bucket/new_name.txt
-osc ls s3://my-bucket/logs/                                     # names; --url prints full object URLs
-osc rm s3://my-bucket/temp_file.tmp
-osc exists s3://my-bucket/report.pdf                            # prints true or false
-osc mb s3://my-new-bucket                                       # create a bucket (a directory for local paths)
-osc bucket-exists s3://my-bucket                                # prints true or false
-
-# Pre-signed URLs (S3, GCS, Azure): a download link valid for the default
-# 1 hour, and an upload (PUT) link valid for 15 minutes. With temporary
-# credentials (SSO, an assumed role) an s3:// link stops working when that
-# session ends, whatever the expiry
-osc sign s3://my-bucket/report.pdf
-osc sign --method PUT --expires-in 900 s3://my-bucket/upload.bin
-# S3 only: the upload is rejected unless Content-Length and Content-Type match
-osc sign --method PUT --content-length 1048576 \
-    --content-type application/pdf s3://my-bucket/upload.pdf
-```
-
-`get-stream` writes each chunk to standard output as it arrives, so its output
-is complete only if `osc` exits 0. A failed read, or a truncated or tampered
-encrypted object, stops the output part way: every byte written was
-authenticated, but the object may be cut short. In a pipeline use
-`set -o pipefail`, or give a FILE for an all-or-nothing download.
-
-With a keyring, `put`, `get`, `get-stream`, `cp` and `mv` encrypt and decrypt
-transparently:
-
-```bash
-umask 077                                    # keyring files must not be readable by others
-osc keyring new > keyring                    # a keyring with one fresh key
-osc --keyring keyring put report.csv s3://my-bucket/report.csv
-osc --keyring keyring get s3://my-bucket/report.csv report.csv
-osc enc inspect s3://my-bucket/report.csv    # header details; no keys needed
-
-# Rotation: add a key, wait until every reader has it, activate it, then move
-# objects off the old one (a single reader may use `osc keyring rotate`)
-osc keyring add < keyring > keyring.new && mv keyring.new keyring
-osc keyring activate <new key ID> < keyring > keyring.new && mv keyring.new keyring
-osc --keyring keyring enc reencrypt s3://my-bucket/ --from <old key ID>
-```
-
-`--keyring` can also come from `OSC_KEYRING_FILE`, or from a command that
-prints the keyring (`OSC_KEYRING_COMMAND`), so the keyring never touches the
-disk.
-
-## Desktop browser (`osc-gui`)
-
-`osc-gui` is a two-panel desktop browser for the same stores as `osc`. Each
-panel shows one folder, and you copy, move, rename and delete objects and whole
-folders within a panel or between the two. It uses the same credentials and
-encryption options as `osc`.
-
-![osc-gui showing the root folder in both panels](docs/images/osc-gui.png)
-
-### Install
-
-The browser is behind the optional `gui` feature, so `osc` alone is unaffected.
-Install both binaries from the registry:
-
-```bash
-export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
-cargo install object-storage-client --registry bixority --features gui
-```
-
-Or from a checkout:
-
-```bash
-cargo install --path . --features gui
-```
-
-On Linux, `osc-gui` needs a Wayland session; X11 is not supported.
-
-### Run
-
-```bash
-osc-gui                                        # both panels on Local, the current directory
-osc-gui --keyring keyring                      # copies encrypt and decrypt
-```
-
-Each panel has a connection selector for Local and the AWS profiles, gcloud
-configurations and Azure storage accounts found on the machine; a cloud connection
-lists its buckets. Type any matching URL or path into a panel's address bar and
-press Enter. The keys and shortcuts are listed in
-[Desktop browser](docs/GUI.md), which also covers limits and closing behaviour.
 
 ## Documentation
 

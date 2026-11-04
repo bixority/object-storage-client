@@ -108,8 +108,10 @@ fn banners(ui: &mut egui::Ui, panel: &PanelState, side: Side, actions: &mut Vec<
         });
     }
     if let Some(error) = &panel.error {
+        // On its own line the text wraps inside the panel, so a long error
+        // cannot push the buttons out of it.
+        ui.colored_label(ui.visuals().error_fg_color, error);
         ui.horizontal(|ui| {
-            ui.colored_label(ui.visuals().error_fg_color, error);
             if ui.button("Retry").clicked() {
                 actions.push(Action::Retry(side));
             }
@@ -149,6 +151,9 @@ fn table(
     let modifiers = ui.input(|i| i.modifiers);
     let spacing = ui.spacing().item_spacing.y;
     let ctx = ui.ctx().clone();
+    // A ".." row on top goes up one level, when there is a level above.
+    let parent = panel.location.parent().is_some();
+    let offset = usize::from(parent);
     // Keyboard motion since the last frame: bring the cursor into view.
     // Clicks never scroll, since they do not count as moves.
     let mut builder = TableBuilder::new(ui).id_salt(("panel", side.index()));
@@ -159,7 +164,7 @@ fn table(
             .as_ref()
             .and_then(|cursor| panel.entries.iter().position(|e| e.is(cursor)));
         if let (Some(at), true) = (at, panel.cursor_moves > 0) {
-            builder = builder.scroll_to_row(at, None);
+            builder = builder.scroll_to_row(at + offset, None);
         }
     }
     let output = builder
@@ -185,8 +190,21 @@ fn table(
             });
         })
         .body(|body| {
-            body.rows(ROW_HEIGHT, panel.entries.len(), |mut row| {
-                let entry = &panel.entries[row.index()];
+            body.rows(ROW_HEIGHT, panel.entries.len() + offset, |mut row| {
+                let Some(index) = row.index().checked_sub(offset) else {
+                    row.set_selected(false);
+                    row.col(|ui| {
+                        ui.add(egui::Label::new("🗀 .."));
+                    });
+                    row.col(|_| {});
+                    row.col(|_| {});
+                    let response = row.response().on_hover_text("Up one level");
+                    if response.double_clicked() {
+                        actions.push(Action::Up(side));
+                    }
+                    return;
+                };
+                let entry = &panel.entries[index];
                 let name = entry.name();
                 let key = entry.key();
                 row.set_selected(panel.selection.contains(&key));

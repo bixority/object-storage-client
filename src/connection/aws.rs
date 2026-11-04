@@ -10,6 +10,24 @@ use std::path::PathBuf;
 /// The scope the AWS CLI registers a session with when it names none.
 const DEFAULT_SCOPE: &str = "sso:account:access";
 
+/// The keys that give a profile a credential source in the AWS SDK; a profile
+/// with none of them fails with "no credentials found", as with the AWS CLI.
+const CREDENTIAL_KEYS: [&str; 13] = [
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+    "credential_process",
+    "credential_source",
+    "login_session",
+    "role_arn",
+    "web_identity_token_file",
+    "sso_session",
+    "sso_start_url",
+    "sso_account_id",
+    "sso_role_name",
+    "sso_region",
+];
+
 /// The environment connection, when the variables hold credentials or an
 /// endpoint.
 pub(super) fn env(host: &Host) -> Option<Connection> {
@@ -28,7 +46,8 @@ pub(super) fn env(host: &Host) -> Option<Connection> {
 
 /// One connection per profile of the config and credentials files, sorted by
 /// name. The files are those the AWS CLI reads (`AWS_CONFIG_FILE` and
-/// `AWS_SHARED_CREDENTIALS_FILE` honoured).
+/// `AWS_SHARED_CREDENTIALS_FILE` honoured). A profile without credentials
+/// (only settings such as `region`) is left out and named in a note.
 pub(super) fn profiles(host: &Host, out: &mut Discovery) {
     // The loader only does blocking file reads, so one poll completes it.
     let loaded =
@@ -59,10 +78,15 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
 
     let mut names: Vec<&str> = set.profiles().collect();
     names.sort_unstable();
+    let mut without = Vec::new();
     for name in names {
         let Some(profile) = set.get_profile(name) else {
             continue;
         };
+        if !CREDENTIAL_KEYS.iter().any(|key| profile.get(key).is_some()) {
+            without.push(name);
+            continue;
+        }
         let sso = profile.get("sso_session").is_some() || profile.get("sso_start_url").is_some();
         let hint = if sso {
             " · SSO"
@@ -86,6 +110,12 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
             },
             login: sso_login(&set, name).map(Login::AwsSso),
         });
+    }
+    if !without.is_empty() {
+        out.notes.push(format!(
+            "AWS profiles without credentials: {}; add keys or SSO settings to use them",
+            without.join(", ")
+        ));
     }
 }
 
@@ -280,9 +310,12 @@ aws_secret_access_key = minio123
     #[test]
     fn the_file_overrides_are_honoured() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write(&dir.path().join(".aws/config"), "[profile home]\n");
+        write(
+            &dir.path().join(".aws/config"),
+            "[profile home]\nrole_arn = r\n",
+        );
         let custom = dir.path().join("elsewhere/cfg");
-        write(&custom, "[profile custom]\n");
+        write(&custom, "[profile custom]\nrole_arn = r\n");
         let creds = dir.path().join("elsewhere/creds");
         write(
             &creds,

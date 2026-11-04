@@ -613,10 +613,47 @@ fn the_selector_items_emit_their_actions() {
     assert_eq!(actions, [Action::Rescan]);
 }
 
+/// Double-clicks at `pos`, with explicit times so egui counts a double click.
+fn double_click(ctx: &egui::Context, state: &AppState, pos: egui::Pos2) -> Vec<Action> {
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let frames = [
+        vec![egui::Event::PointerMoved(pos)],
+        vec![button(true)],
+        vec![button(false)],
+        vec![button(true)],
+        vec![button(false)],
+        Vec::new(),
+    ];
+    let mut actions = Vec::new();
+    let mut time = 100.0;
+    for events in frames {
+        let mut frame_actions = Vec::new();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| frame_actions = draw(ui, state),
+        );
+        output.drop_without_applying_deltas();
+        actions.extend(frame_actions);
+        time += 0.05;
+    }
+    actions
+}
+
 #[test]
-fn up_works_at_a_bucket_root_but_not_at_the_provider_root() {
+fn the_dotdot_row_goes_up_only_where_there_is_a_level_above() {
     let mut s = connections_state();
     s.panels[0].connection = Arc::new(sso());
+    // The right panel must not show a ".." row of its own.
+    s.panels[1].location = loc("file:///");
     for (url, expected) in [
         ("s3://media/", vec![Action::Up(Side::Left)]),
         ("s3:///", vec![]),
@@ -624,8 +661,53 @@ fn up_works_at_a_bucket_root_but_not_at_the_provider_root() {
     ] {
         s.panels[0].location = loc(url);
         let (ctx, shapes) = settled(&s);
-        let (_, actions) = click(&ctx, &s, find_text(&shapes, "⬆ Up"));
-        assert_eq!(actions, expected, "{url}");
+        let shown = painted(&shapes).contains("🗀 ..");
+        assert_eq!(shown, !expected.is_empty(), "{url}");
+        if shown {
+            let actions = double_click(&ctx, &s, find_text(&shapes, "🗀 .."));
+            assert_eq!(actions, expected, "{url}");
+        }
+    }
+}
+
+#[test]
+fn a_long_error_keeps_the_banner_buttons_in_the_panel() {
+    let mut s = connections_state();
+    s.panels[0].connection = Arc::new(sso());
+    s.panels[0].error = Some(
+        "Object store error: Generic S3 error: AWS profile `bixority` credentials \
+         unavailable: the credential source or role assumption failed (for an SSO \
+         profile, run `aws sso login --profile bixority`)"
+            .to_owned(),
+    );
+    let ctx = egui::Context::default();
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    };
+    let mut shapes = Vec::new();
+    for _ in 0..2 {
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = draw(ui, &s);
+        });
+        shapes.clone_from(&output.shapes);
+        output.drop_without_applying_deltas();
+    }
+    // The left panel is the left half of the window.
+    for button in ["Retry", "Log in"] {
+        let right = shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(t) if t.galley.text() == button => {
+                    Some(t.pos.x + t.galley.rect.width())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{button} is not painted"));
+        assert!(right < 640.0, "{button} ends at x = {right}");
     }
 }
 

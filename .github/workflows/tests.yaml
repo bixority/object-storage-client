@@ -139,8 +139,9 @@ jobs:
       - run: cargo check --locked --no-default-features --features encryption --lib
       - run: cargo check --locked --no-default-features --features gui --bins
       # Keeps `encryption::fuzzing` and the fuzz targets compiling, against the
-      # committed fuzz/Cargo.lock.
-      - run: cargo check --locked --manifest-path fuzz/Cargo.toml --target-dir target
+      # committed fuzz/Cargo.lock. Not --locked: CI's cargo fails on a lock
+      # update instead of applying it.
+      - run: cargo check --manifest-path fuzz/Cargo.toml --target-dir target
 
   python:
     name: python tests (${{ matrix.python }})

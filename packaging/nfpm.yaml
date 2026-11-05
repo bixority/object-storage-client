@@ -1,0 +1,60 @@
+# Built by scripts/release/linux-packages.sh, which sets NFPM_ARCH (amd64|arm64)
+# and VERSION in the environment and replaces @BIN_DIR@ with the binary directory.
+name: object-storage-client
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+release: "1"
+section: utils
+priority: optional
+maintainer: Olegs Korsaks <olegs.korsaks@bixority.com>
+description: |
+  Client for S3-compatible object storage (osc command line tool and osc-gui).
+vendor: Bixority
+homepage: https://github.com/bixority/object-storage-client
+license: GPL-3.0-only
+
+contents:
+  - src: @BIN_DIR@/osc
+    dst: /usr/bin/osc
+    file_info:
+      mode: 0755
+  - src: @BIN_DIR@/osc-gui
+    dst: /usr/bin/osc-gui
+    file_info:
+      mode: 0755
+  - src: packaging/linux/osc-gui.desktop
+    dst: /usr/share/applications/osc-gui.desktop
+    file_info:
+      mode: 0644
+  - src: packaging/icon/osc-gui.png
+    dst: /usr/share/icons/hicolor/1024x1024/apps/osc-gui.png
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/object-storage-client/README.md
+    file_info:
+      mode: 0644
+  - src: LICENSE
+    dst: /usr/share/doc/object-storage-client/LICENSE
+    file_info:
+      mode: 0644
+
+# osc-gui loads these at runtime (Wayland, xkbcommon, EGL, GL).
+overrides:
+  deb:
+    depends:
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+      - libxkbcommon0
+      - libegl1
+      - libgl1
+  rpm:
+    depends:
+      - libwayland-client
+      - libwayland-cursor
+      - libwayland-egl
+      - libxkbcommon
+      - libglvnd-egl
+      - libglvnd-opengl

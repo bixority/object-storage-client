@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Object Storage Client
+Comment=Browse and manage S3-compatible object storage
+Exec=osc-gui
+Icon=osc-gui
+Terminal=false
+Categories=Network;
+StartupWMClass=osc-gui

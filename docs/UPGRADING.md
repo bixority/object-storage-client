@@ -1,6 +1,6 @@
 # Upgrading
 
-## Unreleased
+## From 0.4.4 to 0.4.5
 
 ### `osc-gui`
 

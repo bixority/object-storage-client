@@ -4,7 +4,12 @@
 yanked = "deny"
 # Triage an advisory by updating the crate; only if that is impossible, add
 # its id here with a reason.
-ignore = []
+ignore = [
+    # astral-tokio-tar is unmaintained (all versions); it comes only from the
+    # dev-dependency testcontainers 0.28 (the latest), so it never ships.
+    # Remove once testcontainers drops it.
+    { id = "RUSTSEC-2026-0440", reason = "dev-only via testcontainers 0.28; no maintained alternative yet" },
+]
 
 [bans]
 multiple-versions = "allow"

@@ -1,0 +1,29 @@
+# Maintainer: Olegs Korsaks <olegs.korsaks@bixority.com>
+# Rendered by scripts/release/render-aur.sh. Do not edit the rendered file.
+pkgname=object-storage-client-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Client for S3-compatible object storage (osc and osc-gui), prebuilt binaries'
+arch=('x86_64' 'aarch64')
+url='https://github.com/bixority/object-storage-client'
+license=('GPL-3.0-only')
+depends=('glibc' 'gcc-libs' 'wayland' 'libxkbcommon' 'libglvnd')
+provides=('object-storage-client')
+conflicts=('object-storage-client')
+options=('!strip')
+# Literal arch in each URL (not $CARCH) so .SRCINFO is right on any host.
+source_x86_64=("object-storage-client-$pkgver-linux-x86_64.tar.gz::https://github.com/bixority/object-storage-client/releases/download/v$pkgver/object-storage-client-$pkgver-linux-x86_64.tar.gz")
+source_aarch64=("object-storage-client-$pkgver-linux-aarch64.tar.gz::https://github.com/bixority/object-storage-client/releases/download/v$pkgver/object-storage-client-$pkgver-linux-aarch64.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+    cd "$srcdir/object-storage-client-$pkgver-linux-$CARCH"
+    install -Dm755 osc "$pkgdir/usr/bin/osc"
+    install -Dm755 osc-gui "$pkgdir/usr/bin/osc-gui"
+    install -Dm644 osc-gui.desktop "$pkgdir/usr/share/applications/osc-gui.desktop"
+    install -Dm644 osc-gui.png "$pkgdir/usr/share/icons/hicolor/1024x1024/apps/osc-gui.png"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/object-storage-client/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/doc/object-storage-client/LICENSE"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

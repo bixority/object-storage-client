@@ -275,9 +275,14 @@ connections it finds on the machine and gives each one a client of its own
   lists for a subscription, signed in through `az` (`AZURE_USE_AZURE_CLI`).
 
 A profile, gcloud or Azure CLI connection takes nothing else from the
-environment: `S3_ENDPOINT`, `AWS_REGION` and the timeout and transport
-variables do not apply to it, and an AWS profile's region and S3
-endpoint come from the profile. The system proxy settings still apply, and the
+environment: `S3_ENDPOINT` and the timeout and transport variables do not apply
+to it, and an AWS profile's S3 endpoint comes from the profile. The one
+exception is the region of an AWS profile connection: as with the AWS CLI,
+`S3_REGION`, `AWS_REGION` and `AWS_DEFAULT_REGION` (as they were when
+`osc-gui` searched for connections) come before the profile's `region`, else
+`us-east-1`. When S3 answers that a bucket lives in another region (a `301`
+or `400` naming it in `x-amz-bucket-region`), `osc-gui` uses that region for
+the bucket from then on and lists it again. The system proxy settings still apply, and the
 AWS SDK's own SSO and STS requests still read the process environment (see
 [AWS profiles and SSO](#aws-profiles-and-sso)). A global `AWS_ENDPOINT_URL` is
 refused for a profile connection, as described under Endpoints: a panel on that

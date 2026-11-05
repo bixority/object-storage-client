@@ -408,6 +408,41 @@ fn login_reloads_only_the_panels_on_that_connection() {
 }
 
 #[test]
+fn login_reloads_the_panels_that_share_the_login() {
+    let mut s = state();
+    s.panels[0].connection = sso("aws-profile:dev");
+    s.panels[1].connection = sso("aws-profile:core");
+    let done = || Event::LoginDone {
+        conn_id: "aws-profile:dev".into(),
+        result: Ok(()),
+    };
+    let commands = event(&mut s, done());
+    assert_eq!(commands.len(), 2);
+
+    // Another login, or none, is not reloaded.
+    let other = Arc::new(Connection {
+        login: Some(Login::AwsSso(SsoLogin {
+            identifier: "other".into(),
+            start_url: "https://y.awsapps.com/start".into(),
+            region: "eu-west-1".into(),
+            scopes: Vec::new(),
+        })),
+        ..(*s3("aws-profile:other")).clone()
+    });
+    for connection in [other, s3("aws-profile:plain")] {
+        s.panels[1].connection = connection;
+        let commands = event(&mut s, done());
+        assert!(matches!(
+            commands.as_slice(),
+            [Command::List {
+                side: Side::Left,
+                ..
+            }]
+        ));
+    }
+}
+
+#[test]
 fn login_error_stays_in_the_dialog_and_cancel_stops_it() {
     let mut s = state();
     s.panels[0].connection = sso("aws-profile:dev");

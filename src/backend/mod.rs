@@ -40,11 +40,11 @@ use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
 use object_store::{ClientConfigKey, ObjectMeta, ObjectStore};
 #[cfg(feature = "gui")]
-pub use s3::PROFILE_ENDPOINT_REFUSED;
+pub use s3::{PROFILE_ENDPOINT_REFUSED, S3Backend};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 use url::Url;
 
@@ -67,9 +67,48 @@ pub struct Shared {
     aws: OnceLock<AwsCredentialProvider>,
     gcs: OnceLock<(GcpCredentialProvider, GcpSigningCredentialProvider)>,
     azure: OnceLock<AzureCredentialProvider>,
+    /// The regions that S3 reported for buckets, see [`BucketRegions`].
+    regions: Arc<BucketRegions>,
+}
+
+/// The region of each S3 bucket, as learned from S3's own answers (the
+/// `x-amz-bucket-region` header of a redirect), by bucket name. Poison-tolerant.
+#[derive(Default)]
+pub struct BucketRegions(Mutex<HashMap<String, String>>);
+
+impl BucketRegions {
+    /// The region learned for `bucket`, if any.
+    pub fn get(&self, bucket: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(bucket)
+            .cloned()
+    }
+
+    /// Records `region` as the region of `bucket`.
+    #[cfg(feature = "gui")]
+    pub fn learn(&self, bucket: &str, region: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(bucket.to_owned(), region.to_owned());
+    }
 }
 
 impl Shared {
+    /// Records `region` as the region of the S3 bucket `bucket`.
+    #[cfg(all(test, feature = "gui"))]
+    pub fn learn_region(&self, bucket: &str, region: &str) {
+        self.regions.learn(bucket, region);
+    }
+
+    /// The region learned for the S3 bucket `bucket`, if any.
+    #[cfg(feature = "gui")]
+    pub fn learned_region(&self, bucket: &str) -> Option<String> {
+        self.regions.get(bucket)
+    }
+
     /// A connector for a store's HTTP clients, drawn from the shared cache.
     fn connector(&self) -> BoundedConnector<SharedConnector> {
         BoundedConnector::shared(&self.clients)

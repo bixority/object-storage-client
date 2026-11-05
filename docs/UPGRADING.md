@@ -1,5 +1,20 @@
 # Upgrading
 
+## Unreleased
+
+### `osc-gui`
+
+- An AWS profile connection now takes `S3_REGION`, `AWS_REGION` and
+  `AWS_DEFAULT_REGION` from the environment, before the profile's `region`, as
+  the AWS CLI does. They used to be ignored, so a profile without `region`
+  signed for `us-east-1`.
+- A bucket in another region than the one used no longer fails with
+  `301 PermanentRedirect`: the region S3 names is used for that bucket and the
+  listing is retried once.
+- A profile with `sso_session` and its own `sso_start_url` or `sso_region` is
+  named in a note; the AWS SDK refuses it. Remove the repeated keys.
+- After an SSO login, panels on every profile that shares the login reload.
+
 ## From 0.4.3 to 0.4.4
 
 ### Errors

@@ -64,7 +64,11 @@ local files and variables and never asks you to log in; for Azure it also asks
   `AZURE_STORAGE_ACCOUNT_NAME` variable.
 
 Anything it could not use is listed under the connections as a small grey
-note. An AWS profile is refused while `AWS_ENDPOINT_URL` is set, and a panel on
+note. A note also names an AWS profile that repeats `sso_start_url` or
+`sso_region` next to `sso_session`: the AWS SDK refuses that profile, so
+remove the repeated keys (they belong in the `[sso-session]` section). After
+an SSO login, every panel whose profile shares that login is reloaded. An AWS
+profile is refused while `AWS_ENDPOINT_URL` is set, and a panel on
 it shows that error (see CONFIGURATION.md). "Rescan" searches again. A
 connection uses only its own settings, so one panel can use another account than
 the other, and copies between panels on different connections stream through

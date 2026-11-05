@@ -28,6 +28,10 @@ const CREDENTIAL_KEYS: [&str; 13] = [
     "sso_region",
 ];
 
+/// The region variables the S3 backend reads, which a profile connection
+/// takes from the process environment as the AWS CLI does.
+const REGION_VARS: [&str; 3] = ["S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"];
+
 /// The environment connection, when the variables hold credentials or an
 /// endpoint.
 pub(super) fn env(host: &Host) -> Option<Connection> {
@@ -87,6 +91,19 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
             without.push(name);
             continue;
         }
+        if let Some(session) = profile.get("sso_session") {
+            let keys: Vec<&str> = ["sso_start_url", "sso_region"]
+                .into_iter()
+                .filter(|key| profile.get(key).is_some())
+                .collect();
+            if !keys.is_empty() {
+                out.notes.push(format!(
+                    "AWS profile {name} sets {} next to sso_session {session}; \
+                     remove them from the profile, they belong in [sso-session {session}]",
+                    keys.join(" and ")
+                ));
+            }
+        }
         let sso = profile.get("sso_session").is_some() || profile.get("sso_start_url").is_some();
         let hint = if sso {
             " · SSO"
@@ -108,6 +125,10 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
                 config: config.clone(),
                 credentials: credentials.clone(),
                 process_endpoint: host.any(&["AWS_ENDPOINT_URL"]),
+                regions: REGION_VARS
+                    .iter()
+                    .filter_map(|key| Some(((*key).to_owned(), host.var(key)?)))
+                    .collect(),
             },
             login: sso_login(&set, name).map(Login::AwsSso),
         });
@@ -403,5 +424,145 @@ aws_secret_access_key = minio123
         assert_eq!(found.connections.len(), 0);
         assert_eq!(found.notes.len(), 1);
         assert!(found.notes[0].starts_with("AWS profiles could not be read"));
+    }
+
+    /// Several profiles on one start URL, the common multi-account setup: each
+    /// is its own connection, and those that share a login share one token
+    /// cache entry (the identifier names the file, as with the AWS CLI).
+    #[test]
+    fn profiles_sharing_a_start_url_each_get_a_connection_and_share_the_login() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join(".aws/config"),
+            "\
+[sso-session corp]
+sso_start_url = https://corp.awsapps.com/start
+sso_region = eu-west-1
+
+[sso-session corp-again]
+sso_start_url = https://corp.awsapps.com/start
+sso_region = eu-west-1
+
+[profile dev]
+sso_session = corp
+sso_account_id = 111111111111
+sso_role_name = Admin
+
+[profile core-infra]
+sso_session = corp
+sso_account_id = 222222222222
+sso_role_name = Admin
+
+[profile legacy-dev]
+sso_session = corp-again
+sso_account_id = 333333333333
+sso_role_name = Admin
+
+[profile old-a]
+sso_start_url = https://corp.awsapps.com/start
+sso_region = eu-west-1
+sso_account_id = 111111111111
+sso_role_name = Admin
+
+[profile old-b]
+sso_start_url = https://corp.awsapps.com/start
+sso_region = eu-west-1
+sso_account_id = 222222222222
+sso_role_name = ReadOnly
+",
+        );
+        let found = scan(&host(dir.path(), &[]));
+        let ids: Vec<_> = found.connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "aws-profile:core-infra",
+                "aws-profile:dev",
+                "aws-profile:legacy-dev",
+                "aws-profile:old-a",
+                "aws-profile:old-b",
+            ]
+        );
+        assert_eq!(found.notes, Vec::<String>::new());
+        let login = |name| match &find(&found, name).login {
+            Some(Login::AwsSso(login)) => login.clone(),
+            other => panic!("{name}: {other:?}"),
+        };
+        // One sso-session: one login and one token for both accounts.
+        assert_eq!(login("dev"), login("core-infra"));
+        assert_eq!(login("dev").identifier, "corp");
+        // Another session name on the same URL is a separate token, as the
+        // AWS CLI keeps it.
+        assert_eq!(login("legacy-dev").identifier, "corp-again");
+        assert_eq!(login("legacy-dev").start_url, login("dev").start_url);
+        // Legacy profiles share the token of their start URL.
+        assert_eq!(login("old-a"), login("old-b"));
+        assert_eq!(login("old-a").identifier, "https://corp.awsapps.com/start");
+    }
+
+    #[test]
+    fn the_region_variables_are_recorded_on_each_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join(".aws/config"),
+            "[profile dev]\nregion = us-east-1\naws_access_key_id = AKID\naws_secret_access_key = s\n",
+        );
+        let recorded = |extra: &[(&str, &str)]| {
+            let found = scan(&host(dir.path(), extra));
+            let Source::AwsProfile { regions, .. } = &find(&found, "dev").source else {
+                panic!("not a profile");
+            };
+            regions.clone()
+        };
+        assert_eq!(recorded(&[]), Vec::new());
+        assert_eq!(
+            recorded(&[("AWS_REGION", ""), ("S3_REGION", "")]),
+            Vec::new()
+        );
+        assert_eq!(
+            recorded(&[
+                ("AWS_DEFAULT_REGION", "eu-west-2"),
+                ("AWS_REGION", "eu-north-1"),
+                ("S3_REGION", ""),
+            ]),
+            [
+                ("AWS_REGION".to_owned(), "eu-north-1".to_owned()),
+                ("AWS_DEFAULT_REGION".to_owned(), "eu-west-2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sso_keys_next_to_sso_session_are_a_note_and_the_profile_stays() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join(".aws/config"),
+            "\
+[sso-session corp]
+sso_start_url = https://corp.awsapps.com/start
+sso_region = eu-west-1
+
+[profile dup]
+sso_session = corp
+sso_start_url = https://corp.awsapps.com/start
+sso_region = eu-west-1
+sso_account_id = 1
+sso_role_name = Admin
+
+[profile clean]
+sso_session = corp
+sso_account_id = 1
+sso_role_name = Admin
+",
+        );
+        let found = scan(&host(dir.path(), &[]));
+        assert_eq!(found.connections.len(), 2);
+        assert_eq!(
+            found.notes,
+            [
+                "AWS profile dup sets sso_start_url and sso_region next to sso_session corp; \
+                 remove them from the profile, they belong in [sso-session corp]"
+            ]
+        );
     }
 }

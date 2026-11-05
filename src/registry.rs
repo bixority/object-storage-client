@@ -168,6 +168,34 @@ impl StoreRegistry {
         backend::list_buckets(scheme, &self.vars, self.profile.as_deref(), &self.shared).await
     }
 
+    /// For an S3 `url`: drops the cached backend when this registry has learned
+    /// a region for its bucket that differs from the backend's, so the next
+    /// [`Self::resolve`] builds one that signs with it. Returns whether it did.
+    #[cfg(feature = "gui")]
+    pub(crate) fn evict_for_learned_region(&self, url: &Url) -> bool {
+        if url.scheme() != "s3" {
+            return false;
+        }
+        let Some(bucket) = url.host_str() else {
+            return false;
+        };
+        let Some(learned) = self.shared.learned_region(bucket) else {
+            return false;
+        };
+        let mut cache = self.lock();
+        let key = origin(url);
+        let stale = cache.entries.get(key).is_some_and(|(_, backend)| {
+            backend
+                .as_any()
+                .and_then(|any| any.downcast_ref::<backend::S3Backend>())
+                .is_some_and(|s3| s3.region() != learned)
+        });
+        if stale {
+            cache.entries.remove(key);
+        }
+        stale
+    }
+
     /// Caches `backend` as the one for the origin of `url`.
     #[cfg(all(test, any(feature = "cli", feature = "encryption", feature = "gui")))]
     pub(crate) fn preload(&self, url: &Url, backend: Arc<dyn Backend>) {
@@ -535,6 +563,34 @@ mod tests {
         assert_eq!(s3(&registry, "a").s3_signing(), Some(first.clone()));
         let other = StoreRegistry::with_capacity(1, vars());
         assert_ne!(s3(&other, "a").s3_signing().expect("s3 backend").0, first.0);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn a_learned_bucket_region_replaces_the_backend_and_the_resolved_chain() {
+        let registry = StoreRegistry::with_vars(HashMap::from([
+            ("AWS_REGION".to_owned(), "eu-west-1".to_owned()),
+            ("AWS_ACCESS_KEY_ID".to_owned(), "k".to_owned()),
+            ("AWS_SECRET_ACCESS_KEY".to_owned(), "s".to_owned()),
+        ]));
+        let url = Url::parse("s3://a/x").expect("url");
+        let region = |b: &Arc<dyn Backend>| b.s3_signing().expect("s3 backend").1;
+        let first = s3(&registry, "a");
+        assert_eq!(region(&first), "eu-west-1");
+        // Nothing learned: nothing is evicted.
+        assert!(!registry.evict_for_learned_region(&url));
+        registry.shared.learn_region("a", "eu-central-1");
+        assert!(registry.evict_for_learned_region(&url));
+        assert_eq!(registry.len(), 0);
+        let second = s3(&registry, "a");
+        assert_eq!(region(&second), "eu-central-1");
+        // The rebuilt backend already agrees: no further eviction.
+        assert!(!registry.evict_for_learned_region(&url));
+        assert!(Arc::ptr_eq(&second, &s3(&registry, "a")));
+        // Other buckets and other schemes are untouched.
+        assert_eq!(region(&s3(&registry, "b")), "eu-west-1");
+        let gs = Url::parse("gs://a/x").expect("url");
+        assert!(!registry.evict_for_learned_region(&gs));
     }
 
     #[test]

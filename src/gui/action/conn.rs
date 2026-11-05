@@ -91,7 +91,7 @@ pub(super) fn login_code(
     Vec::new()
 }
 
-/// A finished login: reload the panels on the connection, or show the error.
+/// A finished login: reload the panels on the connection or its login, or show the error.
 pub(super) fn login_done(
     state: &mut AppState,
     conn_id: &str,
@@ -102,9 +102,19 @@ pub(super) fn login_done(
             if dialog_of(state, conn_id).is_some() {
                 state.dialog = None;
             }
+            // Profiles that share a login (one sso-session or start URL) share
+            // its token, so every panel on that login retries.
+            let login = state
+                .panels
+                .iter()
+                .map(|panel| &panel.connection)
+                .chain(&state.connections)
+                .find(|c| c.id == conn_id)
+                .and_then(|c| c.login.clone());
             let mut commands = Vec::new();
             for side in [Side::Left, Side::Right] {
-                if state.panels[side.index()].connection.id == conn_id {
+                let connection = &state.panels[side.index()].connection;
+                if connection.id == conn_id || (login.is_some() && connection.login == login) {
                     commands.extend(nav::reload(state, side));
                 }
             }

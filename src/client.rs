@@ -670,7 +670,15 @@ impl<C: Codec> Client<C> {
         let r = self.resolve_url(url)?;
         let path = r.loc.path;
         let first = page_token.is_none();
-        let listed = r.backend.list_page(&path, max, page_token).await?;
+        let listed = match r.backend.list_page(&path, max, page_token.clone()).await {
+            Err(_) if self.registry.evict_for_learned_region(&r.loc.url) => {
+                // S3 named the bucket's region: retry once with a backend that
+                // signs for it. A second failure is reported as it is.
+                let retry = self.resolve_url(r.loc.url.clone())?;
+                retry.backend.list_page(&path, max, page_token).await?
+            }
+            other => other?,
+        };
         let next = listed.next;
         let links = if first && r.backend.scheme() == "file" {
             local_links(crate::backend::fs_path(&path)?).await?
@@ -2614,6 +2622,125 @@ mod tests {
             assert_eq!(page.next.as_deref(), Some("n"));
             let line = &stub.requests()[0].line;
             assert!(line.contains("prefix=d%2F&max-keys=3"), "{line}");
+        }
+
+        /// A client for bucket `bkt` on a stub answering `replies`, signing
+        /// with `us-east-1` to start with.
+        async fn region_client(
+            replies: Vec<crate::backend::stub::Reply>,
+        ) -> (ObjectStorageClient, crate::backend::stub::Stub) {
+            let stub = crate::backend::stub::serve(replies).await;
+            let c = ObjectStorageClient::with_vars(std::collections::HashMap::from(
+                [
+                    ("S3_ENDPOINT", stub.base.as_str()),
+                    ("S3_ALLOW_HTTP", "true"),
+                    ("S3_REGION", "us-east-1"),
+                    ("S3_ACCESS_KEY_ID", "k"),
+                    ("S3_SECRET_ACCESS_KEY", "s"),
+                ]
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            ));
+            (c, stub)
+        }
+
+        const REDIRECT: &str = "<Error><Code>PermanentRedirect</Code>\
+            <Message>The bucket you are attempting to access must be addressed using the specified endpoint.</Message></Error>";
+        const LISTING: &str = "<ListBucketResult><Prefix>d/</Prefix>\
+            <Contents><Key>d/o</Key><LastModified>2024-05-06T07:08:09.000Z</LastModified><Size>7</Size></Contents>\
+            <IsTruncated>false</IsTruncated></ListBucketResult>";
+
+        #[tokio::test]
+        async fn an_s3_listing_follows_the_region_that_s3_names() {
+            use crate::backend::stub::Reply;
+            let (c, stub) = region_client(vec![
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", "eu-central-1"),
+                Reply::new(200, LISTING),
+            ])
+            .await;
+            let page = c.list_dir("s3://bkt/d/", None, 10).await.expect("list");
+            assert_eq!(page.objects.len(), 1);
+            let requests = stub.requests();
+            assert_eq!(requests.len(), 2);
+            let auth = |i: usize| {
+                requests[i]
+                    .headers
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(str::to_owned)
+                    .expect("authorization")
+            };
+            assert!(
+                auth(0).contains("/us-east-1/s3/aws4_request"),
+                "{}",
+                auth(0)
+            );
+            assert!(
+                auth(1).contains("/eu-central-1/s3/aws4_request"),
+                "{}",
+                auth(1)
+            );
+            // Later calls reuse the rebuilt backend and its region.
+            let (backend, _) = c
+                .registry
+                .resolve(&"s3://bkt/x".parse().expect("url"))
+                .expect("r");
+            assert_eq!(backend.s3_signing().expect("s3").1, "eu-central-1");
+        }
+
+        #[tokio::test]
+        async fn an_s3_listing_follows_a_400_that_names_the_region() {
+            use crate::backend::stub::Reply;
+            let (c, stub) = region_client(vec![
+                Reply::new(
+                    400,
+                    "<Error><Code>AuthorizationHeaderMalformed</Code></Error>",
+                )
+                .header("x-amz-bucket-region", "ap-south-1"),
+                Reply::new(200, LISTING),
+            ])
+            .await;
+            c.list_dir("s3://bkt/d/", None, 10).await.expect("list");
+            assert_eq!(stub.requests().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn an_s3_redirect_without_a_usable_region_is_not_retried() {
+            use crate::backend::stub::Reply;
+            let cases = [
+                Reply::new(301, REDIRECT),
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", "us-east-1"),
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", "EU-West-1"),
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", "eu/west"),
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", ""),
+                Reply::new(301, REDIRECT)
+                    .header("x-amz-bucket-region", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                Reply::new(403, REDIRECT).header("x-amz-bucket-region", "eu-west-1"),
+            ];
+            for reply in cases {
+                let (c, stub) = region_client(vec![reply]).await;
+                let err = c
+                    .list_dir("s3://bkt/d/", None, 10)
+                    .await
+                    .expect_err("fails");
+                assert_eq!(stub.requests().len(), 1);
+                assert!(!err.to_string().contains("is in region"), "{err}");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_second_wrong_region_answer_is_reported_without_a_third_request() {
+            use crate::backend::stub::Reply;
+            let (c, stub) = region_client(vec![
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", "eu-central-1"),
+                Reply::new(301, REDIRECT).header("x-amz-bucket-region", "ap-south-1"),
+            ])
+            .await;
+            let err = c
+                .list_dir("s3://bkt/d/", None, 10)
+                .await
+                .expect_err("fails");
+            assert!(err.to_string().contains("ap-south-1"), "{err}");
+            assert_eq!(stub.requests().len(), 2);
         }
 
         #[tokio::test]

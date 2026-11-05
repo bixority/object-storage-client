@@ -72,6 +72,10 @@ pub enum Source {
         /// connection was discovered. The SDK's SSO and STS clients read it
         /// there, so the profile is refused, as `osc --profile` refuses it.
         process_endpoint: bool,
+        /// The non-empty region variables (`S3_REGION`, `AWS_REGION`,
+        /// `AWS_DEFAULT_REGION`) of the process environment at discovery, as
+        /// (name, value). They take precedence over the profile's region.
+        regions: Vec<(String, String)>,
     },
     Gcs {
         credentials: PathBuf,
@@ -135,8 +139,12 @@ impl Connection {
             Source::AwsProfile {
                 config,
                 credentials,
+                regions,
                 ..
             } => {
+                for (key, value) in regions {
+                    set(key, value.clone());
+                }
                 for (key, path) in [
                     ("AWS_CONFIG_FILE", config),
                     ("AWS_SHARED_CREDENTIALS_FILE", credentials),
@@ -369,6 +377,7 @@ mod tests {
                 config: config.map(PathBuf::from),
                 credentials: None,
                 process_endpoint: false,
+                regions: Vec::new(),
             },
             login: None,
         }
@@ -419,6 +428,23 @@ mod tests {
             vars(gcs(None)),
             Some(pairs(&[("GOOGLE_APPLICATION_CREDENTIALS", "/k.json")]))
         );
+    }
+
+    #[test]
+    fn a_profile_takes_the_recorded_region_variables() {
+        let mut connection = profile(Some("/c"));
+        let Source::AwsProfile { regions, .. } = &mut connection.source else {
+            panic!("not a profile");
+        };
+        *regions = vec![("AWS_REGION".into(), "eu-north-1".into())];
+        assert_eq!(
+            connection.vars(),
+            Some(pairs(&[
+                ("AWS_CONFIG_FILE", "/c"),
+                ("AWS_REGION", "eu-north-1")
+            ]))
+        );
+        assert!(format!("{connection:?}").contains("eu-north-1"));
     }
 
     #[test]

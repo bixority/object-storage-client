@@ -89,6 +89,10 @@ pub struct S3Backend {
     bucket: String,
     /// The region, resolved once: it signs object and bucket requests alike.
     region: String,
+    /// The registry's learned bucket regions: a redirect's answer is recorded
+    /// here, see [`Self::wrong_region`].
+    #[cfg(feature = "gui")]
+    regions: Arc<super::BucketRegions>,
     /// The configured custom endpoint; `None` means AWS.
     endpoint: Option<String>,
     /// How the bucket is addressed, for object and bucket requests alike.
@@ -175,7 +179,11 @@ impl S3Backend {
             }
             _ => None,
         };
-        let region = variable_region
+        // A region that S3 itself reported for this bucket beats the guess.
+        let region = shared
+            .regions
+            .get(bucket)
+            .or(variable_region)
             .or_else(|| settings.and_then(|s| s.region.clone()))
             .unwrap_or_else(|| "us-east-1".into());
         builder = builder.with_region(&region);
@@ -255,12 +263,48 @@ impl S3Backend {
             skip_signature,
             bucket: bucket.to_string(),
             region,
+            #[cfg(feature = "gui")]
+            regions: Arc::clone(&shared.regions),
             endpoint,
             addressing,
             http,
             request_payer,
             provider_policy,
         })
+    }
+
+    /// The region this backend signs with.
+    #[cfg(feature = "gui")]
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// If `response` says that the bucket lives in another region (status 301,
+    /// or 400 for `AuthorizationHeaderMalformed`, with an `x-amz-bucket-region`
+    /// header that is a valid region and not the one used), records that region
+    /// for the bucket and returns the error to report.
+    #[cfg(feature = "gui")]
+    fn wrong_region(&self, response: &reqwest::Response) -> Option<Error> {
+        if !matches!(response.status().as_u16(), 301 | 400) {
+            return None;
+        }
+        let region = response
+            .headers()
+            .get("x-amz-bucket-region")?
+            .to_str()
+            .ok()?;
+        let valid = (1..=32).contains(&region.len())
+            && region
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !valid || region == self.region {
+            return None;
+        }
+        self.regions.learn(&self.bucket, region);
+        Some(Error::Generic(format!(
+            "S3 bucket `{}` is in region `{region}`, not `{}`",
+            self.bucket, self.region
+        )))
     }
 
     /// The setting behind `provider_policy` that `builder` holds, if any.
@@ -639,6 +683,9 @@ impl Backend for S3Backend {
             send_signed(client, request).await
         })
         .await?;
+        if let Some(err) = self.wrong_region(&response) {
+            return Err(err);
+        }
         let body = read_listing(response, "S3 listing").await?;
         let xml = String::from_utf8_lossy(&body);
         let bad = |what: &str, v: &str| Error::Generic(format!("S3 listing: bad {what} {v:?}"));

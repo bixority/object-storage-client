@@ -95,17 +95,6 @@ impl Location {
         Some(Self { url })
     }
 
-    /// The bucket or container name, for schemes that have one.
-    pub(crate) fn bucket(&self) -> Option<String> {
-        // A URL with user information is refused by the library, so the host
-        // is always the bucket.
-        if is_bucket_scheme(self.url.scheme()) {
-            self.url.host_str().map(str::to_owned)
-        } else {
-            None
-        }
-    }
-
     /// The subfolder `name`, or `None` when `name` is empty, `.` or `..`:
     /// such a name would resolve to this folder or its parent.
     #[must_use]
@@ -212,13 +201,11 @@ mod tests {
             let at = loc(text);
             assert_eq!(at.as_str(), root);
             assert!(at.is_root() && at.is_provider_root());
-            assert_eq!(at.bucket(), None);
             assert_eq!(at.parent(), None);
         }
         assert_eq!(loc("s3://").scheme(), "s3");
         let bucket = loc("s3://").child_dir("My_bucket.1").expect("bucket");
         assert_eq!(bucket.as_str(), "s3://My_bucket.1/");
-        assert_eq!(bucket.bucket().as_deref(), Some("My_bucket.1"));
         assert_eq!(bucket.parent(), Some(loc("s3://")));
         assert_eq!(
             loc("gs://").child_dir("b").expect("bucket").as_str(),
@@ -233,13 +220,6 @@ mod tests {
     #[test]
     fn file_root() {
         assert_eq!(loc("file:///").parent(), None);
-    }
-
-    #[test]
-    fn bucket_names() {
-        assert_eq!(loc("s3://media/").bucket().as_deref(), Some("media"));
-        assert_eq!(loc("file:///tmp/").bucket(), None);
-        assert_eq!(loc("https://h/x/").bucket(), None);
     }
 
     #[test]

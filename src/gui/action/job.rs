@@ -2,7 +2,6 @@
 
 use super::{Answer, Command, nav};
 use crate::connection::Connection;
-use crate::gui::display;
 use crate::gui::location::Location;
 use crate::gui::model::{
     AppState, Batch, Closing, Dialog, Entry, Item, Job, JobId, JobPhase, OnExisting, OpKind,
@@ -170,13 +169,9 @@ pub(super) fn start_rename(state: &mut AppState) -> Vec<Command> {
 
 /// Text typed into the open dialog.
 pub(super) fn dialog_text(state: &mut AppState, text: String) -> Vec<Command> {
-    match &mut state.dialog {
-        Some(Dialog::Rename { to, error, .. }) => {
-            *to = text;
-            *error = None;
-        }
-        Some(Dialog::ConfirmBucketDelete { typed, .. }) => *typed = text,
-        _ => {}
+    if let Some(Dialog::Rename { to, error, .. }) = &mut state.dialog {
+        *to = text;
+        *error = None;
     }
     Vec::new()
 }
@@ -299,12 +294,6 @@ pub(super) fn answer(state: &mut AppState, answer: Answer) -> Vec<Command> {
             state.dialog = None;
             return Vec::new();
         }
-        (Dialog::ConfirmBucketDelete { bucket, typed, .. }, Answer::Proceed) => {
-            if typed != bucket {
-                return Vec::new();
-            }
-            OnExisting::Overwrite
-        }
         (Dialog::Overwrite { .. }, Answer::Overwrite)
         | (
             Dialog::Unchecked { .. } | Dialog::ConfirmMove { .. } | Dialog::ConfirmDelete { .. },
@@ -416,19 +405,10 @@ fn confirmation(kind: OpKind, plan: &Plan, dst_dir: &Location) -> Option<Dialog>
                 .iter()
                 .filter(|item| matches!(item, Item::DeletePrefix { .. }))
                 .count();
-            let bucket = dst_dir.bucket().filter(|_| dst_dir.is_root());
-            let confirm = Dialog::ConfirmDelete {
+            Some(Dialog::ConfirmDelete {
                 count: total,
                 folders,
-            };
-            Some(
-                bucket.map_or(confirm, |bucket| Dialog::ConfirmBucketDelete {
-                    count: total,
-                    folders,
-                    bucket: display::text(&bucket),
-                    typed: String::new(),
-                }),
-            )
+            })
         }
         OpKind::Copy | OpKind::Rename => None,
     }

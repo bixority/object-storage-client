@@ -14,6 +14,8 @@
 - A profile with `sso_session` and its own `sso_start_url` or `sso_region` is
   named in a note; the AWS SDK refuses it. Remove the repeated keys.
 - After an SSO login, panels on every profile that shares the login reload.
+- Deleting entries at the top of a bucket no longer asks you to type the
+  bucket name; it asks like any other delete.
 
 ## From 0.4.3 to 0.4.4
 

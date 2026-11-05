@@ -155,8 +155,7 @@ lose data, and Esc cancels.
 - **Existing destinations are checked first**, for up to 1,000 items: one
   question per job offers to overwrite all, skip existing or cancel. A larger
   job is not checked; you are warned that existing objects will be overwritten.
-- **Moves and deletes ask first.** Deleting at a bucket root also asks you to
-  type the bucket name.
+- **Moves and deletes ask first.**
 - **Copying or moving a folder into itself is refused.** So is copying or
   moving onto the folder the selection already is in.
 - **Empty directories can stay behind.** Moving or deleting a local folder can

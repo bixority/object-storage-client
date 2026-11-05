@@ -134,12 +134,6 @@ fn dialogs() -> Vec<Dialog> {
             count: 3,
             folders: 1,
         },
-        Dialog::ConfirmBucketDelete {
-            count: 3,
-            folders: 2,
-            bucket: "bucket".to_owned(),
-            typed: "buck".to_owned(),
-        },
         Dialog::Failures {
             kind: OpKind::Delete,
             outcome: Outcome {
@@ -283,7 +277,6 @@ fn enter_takes_the_safe_answer_and_esc_cancels() {
         vec![
             Answer::Proceed,
             Answer::Skip,
-            Answer::Cancel,
             Answer::Cancel,
             Answer::Cancel,
             Answer::Cancel,

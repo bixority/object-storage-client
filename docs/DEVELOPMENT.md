@@ -155,6 +155,17 @@ otherwise a `--locked` check of the fuzz crate fails.
   next to the Codeberg token) and `publish-to-pypi` uses PyPI Trusted
   Publishing (OIDC), with no stored token. Run it by hand (`workflow_dispatch`)
   from a branch to dry-run everything except publishing.
+- `ci.yaml` also builds the desktop packages for each release: Linux tarballs,
+  `.deb` and `.rpm` for x86_64 and aarch64, and a macOS `.dmg` for Apple
+  silicon. The Linux binaries are built in the `manylinux_2_28` image, so they
+  run on glibc 2.28 and newer; `check-glibc.sh` enforces that. The scripts in
+  `scripts/release/` make the packages, and `packaging/` holds their inputs.
+  `test-packages` installs the `.deb` and `.rpm` in Debian and Fedora
+  containers. `publish-release` attaches everything to the GitHub release with
+  a `SHA256SUMS` file. The `.dmg` is ad-hoc signed only, so users approve the
+  app once in System Settings. A `workflow_dispatch` run builds and tests all of
+  it and publishes nothing. There is no AUR job: the AUR package is not part of
+  CI.
 - Every `uses:` in every workflow is pinned to a full commit SHA with the tag
   in a trailing comment, and the `lint` job fails on an unpinned one.
   Dependabot proposes updates to the pins weekly; review them by hand.

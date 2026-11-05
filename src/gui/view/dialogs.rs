@@ -47,7 +47,6 @@ pub(super) const fn default_answer(dialog: &Dialog) -> Answer {
         | Dialog::Unchecked { .. }
         | Dialog::ConfirmMove { .. }
         | Dialog::ConfirmDelete { .. }
-        | Dialog::ConfirmBucketDelete { .. }
         | Dialog::Login { .. }
         | Dialog::Quit => Answer::Cancel,
     }
@@ -126,12 +125,6 @@ fn body(
                 &[("Delete", Answer::Proceed), ("Cancel", Answer::Cancel)],
             )
         }
-        Dialog::ConfirmBucketDelete {
-            count: n,
-            folders,
-            bucket,
-            typed,
-        } => bucket_delete(ui, *n, *folders, bucket, typed, actions),
         Dialog::Failures { kind, outcome } => failures(ui, *kind, outcome),
         Dialog::Login {
             label, code, error, ..
@@ -235,33 +228,6 @@ fn delete_text(ui: &mut egui::Ui, n: usize, folders: usize) {
         });
     }
     ui.label("This cannot be undone.");
-}
-
-fn bucket_delete(
-    ui: &mut egui::Ui,
-    n: usize,
-    folders: usize,
-    bucket: &str,
-    typed: &str,
-    actions: &mut Vec<Action>,
-) -> Option<Answer> {
-    delete_text(ui, n, folders);
-    ui.label(format!(
-        "This is the root of the bucket {bucket}. Type its name to confirm:"
-    ));
-    dialog_field(ui, typed, actions);
-    ui.add_space(8.0);
-    let mut picked = None;
-    ui.horizontal(|ui| {
-        let delete = ui.add_enabled(typed == bucket, egui::Button::new("Delete"));
-        if delete.clicked() {
-            picked = Some(Answer::Proceed);
-        }
-        if ui.button("Cancel").clicked() {
-            picked = Some(Answer::Cancel);
-        }
-    });
-    picked
 }
 
 fn failures(ui: &mut egui::Ui, kind: OpKind, outcome: &Outcome) -> Option<Answer> {

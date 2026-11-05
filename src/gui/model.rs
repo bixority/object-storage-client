@@ -387,12 +387,6 @@ pub(crate) enum Dialog {
         count: usize,
         folders: usize,
     },
-    ConfirmBucketDelete {
-        count: usize,
-        folders: usize,
-        bucket: String,
-        typed: String,
-    },
     Failures {
         kind: OpKind,
         outcome: Outcome,

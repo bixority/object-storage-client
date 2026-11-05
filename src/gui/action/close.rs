@@ -88,7 +88,6 @@ pub(super) fn worker_gone(state: &mut AppState) -> Vec<Command> {
                 | Dialog::Unchecked { .. }
                 | Dialog::ConfirmMove { .. }
                 | Dialog::ConfirmDelete { .. }
-                | Dialog::ConfirmBucketDelete { .. }
                 | Dialog::Login { .. }
         )
     ) {

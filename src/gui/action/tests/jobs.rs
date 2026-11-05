@@ -426,7 +426,7 @@ fn delete_plan() -> Plan {
 }
 
 #[test]
-fn bucket_root_delete_needs_exact_name() {
+fn bucket_root_delete_is_a_plain_confirm() {
     let mut s = with_selection(
         "s3://media/",
         "file:///r/",
@@ -441,17 +441,11 @@ fn bucket_root_delete_needs_exact_name() {
     planned(&mut s, 1, delete_plan());
     assert_eq!(
         s.dialog,
-        Some(Dialog::ConfirmBucketDelete {
+        Some(Dialog::ConfirmDelete {
             count: 2,
             folders: 1,
-            bucket: "media".to_owned(),
-            typed: String::new(),
         })
     );
-    act(&mut s, Action::DialogText("medi".to_owned()));
-    assert_eq!(answer(&mut s, Answer::Proceed), vec![]);
-    assert!(s.dialog.is_some());
-    act(&mut s, Action::DialogText("media".to_owned()));
     assert_eq!(
         answer(&mut s, Answer::Proceed),
         vec![Command::Execute {

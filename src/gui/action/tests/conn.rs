@@ -171,7 +171,7 @@ fn nothing_changes_at_a_provider_root() {
 }
 
 #[test]
-fn a_bucket_root_can_still_be_deleted_by_typing_its_name() {
+fn a_bucket_root_object_can_still_be_deleted() {
     let mut s = selected_on(s3("aws"), "s3://media/", vec![obj("a")]);
     act(&mut s, Action::Delete);
     planned(
@@ -188,7 +188,7 @@ fn a_bucket_root_can_still_be_deleted_by_typing_its_name() {
     );
     assert!(matches!(
         s.dialog,
-        Some(Dialog::ConfirmBucketDelete { ref bucket, .. }) if bucket == "media"
+        Some(Dialog::ConfirmDelete { count: 1, .. })
     ));
 }
 

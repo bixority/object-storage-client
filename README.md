@@ -48,8 +48,20 @@ and takes the same encryption options as `osc`.
 
 ### Install
 
-The browser is behind the optional `gui` feature, so `osc` alone is unaffected.
-Install both binaries from the registry:
+Each [GitHub release](https://github.com/bixority/object-storage-client/releases)
+has packages for both binaries:
+
+- **macOS (Apple silicon):** open the `.dmg` and drag the app to Applications.
+  The app is not signed with an Apple Developer ID, so macOS blocks it on first
+  launch. Open System Settings → Privacy & Security and choose **Open Anyway**.
+  The README in the `.dmg` shows how to put `osc` on your PATH.
+- **Debian and Ubuntu:** `sudo apt install ./object-storage-client_<version>-1_amd64.deb`
+- **Fedora and RHEL-family:** `sudo dnf install ./object-storage-client-<version>-1.x86_64.rpm`
+
+The Linux packages install the GUI's runtime libraries (Wayland, xkbcommon,
+EGL and GL) as dependencies.
+
+Or install both binaries from the registry:
 
 ```bash
 export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"

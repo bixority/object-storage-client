@@ -315,11 +315,24 @@ mod tests {
         assert_eq!(got.as_ref(), vec![b'x'; 6 * stub::CHUNK].as_slice());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_stalled_body_fails_within_the_read_timeout() {
+        // The request runs on real sockets. A paused clock would jump ahead
+        // while the runtime waits for them, and object_store would retry each
+        // jump as a failed request. So the clock is paused once the head is in:
+        // only the body read is left, nothing is pending, and the read timeout
+        // fires at exactly READ_TIMEOUT.
         let base = stub::serve_slow(1, 0, Duration::ZERO).await;
+        let url = Url::parse(&format!("{base}/slow")).unwrap();
+        let backend = HttpBackend::new("http", &url).unwrap();
+        let got = backend
+            .store()
+            .get(&ObjectPath::from("slow"))
+            .await
+            .expect("the head");
+        tokio::time::pause();
         let start = tokio::time::Instant::now();
-        let err = get_bytes(&base).await.unwrap_err();
+        let err = got.bytes().await.unwrap_err();
         let text = format!("{err:?}").to_lowercase();
         assert!(
             text.contains("timed out") || text.contains("timeout"),

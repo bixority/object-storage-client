@@ -12,6 +12,7 @@ mod gcp;
 pub mod sso;
 
 use crate::Result;
+use crate::backend::PROFILE_ENDPOINT_REFUSED;
 use crate::client::{Client, ObjectStorageClient};
 use aws_runtime::fs_util::Os;
 use aws_types::os_shim_internal::Env;
@@ -67,6 +68,10 @@ pub enum Source {
         name: String,
         config: Option<PathBuf>,
         credentials: Option<PathBuf>,
+        /// `AWS_ENDPOINT_URL` was set in the process environment when the
+        /// connection was discovered. The SDK's SSO and STS clients read it
+        /// there, so the profile is refused, as `osc --profile` refuses it.
+        process_endpoint: bool,
     },
     Gcs {
         credentials: PathBuf,
@@ -167,8 +172,16 @@ impl Connection {
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`](crate::Error::InvalidInput) for an AWS
-    /// profile with an empty name.
+    /// profile with an empty name, and for an AWS profile while the process
+    /// sets `AWS_ENDPOINT_URL`.
     pub fn client(&self) -> Result<ObjectStorageClient> {
+        if let Source::AwsProfile {
+            process_endpoint: true,
+            ..
+        } = self.source
+        {
+            return Err(crate::Error::InvalidInput(PROFILE_ENDPOINT_REFUSED.into()));
+        }
         let Some(vars) = self.vars() else {
             return Ok(ObjectStorageClient::new());
         };
@@ -355,6 +368,7 @@ mod tests {
                 name: "dev".into(),
                 config: config.map(PathBuf::from),
                 credentials: None,
+                process_endpoint: false,
             },
             login: None,
         }
@@ -418,6 +432,23 @@ mod tests {
             connection.client(),
             Err(crate::Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn a_profile_is_refused_while_the_process_sets_an_endpoint() {
+        let mut connection = profile(None);
+        let Source::AwsProfile {
+            process_endpoint, ..
+        } = &mut connection.source
+        else {
+            panic!("not a profile");
+        };
+        *process_endpoint = true;
+        let err = connection.client().err();
+        assert!(
+            matches!(&err, Some(crate::Error::InvalidInput(m)) if m == PROFILE_ENDPOINT_REFUSED),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

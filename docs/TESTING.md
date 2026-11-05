@@ -17,7 +17,8 @@ interop tests skip silently (`pytest.importorskip`).
 
 `cargo test` runs the library's unit tests,
 `tests/functional.rs` (the client, request signing, encryption and `osc` on
-`file://` in temporary directories, plus the golden ciphertexts in
+`file://` in temporary directories, `osc`'s AWS profile handling against
+loopback SSO, STS and S3 stand-ins, plus the golden ciphertexts in
 `tests/vectors/golden/`)
 and `tests/perf_guards.rs`. A plain `pytest` runs `tests/python/` without the
 container tests.
@@ -28,11 +29,18 @@ through `object_store`'s clients, which always honour system proxies and cannot
 turn them off. The clients the crate builds itself ignore proxies in tests
 (injected variables).
 
+Backend unit tests that talk to a loopback stub (`src/backend/stub.rs`) run on
+the real tokio clock, not `start_paused`: on macOS a paused clock can jump to
+the HTTP timeouts while a loopback connect is still pending.
+`stub::closed_port()` keeps its port bound, so a concurrent test's stub cannot
+be given the same port.
+
 To check that the tests do not depend on your machine, run
 `scripts/hostile-env.sh`: it runs the library and functional suites
 twice, with a poisoned HOME and `~/.aws`, poisoned `AWS_*`, `S3_*` and `OSC_*`
-variables (`OSC_KEYRING_FILE`, `OSC_REQUIRE_ENCRYPTION`), a dead proxy and a
-dead IMDS endpoint. In the first pass the SDK reads the poisoned `~/.aws`
+variables (`OSC_KEYRING_FILE`, `OSC_KEYRING_COMMAND`,
+`OSC_REQUIRE_ENCRYPTION`), a dead proxy and a dead IMDS endpoint. In the first
+pass the SDK reads the poisoned `~/.aws`
 files; in the second `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` point
 at `/nonexistent`. It is not run in CI.
 
@@ -41,10 +49,11 @@ at `/nonexistent`. It is not run in CI.
 The integration tests run the S3 and Azure backends, including client-side
 encryption and copies between the two, against Garage and Azurite containers
 started by `testcontainers`. They are `#[ignore]`d, so a plain `cargo test`
-skips them:
+skips them. Run them as CI does, without the 4 GiB tier
+(see [Checksum round trips](#checksum-round-trips)):
 
 ```bash
-cargo test --all-features --test integration -- --ignored
+cargo test --all-features --test integration -- --ignored --skip _4gib
 ```
 
 GCS is covered by a fake-gcs-server container
@@ -62,7 +71,7 @@ plain `pytest` skips them. They start their own Garage and Azurite with
 testcontainers-python and remove them at the end of the session:
 
 ```bash
-uv run pytest -m "integration and not large"
+uv run --no-sync pytest -m "integration and not large"
 ```
 
 With Docker nothing else is needed. With rootless Podman, point
@@ -106,7 +115,7 @@ emulator's container storage:
 
 ```bash
 cargo test --all-features --test integration -- --ignored _4gib
-uv run pytest -m large
+uv run --no-sync pytest -m large
 ```
 
 ## AWS Encryption SDK interop
@@ -117,7 +126,7 @@ byte-compatible with the AWS Encryption SDK for Python, which
 
 ```bash
 uv sync --group oracle --no-install-project
-UV_NO_SYNC=1 cargo test --all-features -- --ignored oracle
+UV_NO_SYNC=1 cargo test --all-features --lib -- --ignored oracle
 ```
 
 `tests/vectors/esdk/` holds reference ciphertexts made by the SDK and
@@ -134,11 +143,13 @@ re-encrypting copy and 1000 small objects, plain and encrypted, on `file://`.
 counts and peak heap with a counting allocator, so regressions fail
 deterministically. The `perf` workflow runs the bench and a 512 MiB `osc`
 smoke test (`scripts/perf_smoke.py`) nightly or on demand. It compares the
-smoke test's throughput with the previous successful run's, kept in the Actions
-cache, and only warns when it drops by more than 25%; peak-RSS budgets fail the job. The
+smoke test's throughput with that of the previous run that raised no warning,
+kept in the Actions cache, and only warns when it drops by more than 25%;
+peak-RSS budgets fail the job. The
 first run, or one after the cache expired, has nothing to compare with.
 
 ## Fuzzing
 
 See [Development](DEVELOPMENT.md#fuzzing). The fuzz crate has its own committed
-`fuzz/Cargo.lock`; CI builds it with `--locked`.
+`fuzz/Cargo.lock`; CI checks it without `--locked`, and it must be refreshed on
+every version bump.

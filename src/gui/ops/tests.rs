@@ -1,5 +1,6 @@
 use super::*;
 use crate::ObjectStorageClient;
+use crate::backend::ObjectState;
 use crate::encryption::EncryptionConfig;
 use crate::encryption::keys::Keyring;
 use std::fs;
@@ -35,6 +36,8 @@ fn object(name: &str) -> Entry {
         name: name.to_owned(),
         size: 0,
         modified: chrono::DateTime::default(),
+        state: ObjectState::Online,
+        class: None,
     }
 }
 
@@ -621,6 +624,75 @@ async fn plan_rejects_dot_segment_names() {
             error: "invalid name".to_owned(),
         }]
     );
+}
+
+fn offline(name: &str, state: ObjectState, class: &str) -> Entry {
+    Entry::Object {
+        name: name.to_owned(),
+        size: 0,
+        modified: chrono::DateTime::default(),
+        state,
+        class: Some(class.to_owned()),
+    }
+}
+
+fn mixed() -> Vec<Entry> {
+    vec![
+        object("on.bin"),
+        offline("cold.bin", ObjectState::Archived, "GLACIER"),
+        offline("thaw.bin", ObjectState::Restoring, "Archive"),
+    ]
+}
+
+#[tokio::test]
+async fn plan_skips_archived_and_restoring_objects_for_transfers() {
+    for kind in [OpKind::Copy, OpKind::Move, OpKind::Rename] {
+        let (_dir, src, dst) = fixture();
+        let client = ObjectStorageClient::new();
+        let entries = if kind == OpKind::Rename {
+            // A rename is of one entry.
+            vec![offline("cold.bin", ObjectState::Archived, "GLACIER")]
+        } else {
+            mixed()
+        };
+        let mut b = batch(kind, &src, entries, &dst);
+        if kind == OpKind::Rename {
+            b.rename_to = Some("new.bin".to_owned());
+        }
+        let plan = plan(&client, &client, b).await;
+        let cold = Failure {
+            name: "cold.bin".to_owned(),
+            error: "Archived (GLACIER): restore it before copying".to_owned(),
+        };
+        if kind == OpKind::Rename {
+            assert_eq!(plan.items, [], "{kind:?}");
+            assert_eq!(plan.failures, [cold], "{kind:?}");
+        } else {
+            assert_eq!(plan.items.len(), 1, "{kind:?}");
+            assert!(matches!(&plan.items[0], Item::Transfer { rel, .. } if rel == "on.bin"));
+            assert_eq!(
+                plan.failures,
+                [
+                    cold,
+                    Failure {
+                        name: "thaw.bin".to_owned(),
+                        error: "Rehydration in progress (Archive tier): it can be copied once it finishes"
+                            .to_owned(),
+                    }
+                ],
+                "{kind:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn plan_delete_includes_archived_objects() {
+    let (_dir, src, dst) = fixture();
+    let client = ObjectStorageClient::new();
+    let plan = plan(&client, &client, batch(OpKind::Delete, &src, mixed(), &dst)).await;
+    assert_eq!(plan.items.len(), 3);
+    assert_eq!(plan.failures, []);
 }
 
 #[cfg(unix)]
@@ -1347,6 +1419,8 @@ async fn a_same_store_copy_does_not_head_the_source_for_its_size() {
             name: name.to_owned(),
             size: 3,
             modified: chrono::DateTime::default(),
+            state: ObjectState::Online,
+            class: None,
         })
         .to_vec();
     let mut plan = plan(&client, &client, batch(OpKind::Copy, &src, entries, &dst)).await;

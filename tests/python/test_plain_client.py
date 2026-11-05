@@ -145,6 +145,43 @@ def test_forbidden_is_permission_error(run_isolated, status):
     assert proc.stdout.split() == ["PermissionError", "PermissionError"], proc.stdout
 
 
+_ARCHIVED_SCRIPT = _FORBIDDEN_SCRIPT.replace(
+    'print("PermissionError")', 'print("PermissionError", "archived" in str(e).lower())'
+).replace("except PermissionError:", "except PermissionError as e:")
+
+
+def test_archived_is_permission_error(run_isolated):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    body = b"<Error><Code>InvalidObjectState</Code></Error>"
+
+    class Handler(BaseHTTPRequestHandler):
+        def _deny(self):
+            self.send_response(403)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        do_GET = do_HEAD = _deny
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        proc = run_isolated(_ARCHIVED_SCRIPT, str(server.server_address[1]), timeout=60)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split("\n")[0] == "PermissionError True", proc.stdout
+
+
 _BUCKET_SCRIPT = """
 import asyncio
 from object_storage_client import ObjectStorageClient

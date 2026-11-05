@@ -44,7 +44,7 @@ delete objects and whole folders within a panel or between the two, also across
 accounts and providers. It finds the connections already set up on the machine
 and takes the same encryption options as `osc`.
 
-![osc-gui with Local in the left panel and an S3 connection's bucket list in the right panel](docs/images/osc-gui.png)
+![osc-gui with Local in the left panel and an S3 bucket in the right panel, where archived (❄) and restoring (⌛) objects are greyed out](docs/images/osc-gui.png)
 
 ### Install
 
@@ -74,10 +74,13 @@ osc-gui --keyring keyring                      # copies encrypt and decrypt
 Each panel has a connection selector for Local and what is found on the
 machine: AWS profiles, provider environment variables, gcloud configurations and
 Azure CLI storage accounts; a cloud connection lists its buckets. Type any
-matching URL or path into a panel's address bar and press Enter. If a
-connection cannot authenticate, an AWS SSO profile can log in from the panel's
-error banner; for gcloud and Azure the banner shows the command to run. The
-keys and shortcuts are listed in [Desktop browser](docs/GUI.md), which also
+matching URL or path into a panel's address bar and press Enter. Archived
+objects (S3 Glacier Flexible Retrieval and Deep Archive, Azure Archive tier)
+show ❄ and objects being restored show ⌛; copy, move and rename skip them and
+say why.
+If a connection cannot authenticate, an AWS SSO profile can log in from the
+panel's error banner; for gcloud and Azure the banner shows the command to run.
+The keys and shortcuts are listed in [Desktop browser](docs/GUI.md), which also
 covers limits and closing behaviour.
 
 ## CLI (`osc`)
@@ -387,7 +390,8 @@ health = keyring.status()  # active key, key ages, last reload error
 - [Encryption](docs/ENCRYPTION.md): what it protects, keyrings, Kubernetes, key
   rotation, responding to a key leak, the format and interop.
 - [Behaviour and limits](docs/BEHAVIOR.md): URL rules, copy and move, deletes,
-  file permissions, large objects, pre-signing, CLI and Python details.
+  archived objects, file permissions, large objects, pre-signing, CLI and
+  Python details.
 - [Desktop browser](docs/GUI.md): `osc-gui`, its keys, limits and closing.
 - [Upgrading](docs/UPGRADING.md): breaking changes between releases.
 - [Development](docs/DEVELOPMENT.md) and [Testing](docs/TESTING.md).

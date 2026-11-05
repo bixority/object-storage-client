@@ -71,6 +71,7 @@ pub(super) fn map_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::ObjectState;
     use crate::gui::action::{Event, Motion, Msg, update};
     use crate::gui::location::Location;
     use crate::gui::model::{Dialog, Encryption, Entry, Page, Side};
@@ -184,6 +185,8 @@ mod tests {
             name: "x".to_owned(),
             size: 1,
             modified: chrono::DateTime::UNIX_EPOCH,
+            state: ObjectState::Online,
+            class: None,
         };
         let folder = Entry::Folder {
             name: "x".to_owned(),
@@ -288,6 +291,8 @@ mod tests {
             name: "o".to_owned(),
             size: 1,
             modified: chrono::DateTime::UNIX_EPOCH,
+            state: ObjectState::Online,
+            class: None,
         };
         let mut s = loaded(vec![folder, object]);
         let down = Action::Select(

@@ -39,6 +39,8 @@ use object_store::gcp::{GcpCredentialProvider, GcpSigningCredentialProvider};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
 use object_store::{ClientConfigKey, ObjectMeta, ObjectStore};
+#[cfg(feature = "gui")]
+pub use s3::PROFILE_ENDPOINT_REFUSED;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::str::FromStr;
@@ -201,6 +203,27 @@ pub trait Backend: Send + Sync {
     #[cfg(feature = "gui")]
     fn paginated(&self) -> Option<&dyn object_store::list::PaginatedListStore> {
         None
+    }
+
+    /// One page of the immediate children of the directory `dir` (the root
+    /// when empty), at most `max` entries, continuing from the `next` of an
+    /// earlier page. Stores without paged listing return one complete page,
+    /// and an empty one for a token; a missing directory is an empty page.
+    ///
+    /// The default lists through the store and reports every object
+    /// [`ObjectState::Online`]; S3 and Azure override it to report archives.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store refuses or fails the listing.
+    #[cfg(feature = "gui")]
+    async fn list_page(
+        &self,
+        dir: &ObjectPath,
+        max: usize,
+        token: Option<String>,
+    ) -> Result<ListPage> {
+        list_through_store(self, dir, max, token).await
     }
 
     /// The file system path `path` maps to, for the local backend on Unix;
@@ -397,14 +420,16 @@ pub async fn bucket_exists_from_response(
 }
 
 /// The error for a bucket call `what` (creation, listing) that the provider
-/// answered with `status` and the error text `text`. HTTP 401 and 403 are [`Error::Denied`],
-/// every other status [`Error::Generic`].
+/// answered with `status` and the error text `text`. An archived object is
+/// [`Error::Archived`], HTTP 401 and 403 are [`Error::Denied`], every other status [`Error::Generic`].
 pub fn create_failed(what: &str, status: reqwest::StatusCode, text: &str) -> Error {
-    if matches!(status.as_u16(), 401 | 403) {
-        Error::Denied(format!("{what} was denied (HTTP {status}): {text}"))
-    } else {
-        Error::Generic(format!("{what} failed (HTTP {status}): {text}"))
-    }
+    crate::client::archived(status.as_u16(), text, text).unwrap_or_else(|| {
+        if matches!(status.as_u16(), 401 | 403) {
+            Error::Denied(format!("{what} was denied (HTTP {status}): {text}"))
+        } else {
+            Error::Generic(format!("{what} failed (HTTP {status}): {text}"))
+        }
+    })
 }
 
 /// The start of an error response's body, for messages: at most 4 KiB read,
@@ -501,6 +526,85 @@ pub async fn list_buckets(
 /// The most of a listing answer that [`read_listing`] keeps.
 #[cfg(feature = "gui")]
 const LISTING_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The listing of [`Backend::list_page`] through the store, for the default
+/// and for the stores whose own listing cannot be used.
+#[cfg(feature = "gui")]
+pub async fn list_through_store<B: Backend + ?Sized>(
+    backend: &B,
+    dir: &ObjectPath,
+    max: usize,
+    token: Option<String>,
+) -> Result<ListPage> {
+    use object_store::list::PaginatedListOptions;
+    let (listed, next) = if let Some(store) = backend.paginated() {
+        let prefix = (!dir.as_ref().is_empty()).then(|| format!("{dir}/"));
+        let opts = PaginatedListOptions {
+            delimiter: Some("/".into()),
+            max_keys: Some(max),
+            page_token: token,
+            ..Default::default()
+        };
+        let page = store.list_paginated(prefix.as_deref(), opts).await?;
+        (page.result, page.page_token)
+    } else if token.is_some() {
+        return Ok(ListPage::default());
+    } else {
+        match backend.store().list_with_delimiter(Some(dir)).await {
+            Ok(listed) => (listed, None),
+            Err(object_store::Error::NotFound { .. }) => return Ok(ListPage::default()),
+            Err(e) => return Err(e.into()),
+        }
+    };
+    Ok(ListPage {
+        prefixes: listed.common_prefixes,
+        objects: listed
+            .objects
+            .into_iter()
+            .map(|m| ListedObject {
+                location: m.location,
+                size: m.size,
+                modified: m.last_modified,
+                state: ObjectState::Online,
+                class: None,
+            })
+            .collect(),
+        next,
+    })
+}
+
+/// Whether an object can be read now.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectState {
+    /// Readable.
+    Online,
+    /// Offline until restored (S3) or rehydrated (Azure).
+    Archived,
+    /// A restore or rehydration is running.
+    Restoring,
+}
+
+/// An object of a [`ListPage`].
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub location: ObjectPath,
+    pub size: u64,
+    pub modified: chrono::DateTime<chrono::Utc>,
+    pub state: ObjectState,
+    /// The provider's storage class or access tier, when it reports one.
+    pub class: Option<String>,
+}
+
+/// One page of [`Backend::list_page`].
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListPage {
+    pub prefixes: Vec<ObjectPath>,
+    pub objects: Vec<ListedObject>,
+    pub next: Option<String>,
+}
 
 /// The body of a successful listing `response` (else an error naming `what`),
 /// at most 16 MiB.
@@ -599,6 +703,23 @@ fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
         rest = tail;
     }
     texts
+}
+
+/// The inner text of every `<tag>` element of `xml` (one without attributes),
+/// in document order, entities not resolved.
+#[cfg(feature = "gui")]
+fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut blocks = Vec::new();
+    let mut rest = xml;
+    while let Some((_, after)) = rest.split_once(&open) {
+        let Some((block, tail)) = after.split_once(&close) else {
+            break;
+        };
+        blocks.push(block);
+        rest = tail;
+    }
+    blocks
 }
 
 /// `text` with `&lt;`, `&gt;`, `&amp;`, `&quot;`, `&apos;` and numeric
@@ -1061,5 +1182,27 @@ mod tests {
         let err = create_failed("S3 CreateBucket", status(500), "boom");
         assert!(matches!(err, Error::Generic(_)), "{err:?}");
         assert!(err.to_string().contains("HTTP 500"), "{err}");
+    }
+
+    #[test]
+    fn an_archived_object_is_told_from_a_denied_or_conflicting_call() {
+        let status = |c| reqwest::StatusCode::from_u16(c).expect("status");
+        let err = create_failed(
+            "S3 CopyObject",
+            status(403),
+            "<Code>InvalidObjectState</Code>",
+        );
+        assert!(matches!(err, Error::Archived(_)), "{err:?}");
+        assert!(err.to_string().contains("restored"), "{err}");
+        let err = create_failed("Azure Copy Blob", status(409), "BlobArchived <Error/>");
+        assert!(matches!(err, Error::Archived(_)), "{err:?}");
+        assert!(err.to_string().contains("rehydrated"), "{err}");
+        // The code alone does not count under another status.
+        let err = create_failed("S3 CopyObject", status(403), "<Code>AccessDenied</Code>");
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+        let err = create_failed("Azure Copy Blob", status(409), "BlobAlreadyExists");
+        assert!(matches!(err, Error::Generic(_)), "{err:?}");
+        let err = create_failed("Azure Copy Blob", status(500), "BlobArchived");
+        assert!(matches!(err, Error::Generic(_)), "{err:?}");
     }
 }

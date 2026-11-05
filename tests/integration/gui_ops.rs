@@ -155,3 +155,56 @@ async fn gui_folder_copy_s3_to_azure() -> TestResult {
     }
     Ok(())
 }
+
+/// A blob put with the `Archive` access tier lists as offline.
+#[tokio::test]
+#[ignore = "needs a container runtime (docker or podman)"]
+async fn gui_list_archived_blob_azure() -> TestResult {
+    use crate::common::azurite::azurite_vars;
+    use object_store::azure::MicrosoftAzureBuilder;
+    use object_store::{Attribute, Attributes, ObjectStore, PutOptions, PutPayload};
+
+    let client = azurite_client();
+    let root = base(&client, Provider::Azure, "gui-archive").await?;
+    let (container, prefix) = root
+        .strip_prefix("az://")
+        .and_then(|rest| rest.split_once('/'))
+        .ok_or("unexpected root")?;
+    let vars = azurite_vars();
+    let store = MicrosoftAzureBuilder::new()
+        .with_account(&vars["AZURE_STORAGE_ACCOUNT_NAME"])
+        .with_access_key(&vars["AZURE_STORAGE_ACCOUNT_KEY"])
+        .with_endpoint(vars["AZURE_STORAGE_ENDPOINT"].clone())
+        .with_allow_http(true)
+        .with_container_name(container)
+        .build()?;
+    let path = object_store::path::Path::from(format!("{prefix}cold.bin"));
+    let mut attributes = Attributes::new();
+    attributes.insert(Attribute::StorageClass, "Archive".into());
+    let opts = PutOptions {
+        attributes,
+        ..PutOptions::default()
+    };
+    store
+        .put_opts(&path, PutPayload::from_static(b"x"), opts)
+        .await?;
+    write(&client, false, &root, "warm.bin", b"x").await?;
+
+    let page = list_page_with(&client, &Location::parse(&root)?, None, 10).await?;
+    let archived: Vec<_> = page
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Object { name, state, .. } => Some((name.as_str(), format!("{state:?}"))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        archived,
+        [
+            ("cold.bin", "Archived".to_owned()),
+            ("warm.bin", "Online".to_owned())
+        ]
+    );
+    Ok(())
+}

@@ -3,6 +3,7 @@ use super::panel::{
     DEFAULT_PAGE_ROWS, desaturate, human_size, panel_stroke, seen_moves, seen_moves_id, thousands,
 };
 use super::*;
+use crate::backend::ObjectState;
 use crate::connection::sso::SsoLogin;
 use crate::connection::{Connection, Login, Provider, Source};
 use crate::gui::action::{Answer, Event, Motion, Msg, SelectOp, update};
@@ -31,6 +32,8 @@ fn entries() -> Vec<Entry> {
             name: "a\u{1b}[31mb.txt".to_owned(),
             size: 1536,
             modified: DateTime::UNIX_EPOCH,
+            state: ObjectState::Online,
+            class: None,
         },
     ]
 }
@@ -343,6 +346,8 @@ fn moved_state() -> AppState {
             name: format!("r{i:03}"),
             size: 1,
             modified: DateTime::UNIX_EPOCH,
+            state: ObjectState::Online,
+            class: None,
         })
         .collect();
     update(
@@ -375,7 +380,7 @@ fn render_with_cursor_and_pending_scroll() {
     let mut s = moved_state();
     assert_eq!(s.panels[0].cursor_moves, 1);
     assert_eq!(render(&s), Vec::new());
-    // A cursor that is not selected is drawn too.
+    // A cursor that is not selected renders without actions too.
     update(
         &mut s,
         Msg::Action(Action::Select(Side::Left, SelectOp::Clear)),
@@ -763,4 +768,68 @@ fn login_dialog_shows_the_code_and_the_buttons() {
     let (ctx, shapes) = settled(&s);
     let (_, actions) = click(&ctx, &s, find_text(&shapes, "Cancel"));
     assert_eq!(actions, [Action::DialogAnswer(Answer::Cancel)]);
+}
+
+#[test]
+fn each_object_state_has_its_own_icon_and_hover_text() {
+    let object = |name: &str, state, class: Option<&str>| Entry::Object {
+        name: name.to_owned(),
+        size: 1,
+        modified: DateTime::UNIX_EPOCH,
+        state,
+        class: class.map(str::to_owned),
+    };
+    let mut s = state();
+    update(
+        &mut s,
+        Msg::Event(Event::Page {
+            side: Side::Left,
+            seq: 1,
+            first: true,
+            result: Ok(Page {
+                entries: vec![
+                    object("cold.bin", ObjectState::Archived, Some("GLACIER")),
+                    object("blue.bin", ObjectState::Archived, Some("Archive")),
+                    object("thaw.bin", ObjectState::Restoring, Some("GLACIER")),
+                    object("warm.bin", ObjectState::Online, Some("STANDARD")),
+                ],
+                next: None,
+            }),
+        }),
+    );
+    let (ctx, shapes) = settled(&s);
+    let text = painted(&shapes);
+    assert!(text.contains("❄ cold.bin"), "{text}");
+    assert!(text.contains("❄ blue.bin"), "{text}");
+    assert!(text.contains("⌛ thaw.bin"), "{text}");
+    assert!(text.contains("🗋 warm.bin"), "{text}");
+    assert!(!text.contains("restore it before copying"));
+
+    let mut time = 10.0;
+    let mut hover = |name: &str| {
+        let pos = find_text(&shapes, name);
+        let mut seen = String::new();
+        // The tooltip waits for the pointer to rest: move it once.
+        for frame in 0..30 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    events: (frame == 0)
+                        .then_some(egui::Event::PointerMoved(pos))
+                        .into_iter()
+                        .collect(),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ui| drop(draw(ui, &s)),
+            );
+            seen = painted(&output.shapes);
+            output.drop_without_applying_deltas();
+            time += 0.1;
+        }
+        seen
+    };
+    assert!(hover("❄ cold.bin").contains("Archived (GLACIER): restore it before copying"));
+    assert!(hover("❄ blue.bin").contains("Archived (Archive tier): rehydrate it before copying"));
+    assert!(hover("⌛ thaw.bin").contains("Restore in progress (GLACIER)"));
+    assert!(!hover("🗋 warm.bin").contains("before copying"));
 }

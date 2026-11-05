@@ -6,7 +6,7 @@ use super::display;
 use super::location::Location;
 use super::model::{
     Batch, CHECK_CONCURRENCY, CHECK_LIMIT, Entry, Failure, Item, MAX_ENTRIES, MAX_PLAN_ITEMS,
-    OP_CONCURRENCY, OnExisting, OpKind, Outcome, PAGE_SIZE, Page, Plan,
+    OP_CONCURRENCY, OnExisting, OpKind, Outcome, PAGE_SIZE, Page, Plan, unavailable_reason,
 };
 use crate::{Client, Codec};
 use futures::{StreamExt as _, TryStreamExt as _};
@@ -51,6 +51,8 @@ pub async fn list_page_with<C: Codec>(
             name: object.name,
             size: object.size,
             modified: object.modified,
+            state: object.state,
+            class: object.class,
         }))
         .chain(page.links.into_iter().map(|name| Entry::Link { name }))
         .collect();
@@ -173,6 +175,8 @@ async fn entry_items<C: Codec>(
     } else if entry.is_folder() {
         let dirs = (src_dir, dst_dir);
         expand_folder(client, dirs, (name, target), budget, &mut failures).await
+    } else if let Some(reason) = offline_reason(entry) {
+        Err(PlanError::Entry(reason))
     } else if matches!(entry, Entry::Link { .. }) {
         link_items(kind, src_dir, dst_dir, (name, target)).map_err(PlanError::Entry)
     } else {
@@ -191,6 +195,15 @@ async fn entry_items<C: Codec>(
             .ok_or_else(|| PlanError::Entry(INVALID_NAME.to_owned()))
     };
     (failures, result)
+}
+
+/// Why the selected object `entry` cannot be copied, moved or renamed: it is
+/// archived or being restored. Objects found inside folders carry no state.
+fn offline_reason(entry: &Entry) -> Option<String> {
+    match entry {
+        Entry::Object { state, class, .. } => unavailable_reason(*state, class.as_deref()),
+        _ => None,
+    }
 }
 
 /// The error of a symlink that is not copied or moved.

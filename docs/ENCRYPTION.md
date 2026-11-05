@@ -40,14 +40,16 @@ Caveats:
   frame verified.
 - An encrypted copy or move always downloads, decrypts and re-encrypts the
   object with a fresh data key and message ID, whatever the destination: another
-  name, another bucket or store, or a `file://` move. It never copies bytes or
-  asks the store to copy or rename, because the header names the object's path
-  (the object-key binding) and cannot be rewritten safely. This costs a full
-  download and upload even inside one bucket. The source is read once, with no
-  separate header request, and a source that fails verification is never
-  committed.
+  name, another bucket or store, or a `file://` move. The copy keeps the
+  source's caller context and, with object-key binding on, is bound to the
+  destination's name. It never copies bytes or asks the store to copy or
+  rename, because the header names the object's path (the object-key binding)
+  and cannot be rewritten safely. This costs a full download and upload even
+  inside one bucket. The source is read once, with no separate header request,
+  and a source that fails verification is never committed.
 - The plain client (`without_encryption`, or a build without the feature)
-  refuses to copy or move an encrypted object to another name, because the
+  refuses to copy or move an encrypted object bound to its name (in a build
+  without the feature, any encrypted object) to another name, because the
   copy would be unreadable; copy it with the encrypted client. It reads the
   start of the source first, which costs one extra request.
 - A lost key with no other copy means permanent data loss.
@@ -64,8 +66,9 @@ Caveats:
   for its lifetime, and a crash frees and wipes nothing (an allocation
   failure, an AWS-LC fatal error such as an RNG failure, a stack overflow or a
   crash in C code), so a core dump of that process contains every key. `osc`
-  turns core dumps off for itself (see [CLI](#cli)). A library user or a
-  service must do it: see [Core dumps](#core-dumps) under Kubernetes.
+  and `osc-gui` turn core dumps off for themselves (see [CLI](#cli)). A
+  library user or a service must do it: see [Core dumps](#core-dumps) under
+  Kubernetes.
 - Data keys, message IDs and IVs come from AWS-LC's random generator, which
   reseeds after `fork`. A virtual machine restored from a memory snapshot can
   repeat its output until the next reseed, unless the CPU has RDRAND (or RNDR
@@ -90,7 +93,8 @@ key=kek-2025-10-8be01d44 created=2025-10-20 material=<64 hex> check=<16 hex>
 
 - The active key wraps new data keys; every listed key can unwrap. A key ID
   ends in the first 8 hex digits of the key's check value, so a damaged or
-  mismatched key fails to load.
+  mismatched key fails to load. IDs use ASCII letters, digits, `-`, `_` and
+  `.`, at most 128 characters.
 - At most 256 keys and 64 KiB. Errors name a line number or key ID, never key
   bytes.
 - A keyring file may be a symlink (Kubernetes mounts every Secret key as one).
@@ -110,16 +114,18 @@ key=kek-2025-10-8be01d44 created=2025-10-20 material=<64 hex> check=<16 hex>
   updated by the kubelet. Keep the keyring file on a local or tmpfs
   filesystem: a reload runs a synchronous `stat` on the calling thread, which a
   stalled network or FUSE mount can block. `status()` never waits for a reload
-  that another task is running.
+  that another task is running. A keyring read from text (Rust
+  `Keyring::parse`, or `OSC_KEYRING_COMMAND`) never reloads.
 - `status()` (Rust and Python) returns the active key, every key's ID and
   creation date, the active key's age in days and the last reload error. It
   checks the file first (rate-limited like any use), so an idle process still
   reports a broken Secret update.
   Expose it in a health or readiness check; the library does not log.
 - KEK wrapping uses random 96-bit IVs, which bounds the safe number of wraps
-  per KEK (NIST SP 800-38D, about 2^32). `wraps()` counts wraps with the
-  active key in the process; nothing persists the count. Yearly rotation at up
-  to a million objects stays far below the bound.
+  per KEK (NIST SP 800-38D, about 2^32). `wraps()` (Python: the `wraps`
+  property) counts wraps with the active key in the process; nothing persists
+  the count. Yearly rotation at up to a million objects stays far below the
+  bound.
 - **Losing every copy of a key makes its objects unreadable.** Back the keyring
   up offline (encrypted, for example with `age`) after every change.
 
@@ -134,7 +140,7 @@ osc keyring add < keyring > keyring.new          # adds a fresh key, not active 
 osc keyring activate <ID> < keyring > keyring.new   # makes a key active
 osc keyring rotate < keyring > keyring.new       # add and activate in one step (one reader only)
 osc keyring retire kek-2025-10-8be01d44 < keyring > keyring.new   # never the active key
-osc keyring status < keyring                     # IDs, dates, ages; exit 3 if the active key is over 365 days old
+osc keyring status < keyring                     # IDs, dates, ages; exit 3 if the active key is over 365 days old (--max-age-days)
 osc keyring status --configured                  # the same for the configured key source
 ```
 
@@ -219,8 +225,9 @@ kubectl get secret osc-keyring -o jsonpath='{.data.keyring}' | base64 -d \
 
 2. Wait until every reader has the key: each service's `status()` lists it,
    or at least the kubelet's sync delay (about a minute) plus the 5-second
-   check. Readers that get the keyring from `OSC_KEYRING_COMMAND` see it at
-   once.
+   check. Readers that get the keyring from `OSC_KEYRING_COMMAND` see it when
+   they next start: each `osc` run reads it anew, but a running `osc-gui`
+   keeps the keys it started with.
 3. Activate it through the same pipeline, with `osc keyring activate <ID>` in
    place of `add`. Take the offline backup afterwards.
 
@@ -232,6 +239,7 @@ objects off a key means re-encrypting them with fresh data keys:
 
 ```bash
 osc enc scan s3://bucket/                        # objects per key ID (header reads only)
+osc enc scan s3://bucket/ --key kek-2025-10-8be01d44   # only the URLs of the objects under that key
 osc --keyring keyring enc reencrypt s3://bucket/ --from kek-2025-10-8be01d44 --dry-run
 osc --keyring keyring enc reencrypt s3://bucket/ --from kek-2025-10-8be01d44
 ```
@@ -268,11 +276,13 @@ Zero-byte entries, such as the folder markers the S3 and GCS consoles create
 (listed as an empty `p/sub`), are counted as not encrypted without being read.
 
 A scan or re-encryption is complete only when it exits 0. Exit 1 means objects
-were unreadable (`osc enc scan` names each on standard error with the reason)
-or the listing failed: the summary then shows `listing-errors` above 0 and the
-error names the offending key (printed sanitized), for example one with an
-empty segment or a control character, which the store lists as an invalid
-path. Remove that object with the provider's tools and run again; see
+were unreadable (`osc enc scan` names each on standard error with the reason,
+or in its `--json` line), a re-encryption left objects `error`, `changed` or
+`after-cutoff`, or the listing failed: the summary then shows `listing-errors`
+(`(listing errors)` in the scan's table) above 0 and the error names the
+offending key (printed sanitized), for example one with an empty segment or a
+control character, which the store lists as an invalid path. Remove that
+object with the provider's tools and run again; see
 [Unaddressable object names](BEHAVIOR.md#unaddressable-object-names).
 
 ### After a key leak
@@ -391,8 +401,8 @@ Encryption failures derive from `EncryptionError` (a `RuntimeError`):
 `DecryptionError`, `UnknownKeyError`, `NotEncryptedError`. Invalid arguments
 (reserved or oversized context, out-of-range `frame_length`, malformed URL
 paths, an unsupported scheme) raise `ValueError`. A missing object is still
-`FileNotFoundError`, and an HTTP 401 or 403 from the store raises
-`PermissionError`.
+`FileNotFoundError`, and an HTTP 401 or 403 from the store, or an
+[archived object](BEHAVIOR.md#archived-objects), raises `PermissionError`.
 
 ## CLI
 
@@ -413,12 +423,13 @@ With a keyring (`--keyring FILE`, `OSC_KEYRING_FILE` or
 rejected. `ls`, `rm`, `exists`, `mb` and `bucket-exists` never read the
 keyring: the key command does not run and no key is loaded (setting both kinds
 of source is still an error, and so is it for `enc inspect`, `enc scan` and
-the `keyring` helpers). `OSC_KEYRING_COMMAND` runs through `sh -c` with no
-standard input (log in to `kubectl`/`bao` beforehand); its output is kept in memory that is
-wiped after use, and a non-zero exit, more than 64 KiB of output or more than
-30 seconds is an error. `osc` disables core dumps and same-user `ptrace` for
-itself (Unix; `PR_SET_DUMPABLE` on Linux), so a crash writes no keys to disk,
-and the key command inherits the zero core limit.
+the `keyring` helpers). `OSC_KEYRING_COMMAND` runs through `sh -c` (`cmd /C`
+on Windows) with no standard input (log in to `kubectl`/`bao` beforehand); its
+output is kept in memory that is wiped after use, and a non-zero exit, more
+than 64 KiB of output, output that is not UTF-8 or more than 30 seconds is an
+error. `osc` disables core dumps and same-user `ptrace` for itself (Unix;
+`PR_SET_DUMPABLE` on Linux), so a crash writes no keys to disk, and the key
+command inherits the zero core limit.
 
 When the command times out, or `osc` is interrupted while it runs, the shell is
 killed, but processes it started (the stages of a pipeline) may keep running.
@@ -429,15 +440,26 @@ Set `OSC_REQUIRE_ENCRYPTION=1` (or `--require-encryption`) in CI and in
 Kubernetes jobs, so a missing key source is an error and never a silent
 plaintext upload. `0`, `false`, `no` and `off` leave it off.
 
+`osc-gui` takes the same `--keyring`, `OSC_KEYRING_FILE`, `OSC_KEYRING_COMMAND`
+and `--require-encryption` (`OSC_REQUIRE_ENCRYPTION`), and turns core dumps off
+like `osc`. It opens the key source once, at launch: a keyring file still
+reloads itself, a key command does not run again. With `--require-encryption`
+and no key source it refuses to start. See [Launch](GUI.md#launch).
+
 ## Format and interop
 
 Objects are AWS Encryption SDK message format version 2, algorithm suite
-`0x0478` (AES-256-GCM with key commitment), framed with 64 KiB frames. They can
-be decrypted by the AWS Encryption SDK with a raw AES keyring using key
-namespace `osc-file` and key name = the key ID, with the 256-bit key from the
-keyring's `material=` field. The byte layout is the public
+`0x0478` (AES-256-GCM with key commitment), framed with 64 KiB frames by
+default. They can be decrypted by the AWS Encryption SDK with a raw AES keyring
+using key namespace `osc-file` and key name = the key ID, with the 256-bit key
+from the keyring's `material=` field. The byte layout is the public
 [AWS Encryption SDK message format](https://docs.aws.amazon.com/encryption-sdk/latest/developer-guide/message-format.html).
 The encryption context holds the reserved entries `osc:fmt=1` and, when object
 key binding is on, `osc:key=<object path>`, plus the caller's own entries. A
 key's check value is the first 8 bytes of `HMAC-SHA256(material,
 "osc-key-check-v1")`.
+
+By default (`DecodeLimits`) a reader accepts a header of at most 16 KiB with at
+most 8 wrapped data keys, and frame lengths of 4 KiB to 4 MiB; `frame_length`
+must lie in that range. A writer refuses an encryption context over 12 KiB
+serialized.

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::backend::ObjectState;
 use crate::connection::Connection;
 
 /// How the opened client encrypts, and where its keys came from.
@@ -74,11 +75,47 @@ pub enum Entry {
         name: String,
         size: u64,
         modified: DateTime<Utc>,
+        /// Whether it can be read now.
+        state: ObjectState,
+        /// The S3 storage class or Azure access tier, when listed.
+        class: Option<String>,
     },
     /// A symlink of a `file://` folder, acted on as the link itself.
     Link {
         name: String,
     },
+}
+
+/// Why an object in `state` cannot be copied yet, or `None` when it is
+/// online. `class` is the S3 storage class or Azure access tier; the Azure
+/// tier names tell the two apart.
+#[must_use]
+pub fn unavailable_reason(state: ObjectState, class: Option<&str>) -> Option<String> {
+    let azure = class.is_some_and(|c| {
+        ["Hot", "Cool", "Cold", "Smart", "Archive"]
+            .iter()
+            .any(|tier| tier.eq_ignore_ascii_case(c))
+    });
+    let class = match class {
+        Some(c) if azure => format!(" ({c} tier)"),
+        Some(c) => format!(" ({c})"),
+        None => String::new(),
+    };
+    match (state, azure) {
+        (ObjectState::Online, _) => None,
+        (ObjectState::Archived, false) => {
+            Some(format!("Archived{class}: restore it before copying"))
+        }
+        (ObjectState::Archived, true) => {
+            Some(format!("Archived{class}: rehydrate it before copying"))
+        }
+        (ObjectState::Restoring, false) => Some(format!(
+            "Restore in progress{class}: it can be copied once it finishes"
+        )),
+        (ObjectState::Restoring, true) => Some(format!(
+            "Rehydration in progress{class}: it can be copied once it finishes"
+        )),
+    }
 }
 
 impl Entry {
@@ -392,4 +429,35 @@ pub(crate) struct AppState {
     /// A report that arrived while `Dialog::Quit` was open, shown if the user
     /// keeps the window open.
     pub(crate) deferred: Option<Dialog>,
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_reason_names_the_class_and_the_provider_verb() {
+        let reason = |state, class| unavailable_reason(state, Some(class));
+        assert_eq!(reason(ObjectState::Online, "STANDARD"), None);
+        assert_eq!(
+            reason(ObjectState::Archived, "GLACIER").as_deref(),
+            Some("Archived (GLACIER): restore it before copying")
+        );
+        assert_eq!(
+            reason(ObjectState::Archived, "Archive").as_deref(),
+            Some("Archived (Archive tier): rehydrate it before copying")
+        );
+        assert_eq!(
+            reason(ObjectState::Restoring, "DEEP_ARCHIVE").as_deref(),
+            Some("Restore in progress (DEEP_ARCHIVE): it can be copied once it finishes")
+        );
+        assert_eq!(
+            reason(ObjectState::Restoring, "Archive").as_deref(),
+            Some("Rehydration in progress (Archive tier): it can be copied once it finishes")
+        );
+        assert_eq!(
+            unavailable_reason(ObjectState::Archived, None).as_deref(),
+            Some("Archived: restore it before copying")
+        );
+    }
 }

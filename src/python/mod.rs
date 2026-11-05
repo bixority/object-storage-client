@@ -115,7 +115,7 @@ fn client_to_py_err(e: Error) -> PyErr {
         Error::Python(e) => e,
         // The matching `OSError` subclass (`FileNotFoundError`, ...).
         Error::Io(e) => e.into(),
-        Error::Denied(_) => PyPermissionError::new_err(e.to_string()),
+        Error::Denied(_) | Error::Archived(_) => PyPermissionError::new_err(e.to_string()),
         Error::InvalidUrl(_) | Error::UnsupportedScheme(_) => PyValueError::new_err(e.to_string()),
         Error::Decryption(_) => DecryptionError::new_err(e.to_string()),
         Error::Key(KeyError::UnknownKey { .. }) => UnknownKeyError::new_err(e.to_string()),

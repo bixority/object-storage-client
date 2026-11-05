@@ -3,8 +3,9 @@
 ## Prerequisites
 
 - Rust 1.99+ (edition 2024)
-- Python 3.13+ and [uv](https://docs.astral.sh/uv/) for the bindings;
-  `uv sync --group dev` installs maturin 1.15+, pytest and testcontainers
+- Python 3.13.9 to 3.15 and [uv](https://docs.astral.sh/uv/) for the bindings;
+  `uv sync --group dev` installs maturin 1.15+, pytest, testcontainers, ruff,
+  ty and pyright
 - Docker or Podman for the integration tests (see [Testing](TESTING.md))
 - Nightly Rust and [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) for
   fuzzing
@@ -19,7 +20,10 @@
   `uv sync --group dev --no-install-project`, then
   `uv run --no-sync maturin develop`
 
-The committed `.cargo/config.toml` also drives the PyPI wheels, the sdist and the crate, so CPU tuning (for example `-C target-cpu=native`) belongs in `RUSTFLAGS` or your own `~/.cargo/config.toml`, never in the repository.
+The committed `.cargo/config.toml` also drives the PyPI wheels, the sdist and
+the crate, so CPU tuning (for example `-C target-cpu=native`) belongs in
+`RUSTFLAGS` or your own `~/.cargo/config.toml`, never in the repository; the
+`lint` job fails on any table in it other than `[registries]`.
 
 ## Cargo features
 
@@ -70,7 +74,7 @@ cargo check --locked --features fuzzing
 cargo check --locked --no-default-features --lib
 cargo check --locked --no-default-features --features encryption --lib
 cargo check --locked --no-default-features --features gui --bins
-cargo check --locked --manifest-path fuzz/Cargo.toml --target-dir target
+cargo check --manifest-path fuzz/Cargo.toml --target-dir target
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
@@ -91,11 +95,15 @@ are working directories and stay ignored. To keep a crash, minimise it with
 add the output to `fuzz/seeds/<target>/` in the commit that fixes it. There is
 no scheduled fuzzing job.
 
-`fuzz/Cargo.lock` is committed, so CI builds the fuzz crate with `--locked`
-and `cargo deny` checks it (`manifest-path: fuzz/Cargo.toml`); Dependabot
-watches `/fuzz` too. It started as a copy of the root `Cargo.lock`, so shared
-crates have the same versions. After a root dependency change, refresh it with
-`cargo update --manifest-path fuzz/Cargo.toml` and commit it.
+`fuzz/Cargo.lock` is committed and `cargo deny` checks it
+(`manifest-path: fuzz/Cargo.toml`); Dependabot watches `/fuzz` too. CI checks
+the fuzz crate against it without `--locked`, so a stale lock does not fail
+CI. It started as a copy of the root `Cargo.lock`, so shared crates have the
+same versions. After a root dependency change, refresh it with
+`cargo update --manifest-path fuzz/Cargo.toml` and commit it. It also records
+this crate's own version, so refresh it on every version bump with
+`cargo update --manifest-path fuzz/Cargo.toml -p object-storage-client`;
+otherwise a `--locked` check of the fuzz crate fails.
 
 ## Layout
 
@@ -103,7 +111,8 @@ crates have the same versions. After a root dependency change, refresh it with
 - `src/backend/`: one module per storage provider
 - `src/encryption/`: message format, framing, keyrings and the encrypting codec
 - `src/cli.rs`, `src/cli/`, `src/main.rs`: the `osc` binary
-- `src/gui.rs`, `src/gui/`, `src/bin/osc-gui.rs`: the `osc-gui` binary
+- `src/gui.rs`, `src/gui/`, `src/bin/osc-gui.rs`: the `osc-gui` binary;
+  `src/connection/`: its connection discovery and SSO login
 - `src/python/`, `python/object_storage_client/`: the bindings and their type stubs
 - `tests/`, `benches/`, `fuzz/`, `scripts/`: see [Testing](TESTING.md)
 - `compose.yml`: Garage and Azurite for manual exploration (`docker compose up`)
@@ -113,12 +122,15 @@ crates have the same versions. After a root dependency change, refresh it with
 - `tests.yaml`: tests, lints, a `cargo deny` check (advisories, bans, sources;
   see `deny.toml`), feature builds, Python tests and the AWS Encryption SDK
   interop check, on pushes to `main` and on pull requests. Every cargo call
-  on the root crate and the fuzz crate passes `--locked`, so a `Cargo.toml` change without its
-  lockfile fails the PR. Further jobs:
+  on the root crate passes `--locked`, so a `Cargo.toml` change without its
+  lockfile fails the PR; the fuzz crate check does not (see [Fuzzing](#fuzzing)).
+  Further jobs:
   - `msrv` runs `cargo check --locked --all-features --all-targets` with Rust
     1.99, the `rust-version` in `Cargo.toml`.
   - `tests` runs the Rust suite on Linux and macOS, and on Windows the library
     tests plus a check of every target.
+  - `integration` runs the Rust container tests (Garage, Azurite,
+    fake-gcs-server) without the 4 GiB tier.
   - `esdk-interop` fails unless exactly one oracle test passed.
 
   Runs on `main` are never cancelled. Its last job,
@@ -128,22 +140,21 @@ crates have the same versions. After a root dependency change, refresh it with
   (`workflow_dispatch`), because a merge made with `GITHUB_TOKEN` starts no
   push run, so the merged commit would otherwise go untested.
 - `perf.yaml`: benchmarks and the memory smoke test, nightly or on demand.
-- `ci.yaml`: when a release is published, tests and a `cargo deny` check
-  (stable Rust only, so a beta or nightly problem cannot block a release;
-  both publish jobs wait for the deny check), then builds wheels for
-  Python 3.13, 3.14 and 3.15 and the sdist. `test-wheels` installs every
-  wheel into a fresh environment on its own platform (Linux x86_64, macOS,
-  Windows, and the aarch64 Linux wheel under QEMU in its manylinux image;
-  the legs match `build-wheels`) and runs the Python tests that need no
-  containers;
-  both publish jobs wait for it. `package-crate` checks that the tag
-  equals `v` plus the Cargo.toml version and runs `cargo package --locked`
+- `ci.yaml`: when a release is published, tests, rustfmt and clippy, and a
+  `cargo deny` check (stable Rust only, so a beta or nightly problem cannot
+  block a release; both publish jobs wait for the deny check), then builds
+  wheels for Python 3.13, 3.14 and 3.15 and the sdist. `test-wheels` installs
+  every wheel into a fresh environment on its own platform (Linux x86_64,
+  macOS, Windows, and the aarch64 Linux wheel under QEMU in its manylinux
+  image; the legs match `build-wheels`) and runs the Python tests that need no
+  containers; both publish jobs wait for it. `package-crate` checks that the
+  tag equals `v` plus the Cargo.toml version and runs `cargo package --locked`
   without secrets. The publish jobs run only for a published release on a `v*`
   tag, in the `release` environment, after all of those succeed.
   `publish-crate` runs `cargo publish --no-verify` (no dependency code runs
   next to the Codeberg token) and `publish-to-pypi` uses PyPI Trusted
-  Publishing (OIDC), with no stored token. Run it by hand
-  (`workflow_dispatch`) from a branch to dry-run everything except publishing.
+  Publishing (OIDC), with no stored token. Run it by hand (`workflow_dispatch`)
+  from a branch to dry-run everything except publishing.
 - Every `uses:` in every workflow is pinned to a full commit SHA with the tag
   in a trailing comment, and the `lint` job fails on an unpinned one.
   Dependabot proposes updates to the pins weekly; review them by hand.

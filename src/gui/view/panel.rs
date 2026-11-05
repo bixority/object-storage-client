@@ -1,10 +1,11 @@
 //! One panel: address bar, banners, the listing table and its footer.
 
 use super::address_bar;
+use crate::backend::ObjectState;
 use crate::connection::Login;
 use crate::gui::action::{Action, SelectOp};
 use crate::gui::display;
-use crate::gui::model::{AppState, Entry, MAX_ENTRIES, PanelState, Side};
+use crate::gui::model::{AppState, Entry, MAX_ENTRIES, PanelState, Side, unavailable_reason};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -208,14 +209,7 @@ fn table(
                 let name = entry.name();
                 let key = entry.key();
                 row.set_selected(panel.selection.contains(&key));
-                let icon = match entry {
-                    Entry::Folder { .. } => "🗀",
-                    Entry::Object { .. } => "🗋",
-                    Entry::Link { .. } => "🔗",
-                };
-                row.col(|ui| {
-                    ui.add(egui::Label::new(format!("{icon} {}", display::text(name))).truncate());
-                });
+                row.col(|ui| name_cell(ui, entry));
                 let (size_text, modified_text) = match entry {
                     Entry::Folder { .. } | Entry::Link { .. } => (String::new(), String::new()),
                     Entry::Object { size, modified, .. } => (
@@ -230,6 +224,11 @@ fn table(
                     ui.label(modified_text);
                 });
                 let response = row.response();
+                if let Entry::Object { state, class, .. } = entry
+                    && let Some(reason) = unavailable_reason(*state, class.as_deref())
+                {
+                    response.clone().on_hover_text(reason);
+                }
                 if response.double_clicked() {
                     // Only folders open; an object may share a folder's name.
                     if entry.is_folder() {
@@ -253,6 +252,34 @@ fn table(
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let rows = rows.max(1.0) as usize;
     ctx.data_mut(|d| d.insert_temp(page_rows_id(side), rows));
+}
+
+/// The name cell of a row: icon and name; an archived or restoring object
+/// has its own icon and is drawn weak.
+fn name_cell(ui: &mut egui::Ui, entry: &Entry) {
+    let icon = match entry {
+        Entry::Folder { .. } => "🗀",
+        Entry::Object {
+            state: ObjectState::Archived,
+            ..
+        } => "❄",
+        Entry::Object {
+            state: ObjectState::Restoring,
+            ..
+        } => "⌛",
+        Entry::Object { .. } => "🗋",
+        Entry::Link { .. } => "🔗",
+    };
+    let text = egui::RichText::new(format!("{icon} {}", display::text(entry.name())));
+    let offline = matches!(
+        entry,
+        Entry::Object {
+            state: ObjectState::Archived | ObjectState::Restoring,
+            ..
+        }
+    );
+    let text = if offline { text.weak() } else { text };
+    ui.add(egui::Label::new(text).truncate());
 }
 
 /// Selection count, shown count and Load more.

@@ -5,7 +5,10 @@ use super::{
     default_timeouts, error_body, ms_error_code, send_signed, send_with_retry,
 };
 #[cfg(feature = "gui")]
-use super::{collect_pages, encode, xml_listing_page};
+use super::{
+    ListPage, ListedObject, ObjectState, collect_pages, encode, read_listing, xml_blocks,
+    xml_listing_page, xml_texts,
+};
 use crate::client::{Error, Result};
 use http::Method;
 use object_store::ClientConfigKey;
@@ -368,6 +371,103 @@ impl Backend for AzureBackend {
 
     fn scheme(&self) -> &str {
         &self.scheme
+    }
+
+    /// `List Blobs` with delimiter `/`, which reports each blob's access tier
+    /// and rehydration: `Archive` is archived, `rehydrate-pending-*` is
+    /// restoring. Directory entries of a hierarchical namespace are skipped,
+    /// as `object_store` skips them.
+    #[cfg(feature = "gui")]
+    async fn list_page(
+        &self,
+        dir: &ObjectPath,
+        max: usize,
+        token: Option<String>,
+    ) -> Result<ListPage> {
+        let (account, endpoint) = self.account_and_endpoint()?;
+        let prefix = if dir.as_ref().is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        let mut uri = format!(
+            "{}/{}?restype=container&comp=list&delimiter=%2F&maxresults={max}",
+            endpoint.trim_end_matches('/'),
+            self.container
+        );
+        if !prefix.is_empty() {
+            uri = format!("{uri}&prefix={}", encode(&prefix));
+        }
+        if let Some(token) = token {
+            uri = format!("{uri}&marker={}", encode(&token));
+        }
+        let client = self.http.get()?;
+        let response = send_with_retry(|| async {
+            let request = self
+                .signed_request(Method::GET, &uri, &account, &[])
+                .await?;
+            send_signed(client, request).await
+        })
+        .await?;
+        let body = read_listing(response, "Azure List Blobs").await?;
+        let xml = String::from_utf8_lossy(&body);
+        let invalid = |e: object_store::path::Error| object_store::Error::from(e);
+        let mut objects = Vec::new();
+        for block in xml_blocks(&xml, "Blob") {
+            let Some(name) = xml_texts(block, "Name").into_iter().next() else {
+                continue;
+            };
+            let props = xml_blocks(block, "Properties")
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            let text = |tag| xml_texts(props, tag).into_iter().next();
+            if text("ResourceType").as_deref() == Some("directory") || name.len() <= prefix.len() {
+                continue;
+            }
+            let bad =
+                |what: &str, v: &str| Error::Generic(format!("Azure listing: bad {what} {v:?}"));
+            let (Some(size), Some(modified)) = (text("Content-Length"), text("Last-Modified"))
+            else {
+                return Err(Error::Generic(
+                    "Azure listing: a blob has no properties".into(),
+                ));
+            };
+            let class = text("AccessTier");
+            let state = if text("ArchiveStatus").is_some_and(|s| s.starts_with("rehydrate-pending"))
+            {
+                ObjectState::Restoring
+            } else if class.as_deref() == Some("Archive") {
+                ObjectState::Archived
+            } else {
+                ObjectState::Online
+            };
+            objects.push(ListedObject {
+                location: ObjectPath::parse(&name).map_err(invalid)?,
+                size: size.parse().map_err(|_| bad("Content-Length", &size))?,
+                modified: chrono::NaiveDateTime::parse_from_str(
+                    &modified,
+                    "%a, %d %b %Y %H:%M:%S GMT",
+                )
+                .map_err(|_| bad("Last-Modified", &modified))?
+                .and_utc(),
+                state,
+                class,
+            });
+        }
+        let prefixes = xml_blocks(&xml, "BlobPrefix")
+            .into_iter()
+            .filter_map(|block| xml_texts(block, "Name").into_iter().next())
+            .map(|p| ObjectPath::parse(p).map_err(invalid))
+            .collect::<std::result::Result<_, _>>()?;
+        let next = xml_texts(&xml, "NextMarker")
+            .pop()
+            .filter(|t| !t.is_empty());
+        Ok(ListPage {
+            prefixes,
+            objects,
+            next,
+        })
     }
 
     /// Issues an Azure `Create Container` request
@@ -1336,6 +1436,176 @@ mod tests {
                 "{}",
                 requests[0].headers
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_an_archived_blob_is_archived() {
+        use object_store::ObjectStoreExt;
+        let body = "<Error><Code>BlobArchived</Code><Message>This operation is not permitted on an archived blob.</Message></Error>";
+        let stub = serve(vec![Reply::new(409, body)]).await;
+        let endpoint = format!("{}/acct", stub.base);
+        let err = backend(&[
+            ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+            ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
+            ("AZURE_STORAGE_ENDPOINT", &endpoint),
+            ("AZURE_ALLOW_HTTP", "true"),
+        ])
+        .store()
+        .get(&ObjectPath::from("o"))
+        .await
+        .expect_err("archived");
+        let err = Error::from(err);
+        assert!(matches!(err, Error::Archived(_)), "{err:?}");
+    }
+
+    #[cfg(feature = "gui")]
+    mod list_page {
+        use super::*;
+        use crate::backend::stub::Request;
+
+        fn blob(name: &str, props: &str) -> String {
+            format!(
+                "<Blob><Name>{name}</Name><Properties><Content-Length>42</Content-Length>\
+                 <Last-Modified>Mon, 06 May 2024 07:08:09 GMT</Last-Modified>{props}\
+                 </Properties><Metadata><Name>x</Name></Metadata></Blob>"
+            )
+        }
+
+        fn page(inner: &str, marker: &str) -> Reply {
+            let marker = if marker.is_empty() {
+                "<NextMarker />".to_owned()
+            } else {
+                format!("<NextMarker>{marker}</NextMarker>")
+            };
+            Reply::new(
+                200,
+                format!(
+                    "\u{feff}<?xml version=\"1.0\"?><EnumerationResults ServiceEndpoint=\"e\">\
+                     <Prefix>d/</Prefix><Blobs>{inner}</Blobs>{marker}</EnumerationResults>"
+                ),
+            )
+        }
+
+        async fn list(
+            replies: Vec<Reply>,
+            dir: &str,
+            tokens: &[Option<&str>],
+        ) -> (Vec<Result<ListPage>>, Vec<Request>) {
+            let stub = serve(replies).await;
+            let endpoint = format!("{}/acct", stub.base);
+            let b = backend(&[
+                ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
+                ("AZURE_STORAGE_ENDPOINT", &endpoint),
+                ("AZURE_ALLOW_HTTP", "true"),
+            ]);
+            let mut pages = Vec::new();
+            for token in tokens {
+                let token = token.map(str::to_owned);
+                pages.push(b.list_page(&ObjectPath::from(dir), 7, token).await);
+            }
+            (pages, stub.requests())
+        }
+
+        #[tokio::test]
+        async fn tiers_map_to_states() {
+            let inner = [
+                blob("d/cold", "<AccessTier>Archive</AccessTier>"),
+                blob(
+                    "d/going",
+                    "<AccessTier>Archive</AccessTier>\
+                     <ArchiveStatus>rehydrate-pending-to-cool</ArchiveStatus>",
+                ),
+                blob("d/hot", "<AccessTier>Hot</AccessTier>"),
+                blob("d/cool", "<AccessTier>Cool</AccessTier>"),
+                blob("d/none", ""),
+                blob(
+                    "d/a&amp;b &lt;c&gt; \u{e9}",
+                    "<AccessTier>Archive</AccessTier>",
+                ),
+                blob("d/dir", "<ResourceType>directory</ResourceType>"),
+                blob("d/", ""),
+                "<BlobPrefix><Name>d/sub&amp;dir/</Name></BlobPrefix>".to_owned(),
+            ]
+            .concat();
+            let (mut pages, requests) = list(vec![page(&inner, "")], "d", &[None]).await;
+            let got = pages.remove(0).expect("list");
+            let seen: Vec<_> = got
+                .objects
+                .iter()
+                .map(|o| (o.location.as_ref(), o.state, o.class.as_deref()))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    ("d/cold", ObjectState::Archived, Some("Archive")),
+                    ("d/going", ObjectState::Restoring, Some("Archive")),
+                    ("d/hot", ObjectState::Online, Some("Hot")),
+                    ("d/cool", ObjectState::Online, Some("Cool")),
+                    ("d/none", ObjectState::Online, None),
+                    ("d/a&b <c> \u{e9}", ObjectState::Archived, Some("Archive")),
+                ]
+            );
+            assert_eq!(got.objects[0].size, 42);
+            assert_eq!(
+                got.objects[0].modified.to_rfc3339(),
+                "2024-05-06T07:08:09+00:00"
+            );
+            let prefixes: Vec<_> = got.prefixes.iter().map(AsRef::as_ref).collect();
+            assert_eq!(prefixes, ["d/sub&dir"]);
+            assert_eq!(got.next, None);
+            assert_eq!(
+                requests[0].line,
+                "GET /acct/c?restype=container&comp=list&delimiter=%2F&maxresults=7&prefix=d%2F HTTP/1.1"
+            );
+            assert!(
+                requests[0]
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: sharedkey acct:"),
+                "{}",
+                requests[0].headers
+            );
+        }
+
+        #[tokio::test]
+        async fn a_marker_continues_the_listing() {
+            let replies = vec![
+                page(&blob("a", ""), "1!8!Zm9v/+=="),
+                page(&blob("b", ""), ""),
+            ];
+            let tokens = [None, Some("1!8!Zm9v/+==")];
+            let (mut pages, requests) = list(replies, "", &tokens).await;
+            let second = pages.pop().expect("second").expect("list");
+            let first = pages.pop().expect("first").expect("list");
+            assert_eq!(first.next.as_deref(), Some("1!8!Zm9v/+=="));
+            assert_eq!(second.next, None);
+            assert_eq!(
+                requests[0].line,
+                "GET /acct/c?restype=container&comp=list&delimiter=%2F&maxresults=7 HTTP/1.1"
+            );
+            assert_eq!(
+                requests[1].line,
+                "GET /acct/c?restype=container&comp=list&delimiter=%2F&maxresults=7&marker=1%218%21Zm9v%2F%2B%3D%3D HTTP/1.1"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_busy_page_is_retried() {
+            let busy = Reply::new(503, "<Error><Code>ServerBusy</Code></Error>");
+            let (mut pages, requests) =
+                list(vec![busy, page(&blob("a", ""), "")], "", &[None]).await;
+            assert_eq!(pages.remove(0).expect("list").objects.len(), 1);
+            assert_eq!(requests.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_denied_page_is_denied() {
+            let denied = Reply::new(403, "<Error><Code>AuthorizationFailure</Code></Error>");
+            let (mut pages, _) = list(vec![denied], "", &[None]).await;
+            let err = pages.remove(0).expect_err("denied");
+            assert!(matches!(err, Error::Denied(_)), "{err:?}");
         }
     }
 }

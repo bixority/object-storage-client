@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage-client"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "alloc-counter",
  "async-trait",

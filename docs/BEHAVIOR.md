@@ -73,7 +73,8 @@ decrypts the source and re-encrypts it to the destination, see
 destination committed.
 
 A plain copy or move first reads the start of the source with one extra ranged
-request of 1 KiB (up to 16 KiB more only for a larger header). An encrypted object whose header binds a name other than the
+request of 1 KiB (and a second one of at most 16 KiB only for a larger
+header). An encrypted object whose header binds a name other than the
 destination's is refused with `Error::InvalidInput` and nothing is written or
 deleted, because the copy would be unreadable; a header that starts like ours
 but does not parse is refused too. Other objects, and encrypted objects without
@@ -88,17 +89,20 @@ itself (the same path, scheme aliases such as `gs`/`gcs` or `az`/`abfs`, or a
 encrypted objects alike, whatever the key; an object on an old key stays on it
 (use `reencrypt`). Only a `file://` path through a symlinked directory with
 object key binding on is re-encrypted under its new name, and that rewrite is
-abandoned with `Error::Changed` if the file changed meanwhile. An encrypted copy or
-move whose source is replaced while it is being read is abandoned the same way:
-nothing is written and the source is kept. Every move, server-side or
-streamed, deletes the source only if it still matches the object that was
-copied (size, last-modified, e-tag, version). If it changed, for example
-because the destination is another name for the same server (an IP and a
+abandoned with `Error::Changed` if the file changed meanwhile. Every move,
+server-side or streamed, deletes the source only if it still matches the object
+that was copied (size, last-modified, e-tag, version). If it changed, for
+example because the destination is another name for the same server (an IP and a
 hostname, a CNAME) or a concurrent writer replaced it, the source is kept and
 `Error::SourceChanged` is returned; the destination stays written. A
 same-second rewrite with identical bytes on a store that reports no e-tag or
 version cannot be detected. Only a move inside one `file://` file system is an
 atomic rename.
+
+`osc-gui` gives each connection a client of its own. A copy or move between two
+connections always streams, and a move between them onto the same URL is
+refused with `Error::InvalidInput` and keeps the source, because both may reach
+one object.
 
 A copy or move inside one `http(s)://` origin is a WebDAV `COPY` (a move then
 deletes the source as above), so the server must support `COPY`; one that does
@@ -133,7 +137,8 @@ sends no `HEAD`; a move still needs one.
 A plain copy or move between two buckets (containers) of one provider is
 server-side too, when all of these hold:
 
-- both ends are S3, both GCS or both Azure (not across providers or schemes);
+- both ends are S3, both GCS or both Azure (not across providers; the scheme
+  aliases `gs`/`gcs` and `az`/`wasb(s)`/`abfs(s)` count as one provider);
 - both reach the same endpoint (GCS: the same JSON API origin; Azure: the same
   storage account) and, for S3, the same region and addressing style;
 - both use the very same credential provider, which one client shares between
@@ -165,14 +170,15 @@ code `SourceConditionNotMet`). Any other failed answer is an
 error, never a silent stream, so a refused request is not retried under other
 credentials. A copy request that fails before any answer, or is answered 429,
 500, 502, 503 or 504, is sent again after 200 ms and 400 ms, three attempts in
-all; a request answered 2xx is never sent again. An S3 `200` counts as a copy
-only when its body is a `CopyObjectResult`: S3 may send white space first and
-the result or an `<Error>` last, so an empty, cut-off or other body is an
-error. A move deletes the source, on its own bucket, only after the copy is
-complete, the destination is as large as the source was read to be, and the
-source is unchanged. The provider copies the content type
-and user metadata; no storage class or access tier is sent. Encrypted copies
-never take this path.
+all; a request answered 2xx is never sent again. Each attempt has the limits of
+a bucket operation: 5 s to connect and 30 s in all, answer included. An S3
+`200` counts as a copy only when its body is a `CopyObjectResult`: S3 may send
+white space first and the result or an `<Error>` last, so an empty, cut-off or
+other body is an error. A move deletes the source, on its own bucket, only
+after the copy is complete, the destination is as large as the source was read
+to be, and the source is unchanged. The provider copies the content type and
+user metadata; no storage class or access tier is sent. Encrypted copies never
+take this path.
 
 A streamed plain copy keeps the source's `Content-Type`, `Content-Encoding`,
 `Content-Disposition`, `Content-Language` and `Cache-Control`, and its user
@@ -244,6 +250,16 @@ in full:
 - sabre/dav: `enablePropfindDepthInfinity = true`. By default it answers as
   `Depth: 1` without an error, so the listing silently stops one level deep and
   misses nested objects.
+
+## Archived objects
+
+Reading, copying or moving an archived object fails with `Error::Archived`
+(Python: `PermissionError`): for S3 `InvalidObjectState` (a `GLACIER` or
+`DEEP_ARCHIVE` object that is not restored, or an Intelligent-Tiering object in
+an archive tier), for Azure `BlobArchived` (the Archive tier). Restore (S3) or
+rehydrate (Azure) the object first. A delete is not affected, and neither are
+`exists` and plain metadata (a `HEAD`); encrypted metadata and
+`inspect_encryption` read the header and fail the same way.
 
 ## Writes to `file://`
 
@@ -348,7 +364,8 @@ source, and gives the same permission bits.
   the 5 minutes: about 0.9 Mbit/s for the default 4 parts of 8 MiB in flight,
   about 28.6 Mbit/s for a 1 GiB `http(s)://` put.
   See [Configuration](CONFIGURATION.md#request-timeouts).
-- Bucket operations (`create_bucket`, `bucket_exists`) time out after 5 s to
+- Bucket operations (`create_bucket`, `bucket_exists`) and the requests of a
+  server-side copy (see [Copy and move](#copy-and-move)) time out after 5 s to
   connect and 30 s per request. They never follow a redirect. They use the
   transport settings of the store: `*_ALLOW_HTTP`, `*_ALLOW_INVALID_CERTIFICATES`,
   `*_PROXY_URL`, `*_PROXY_CA_CERTIFICATE`, `*_PROXY_EXCLUDES`, `*_USER_AGENT`,

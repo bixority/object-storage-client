@@ -97,8 +97,9 @@ class ObjectStorageClient:
     # an out-of-range ``expires_in_secs``, ``content_length`` or
     # ``frame_length``; ints beyond +-2**127 still raise ``OverflowError``);
     # ``FileNotFoundError`` for a missing object; ``PermissionError`` for an
-    # HTTP 401 or 403 answer; other ``OSError`` subclasses for local file
-    # failures; ``RuntimeError`` for the rest.
+    # HTTP 401 or 403 answer and for an archived object that must be restored
+    # (S3) or rehydrated (Azure) first; other ``OSError`` subclasses for local
+    # file failures; ``RuntimeError`` for the rest.
     def __init__(self, profile: str | None = None) -> None:
         """``profile`` names an AWS profile for ``s3://`` credentials. It is the
         only credential source: static keys in ``S3_ACCESS_KEY_ID`` /

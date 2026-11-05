@@ -7,7 +7,10 @@ use super::{
     send_signed, send_with_retry,
 };
 #[cfg(feature = "gui")]
-use super::{collect_pages, encode, xml_listing_page};
+use super::{
+    ListPage, ListedObject, ObjectState, collect_pages, encode, list_through_store, read_listing,
+    xml_blocks, xml_listing_page, xml_texts,
+};
 use crate::client::{Error, Result};
 use crate::sign::{self, SignMethod, SignOptions};
 use bytes::Bytes;
@@ -23,6 +26,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
+/// Why a profile refuses a global `AWS_ENDPOINT_URL`. The SDK's SSO and STS
+/// clients honour it too, so the profile's tokens would go to the storage
+/// endpoint. The GUI's connections refuse it with the same text.
+pub const PROFILE_ENDPOINT_REFUSED: &str = "AWS_ENDPOINT_URL also redirects the AWS profile's SSO and STS requests and \
+     their tokens; set the S3 endpoint with S3_ENDPOINT or AWS_ENDPOINT_URL_S3";
+
 /// The settings behind [`S3Backend`]'s `provider_policy`.
 const POLICY_KEYS: [&str; 5] = [
     "aws_server_side_encryption",
@@ -31,6 +40,16 @@ const POLICY_KEYS: [&str; 5] = [
     "aws_sse_customer_key_base64",
     "aws_s3_express",
 ];
+
+/// What [`S3Backend`]'s `provider_policy` found in the settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Policy {
+    None,
+    /// Encryption settings, which the store's own requests turn into headers.
+    Encryption,
+    /// `AWS_S3_EXPRESS`: a directory bucket, which needs the store's session auth.
+    Express,
+}
 
 /// How requests address the bucket. `S3_ADDRESSING_STYLE` sets it; when that is
 /// unset, `AWS_VIRTUAL_HOSTED_STYLE_REQUEST` decides, and path is the default.
@@ -81,7 +100,7 @@ pub struct S3Backend {
     /// A setting that the store's own requests turn into encryption headers
     /// (`AWS_SERVER_SIDE_ENCRYPTION` and its key settings), or `AWS_S3_EXPRESS`:
     /// the hand-built copy request does not carry them, so such a store streams.
-    provider_policy: bool,
+    provider_policy: Policy,
 }
 
 impl S3Backend {
@@ -132,13 +151,7 @@ impl S3Backend {
         // explicit profile is the only credential source.
         let uses_profile = profile.is_some();
         if uses_profile && get_var("AWS_ENDPOINT_URL").is_some_and(|v| !v.is_empty()) {
-            // The SDK's SSO and STS clients honour the global endpoint too, so
-            // their tokens would go to the storage endpoint.
-            return Err(Error::InvalidInput(
-                "AWS_ENDPOINT_URL also redirects the AWS profile's SSO and STS requests and \
-                 their tokens; set the S3 endpoint with S3_ENDPOINT or AWS_ENDPOINT_URL_S3"
-                    .into(),
-            ));
+            return Err(Error::InvalidInput(PROFILE_ENDPOINT_REFUSED.into()));
         }
         let mut builder = match vars {
             Vars::Env => AmazonS3Builder::from_env(),
@@ -250,14 +263,23 @@ impl S3Backend {
         })
     }
 
-    /// Whether `builder` holds a setting behind `provider_policy`.
-    fn provider_policy(builder: &AmazonS3Builder) -> bool {
-        POLICY_KEYS.iter().any(|name| {
+    /// The setting behind `provider_policy` that `builder` holds, if any.
+    fn provider_policy(builder: &AmazonS3Builder) -> Policy {
+        let value = |name: &str| {
             name.parse::<AmazonS3ConfigKey>()
                 .ok()
                 .and_then(|key| builder.get_config_value(&key))
-                .is_some_and(|v| *name != "aws_s3_express" || parse_bool(&v) == Some(true))
-        })
+        };
+        if value("aws_s3_express").is_some_and(|v| parse_bool(&v) == Some(true)) {
+            Policy::Express
+        } else if POLICY_KEYS
+            .iter()
+            .any(|name| *name != "aws_s3_express" && value(name).is_some())
+        {
+            Policy::Encryption
+        } else {
+            Policy::None
+        }
     }
 
     /// As [`Self::with_shared`], with providers and clients of its own.
@@ -392,7 +414,13 @@ impl S3Backend {
     /// unless signing is skipped. The credential comes from
     /// [`S3Backend::credential`], so `skip_signature` never reaches IMDS.
     async fn bucket_request(&self, method: Method, body: Bytes) -> Result<HttpRequest> {
-        let uri = match (self.addressing, self.endpoint.as_deref()) {
+        self.signed_request(method, &self.bucket_uri(), body).await
+    }
+
+    /// The URI of the bucket (`/<bucket>`) in the addressing style of the
+    /// store.
+    fn bucket_uri(&self) -> String {
+        match (self.addressing, self.endpoint.as_deref()) {
             // The store uses a custom endpoint as is in this mode.
             (AddressingStyle::Virtual, Some(endpoint)) => {
                 format!("{}/", endpoint.trim_end_matches('/'))
@@ -405,16 +433,29 @@ impl S3Backend {
             (AddressingStyle::Path, _) => {
                 format!("{}/{}", self.endpoint().trim_end_matches('/'), self.bucket)
             }
-        };
-        self.signed_request(method, &uri, body).await
+        }
     }
 
     /// A request to `uri` carrying `body`, `SigV4`-signed unless signing is
     /// skipped.
     async fn signed_request(&self, method: Method, uri: &str, body: Bytes) -> Result<HttpRequest> {
-        let mut request: HttpRequest = http::Request::builder()
-            .method(method)
-            .uri(uri)
+        self.signed_request_with(method, uri, body, &[]).await
+    }
+
+    /// As [`signed_request`](Self::signed_request), with `headers` set before
+    /// signing, so that they are signed.
+    async fn signed_request_with(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Bytes,
+        headers: &[(&'static str, &str)],
+    ) -> Result<HttpRequest> {
+        let mut builder = http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request: HttpRequest = builder
             .body(HttpRequestBody::from(body))
             .map_err(|e| Error::Generic(format!("Failed to build S3 request: {e}")))?;
 
@@ -461,8 +502,8 @@ impl S3Backend {
             && !other.skip_signature
             && !self.request_payer
             && !other.request_payer
-            && !self.provider_policy
-            && !other.provider_policy
+            && self.provider_policy == Policy::None
+            && other.provider_policy == Policy::None
             && self.region == other.region
             && self.endpoint == other.endpoint
             && self.addressing == other.addressing
@@ -543,11 +584,98 @@ fn copy_outcome(status: reqwest::StatusCode, text: &str) -> Result<bool> {
     Err(create_failed("S3 CopyObject", status, &text))
 }
 
+/// The state of an object of storage class `class`, given its `RestoreStatus`
+/// block (`None` when the listing has none). Only `GLACIER` and `DEEP_ARCHIVE`
+/// are offline; every other class is readable.
+#[cfg(feature = "gui")]
+fn object_state(class: Option<&str>, restore: Option<&str>) -> ObjectState {
+    if !matches!(class, Some("GLACIER" | "DEEP_ARCHIVE")) {
+        return ObjectState::Online;
+    }
+    match restore.and_then(|r| xml_texts(r, "IsRestoreInProgress").pop()) {
+        Some(running) if running == "true" => ObjectState::Restoring,
+        Some(_) => ObjectState::Online,
+        None => ObjectState::Archived,
+    }
+}
+
 #[async_trait::async_trait]
 impl Backend for S3Backend {
     #[cfg(feature = "gui")]
     fn paginated(&self) -> Option<&dyn object_store::list::PaginatedListStore> {
         Some(self.inner.as_ref())
+    }
+
+    /// `ListObjectsV2` with `RestoreStatus`, so that `GLACIER` and
+    /// `DEEP_ARCHIVE` objects show as archived, restoring or restored. An
+    /// S3 Express bucket lists through the store, which has its session auth.
+    #[cfg(feature = "gui")]
+    async fn list_page(
+        &self,
+        dir: &ObjectPath,
+        max: usize,
+        token: Option<String>,
+    ) -> Result<ListPage> {
+        if self.provider_policy == Policy::Express {
+            return list_through_store(self, dir, max, token).await;
+        }
+        let mut uri = format!("{}?list-type=2&delimiter=%2F", self.bucket_uri());
+        if !dir.as_ref().is_empty() {
+            uri = format!("{uri}&prefix={}", encode(&format!("{dir}/")));
+        }
+        uri = format!("{uri}&max-keys={max}");
+        if let Some(token) = token {
+            uri = format!("{uri}&continuation-token={}", encode(&token));
+        }
+        let mut headers = vec![("x-amz-optional-object-attributes", "RestoreStatus")];
+        if self.request_payer {
+            headers.push(("x-amz-request-payer", "requester"));
+        }
+        let client = self.http.get()?;
+        let response = send_with_retry(|| async {
+            let request = self
+                .signed_request_with(Method::GET, &uri, Bytes::new(), &headers)
+                .await?;
+            send_signed(client, request).await
+        })
+        .await?;
+        let body = read_listing(response, "S3 listing").await?;
+        let xml = String::from_utf8_lossy(&body);
+        let bad = |what: &str, v: &str| Error::Generic(format!("S3 listing: bad {what} {v:?}"));
+        let mut objects = Vec::new();
+        for block in xml_blocks(&xml, "Contents") {
+            let text = |tag| xml_texts(block, tag).into_iter().next();
+            let (Some(key), Some(size), Some(modified)) =
+                (text("Key"), text("Size"), text("LastModified"))
+            else {
+                continue;
+            };
+            let class = text("StorageClass");
+            let restore = xml_blocks(block, "RestoreStatus").into_iter().next();
+            objects.push(ListedObject {
+                location: ObjectPath::parse(&key).map_err(object_store::Error::from)?,
+                size: size.parse().map_err(|_| bad("Size", &size))?,
+                modified: chrono::DateTime::parse_from_rfc3339(&modified)
+                    .map_err(|_| bad("LastModified", &modified))?
+                    .to_utc(),
+                state: object_state(class.as_deref(), restore),
+                class,
+            });
+        }
+        let prefixes = xml_blocks(&xml, "CommonPrefixes")
+            .into_iter()
+            .filter_map(|block| xml_texts(block, "Prefix").pop())
+            .map(|p| ObjectPath::parse(p).map_err(object_store::Error::from))
+            .collect::<std::result::Result<_, _>>()?;
+        let truncated = xml_texts(&xml, "IsTruncated").pop().as_deref() == Some("true");
+        let next = xml_texts(&xml, "NextContinuationToken")
+            .pop()
+            .filter(|t| truncated && !t.is_empty());
+        Ok(ListPage {
+            prefixes,
+            objects,
+            next,
+        })
     }
 
     fn store(&self) -> &Arc<dyn ObjectStore> {
@@ -1946,6 +2074,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_or_copying_an_archived_object_is_archived() {
+        let body = error_document("InvalidObjectState", "The operation is not valid");
+        let stub = serve(vec![Reply::new(403, body.clone())]).await;
+        let err = stubbed(&stub.base)
+            .store()
+            .get(&ObjectPath::from("o"))
+            .await
+            .expect_err("archived");
+        let err = Error::from(err);
+        assert!(matches!(err, Error::Archived(_)), "{err:?}");
+        assert!(err.to_string().contains("InvalidObjectState"), "{err}");
+
+        let (done, _) = cross_copy(Reply::new(403, body), None).await;
+        assert!(matches!(done, Err(Error::Archived(_))), "{done:?}");
+    }
+
+    #[tokio::test]
     async fn copies_stay_in_the_provider_account_and_endpoint() {
         let stub = serve(vec![]).await;
         let (dst, src) = copy_pair(&stub.base);
@@ -2368,6 +2513,233 @@ mod tests {
         async fn a_token_that_does_not_advance_is_an_error() {
             let (result, _) = list(vec![page(&["a"], Some("t")), page(&["b"], Some("t"))]).await;
             assert!(result.is_err());
+        }
+    }
+
+    #[cfg(feature = "gui")]
+    mod list_page {
+        use super::*;
+
+        fn contents(key: &str, class: Option<&str>, restore: Option<&str>) -> String {
+            let class =
+                class.map_or_else(String::new, |c| format!("<StorageClass>{c}</StorageClass>"));
+            let restore = restore.map_or_else(String::new, |r| {
+                format!("<RestoreStatus>{r}</RestoreStatus>")
+            });
+            format!(
+                "<Contents><Key>{key}</Key><LastModified>2024-05-06T07:08:09.000Z</LastModified>\
+                 <ETag>&quot;e&quot;</ETag><Size>42</Size>{class}{restore}</Contents>"
+            )
+        }
+
+        fn page(inner: &str, next: Option<&str>) -> Reply {
+            let tail = next.map_or_else(
+                || "<IsTruncated>false</IsTruncated>".to_owned(),
+                |t| {
+                    format!(
+                        "<IsTruncated>true</IsTruncated><NextContinuationToken>{t}</NextContinuationToken>"
+                    )
+                },
+            );
+            Reply::new(
+                200,
+                format!(
+                    "<?xml version=\"1.0\"?><ListBucketResult><Name>bkt</Name><Prefix>d/</Prefix>\
+                     {inner}{tail}</ListBucketResult>"
+                ),
+            )
+        }
+
+        fn dir(path: &str) -> ObjectPath {
+            ObjectPath::from(path)
+        }
+
+        const RUNNING: &str = "<IsRestoreInProgress>true</IsRestoreInProgress>";
+        const RESTORED: &str = "<IsRestoreInProgress>false</IsRestoreInProgress>\
+             <RestoreExpiryDate>2030-01-01T00:00:00.000Z</RestoreExpiryDate>";
+
+        #[tokio::test]
+        async fn states_and_classes_pair_with_their_own_keys() {
+            let inner = [
+                contents("d/std", Some("STANDARD"), None),
+                contents("d/cold", Some("GLACIER"), None),
+                contents("d/back", Some("GLACIER"), Some(RESTORED)),
+                contents("d/going", Some("GLACIER"), Some(RUNNING)),
+                contents("d/deep", Some("DEEP_ARCHIVE"), None),
+                contents("d/ir", Some("GLACIER_IR"), None),
+                contents("d/tier", Some("INTELLIGENT_TIERING"), None),
+                contents("d/none", None, None),
+                contents("d/a&amp;b &lt;c&gt; \u{e9}\u{4e2d}", Some("GLACIER"), None),
+                "<CommonPrefixes><Prefix>d/sub&amp;dir/</Prefix></CommonPrefixes>".to_owned(),
+                "<CommonPrefixes><Prefix>d/\u{e9}/</Prefix></CommonPrefixes>".to_owned(),
+            ]
+            .concat();
+            let stub = serve(vec![page(&inner, None)]).await;
+            let got = stubbed(&stub.base)
+                .list_page(&dir("d"), 100, None)
+                .await
+                .expect("list");
+            let seen: Vec<_> = got
+                .objects
+                .iter()
+                .map(|o| (o.location.as_ref(), o.state, o.class.as_deref()))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    ("d/std", ObjectState::Online, Some("STANDARD")),
+                    ("d/cold", ObjectState::Archived, Some("GLACIER")),
+                    ("d/back", ObjectState::Online, Some("GLACIER")),
+                    ("d/going", ObjectState::Restoring, Some("GLACIER")),
+                    ("d/deep", ObjectState::Archived, Some("DEEP_ARCHIVE")),
+                    ("d/ir", ObjectState::Online, Some("GLACIER_IR")),
+                    ("d/tier", ObjectState::Online, Some("INTELLIGENT_TIERING")),
+                    ("d/none", ObjectState::Online, None),
+                    (
+                        "d/a&b <c> \u{e9}\u{4e2d}",
+                        ObjectState::Archived,
+                        Some("GLACIER")
+                    ),
+                ]
+            );
+            assert_eq!(got.objects[0].size, 42);
+            assert_eq!(
+                got.objects[0].modified.to_rfc3339(),
+                "2024-05-06T07:08:09+00:00"
+            );
+            let prefixes: Vec<_> = got.prefixes.iter().map(AsRef::as_ref).collect();
+            assert_eq!(prefixes, ["d/sub&dir", "d/\u{e9}"]);
+            assert_eq!(got.next, None);
+            let request = &stub.requests()[0];
+            assert_eq!(
+                request.line,
+                "GET /bkt?list-type=2&delimiter=%2F&prefix=d%2F&max-keys=100 HTTP/1.1"
+            );
+            let headers = request.headers.to_ascii_lowercase();
+            assert!(
+                headers.contains("authorization: aws4-hmac-sha256"),
+                "{headers}"
+            );
+            assert!(
+                headers.contains("x-amz-optional-object-attributes: restorestatus"),
+                "{headers}"
+            );
+            assert!(!headers.contains("x-amz-request-payer"), "{headers}");
+            // Both extra headers are part of the signature.
+            let signed = headers.split("signedheaders=").nth(1).unwrap_or_default();
+            assert!(
+                signed.starts_with(
+                    "host;x-amz-content-sha256;x-amz-date;x-amz-optional-object-attributes"
+                ),
+                "{headers}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_requester_pays_bucket_is_listed_with_the_payer_header() {
+            let stub = serve(vec![page("", None)]).await;
+            keyed_stub(&stub.base, &[("AWS_REQUEST_PAYER", "true")])
+                .list_page(&dir(""), 10, None)
+                .await
+                .expect("list");
+            let headers = stub.requests()[0].headers.to_ascii_lowercase();
+            assert!(
+                headers.contains("x-amz-request-payer: requester"),
+                "{headers}"
+            );
+            let signed = headers.split("signedheaders=").nth(1).unwrap_or_default();
+            assert!(
+                signed
+                    .split(',')
+                    .next()
+                    .unwrap_or_default()
+                    .contains("x-amz-request-payer"),
+                "{headers}"
+            );
+        }
+
+        fn keyed_stub(base: &str, extra: &[(&str, &str)]) -> S3Backend {
+            let mut all = vec![
+                ("S3_ENDPOINT", base),
+                ("S3_ALLOW_HTTP", "true"),
+                ("S3_REGION", "us-east-1"),
+                ("S3_ACCESS_KEY_ID", "k"),
+                ("S3_SECRET_ACCESS_KEY", "s"),
+            ];
+            all.extend_from_slice(extra);
+            let bucket = if extra.contains(&("AWS_S3_EXPRESS", "true")) {
+                "bkt--use1-az4--x-s3"
+            } else {
+                "bkt"
+            };
+            S3Backend::new(Some(bucket), &Vars::from_pairs(&all), None).expect("build")
+        }
+
+        /// An Express bucket lists through the store, whose session auth the
+        /// hand-built request lacks; the store reaches AWS, not a stub, so only
+        /// the choice is tested.
+        #[test]
+        fn only_an_express_bucket_lists_through_the_store() {
+            let policy = |extra: &[(&str, &str)]| keyed_stub("http://h", extra).provider_policy;
+            assert_eq!(policy(&[("AWS_S3_EXPRESS", "true")]), Policy::Express);
+            assert_eq!(policy(&[("AWS_S3_EXPRESS", "false")]), Policy::None);
+            assert_eq!(policy(&[]), Policy::None);
+        }
+
+        #[tokio::test]
+        async fn a_busy_page_is_retried() {
+            let busy = Reply::new(503, error_document("SlowDown", "later"));
+            let stub = serve(vec![busy, page(&contents("a", None, None), None)]).await;
+            let got = stubbed(&stub.base)
+                .list_page(&dir(""), 5, None)
+                .await
+                .expect("list");
+            assert_eq!(got.objects.len(), 1);
+            assert_eq!(stub.requests().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_token_continues_the_listing() {
+            let stub = serve(vec![
+                page(&contents("a", None, None), Some("t/+=")),
+                page(&contents("b", None, None), None),
+            ])
+            .await;
+            let backend = stubbed(&stub.base);
+            let first = backend.list_page(&dir(""), 1, None).await.expect("first");
+            assert_eq!(first.next.as_deref(), Some("t/+="));
+            let second = backend
+                .list_page(&dir(""), 1, first.next)
+                .await
+                .expect("second");
+            assert_eq!(second.next, None);
+            let lines: Vec<_> = stub.requests().into_iter().map(|r| r.line).collect();
+            assert_eq!(
+                lines,
+                [
+                    "GET /bkt?list-type=2&delimiter=%2F&max-keys=1 HTTP/1.1",
+                    "GET /bkt?list-type=2&delimiter=%2F&max-keys=1&continuation-token=t%2F%2B%3D HTTP/1.1",
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_denied_page_is_denied() {
+            for status in [401, 403] {
+                let stub = serve(vec![Reply::new(
+                    status,
+                    error_document("AccessDenied", "Access Denied"),
+                )])
+                .await;
+                let err = stubbed(&stub.base)
+                    .list_page(&dir(""), 10, None)
+                    .await
+                    .expect_err("denied");
+                assert!(matches!(err, Error::Denied(_)), "{err:?}");
+            }
+            let stub = serve(vec![Reply::new(400, "")]).await;
+            let err = stubbed(&stub.base).list_page(&dir(""), 10, None).await;
+            assert!(matches!(err, Err(Error::Generic(_))));
         }
     }
 }

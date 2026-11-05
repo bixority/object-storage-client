@@ -37,6 +37,14 @@ pub enum Error {
     #[error("Access denied: {0}")]
     Denied(String),
 
+    /// The object is archived and cannot be read until it is restored (S3
+    /// `GLACIER`, `DEEP_ARCHIVE`) or rehydrated (Azure `Archive` tier). Python
+    /// raises `PermissionError`.
+    ///
+    /// The text is escaped and capped like the other provider text.
+    #[error("Archived: {0}")]
+    Archived(String),
+
     #[error("Invalid URL: {0}")]
     InvalidUrl(#[from] url::ParseError),
 
@@ -649,8 +657,6 @@ impl<C: Codec> Client<C> {
         page_token: Option<String>,
         max: usize,
     ) -> Result<DirPage> {
-        use object_store::list::PaginatedListOptions;
-
         let url = parse_checked(url, Dots::OffFile, false)?;
         if let Some(scheme) = crate::registry::provider_root(&url) {
             if page_token.is_some() {
@@ -663,43 +669,29 @@ impl<C: Codec> Client<C> {
         }
         let r = self.resolve_url(url)?;
         let path = r.loc.path;
-        let (listed, next) = if let Some(store) = r.backend.paginated() {
-            let prefix = (!path.as_ref().is_empty()).then(|| format!("{path}/"));
-            let opts = PaginatedListOptions {
-                delimiter: Some("/".into()),
-                max_keys: Some(max),
-                page_token,
-                ..Default::default()
-            };
-            let page = store.list_paginated(prefix.as_deref(), opts).await?;
-            (page.result, page.page_token)
-        } else if page_token.is_some() {
-            return Ok(DirPage::default());
-        } else {
-            match r.backend.store().list_with_delimiter(Some(&path)).await {
-                Ok(listed) => (listed, None),
-                Err(object_store::Error::NotFound { .. }) => return Ok(DirPage::default()),
-                Err(e) => return Err(e.into()),
-            }
-        };
-        let links = if r.backend.scheme() == "file" {
+        let first = page_token.is_none();
+        let listed = r.backend.list_page(&path, max, page_token).await?;
+        let next = listed.next;
+        let links = if first && r.backend.scheme() == "file" {
             local_links(crate::backend::fs_path(&path)?).await?
         } else {
             Vec::new()
         };
         let folders = listed
-            .common_prefixes
+            .prefixes
             .iter()
             .filter_map(|p| relative_str(p, &path).map(str::to_owned))
             .collect();
         let objects = listed
             .objects
-            .iter()
-            .filter_map(|m| {
-                relative_str(&m.location, &path).map(|name| DirObject {
+            .into_iter()
+            .filter_map(|o| {
+                relative_str(&o.location, &path).map(|name| DirObject {
                     name: name.to_owned(),
-                    size: m.size,
-                    modified: m.last_modified,
+                    size: o.size,
+                    modified: o.modified,
+                    state: o.state,
+                    class: o.class,
                 })
             })
             .collect();
@@ -1313,6 +1305,20 @@ impl std::error::Error for EscapedText {}
 
 type BoxedSource = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// [`Error::Archived`] when a provider answer names an archived object: HTTP
+/// 401 or 403 with `InvalidObjectState` (S3), or 409 with `BlobArchived`
+/// (Azure). `raw` is the provider text to look in, `shown` its escaped form.
+pub(crate) fn archived(status: u16, raw: &str, shown: &str) -> Option<Error> {
+    let fix = match status {
+        401 | 403 if raw.contains("InvalidObjectState") => "restored",
+        409 if raw.contains("BlobArchived") => "rehydrated",
+        _ => return None,
+    };
+    Some(Error::Archived(format!(
+        "the object cannot be read until it is {fix}: {shown}"
+    )))
+}
+
 /// Rebuilds a store error with control and bidi characters escaped and its
 /// text capped. `object_store` copies provider text (error bodies, listed
 /// keys, hrefs) into its messages verbatim; anyone able to write a key could
@@ -1326,7 +1332,8 @@ impl From<object_store::Error> for Error {
         let path = |p: String| text::escape(&p, ERROR_PATH_CAP);
         Self::ObjectStore(match e {
             e @ (E::PermissionDenied { .. } | E::Unauthenticated { .. }) => {
-                return Self::Denied(text::escape_display(&e, ERROR_SOURCE_CAP));
+                let shown = text::escape_display(&e, ERROR_SOURCE_CAP);
+                return archived(403, &e.to_string(), &shown).unwrap_or(Self::Denied(shown));
             }
             E::NotFound { path: p, source: s } => E::NotFound {
                 path: path(p),
@@ -1336,10 +1343,19 @@ impl From<object_store::Error> for Error {
                 path: path(p),
                 source: source(s),
             },
-            E::AlreadyExists { path: p, source: s } => E::AlreadyExists {
-                path: path(p),
-                source: source(s),
-            },
+            E::AlreadyExists { path: p, source: s } => {
+                if let Some(e) = archived(
+                    409,
+                    &s.to_string(),
+                    &text::escape_display(&s, ERROR_SOURCE_CAP),
+                ) {
+                    return e;
+                }
+                E::AlreadyExists {
+                    path: path(p),
+                    source: source(s),
+                }
+            }
             E::NotModified { path: p, source: s } => E::NotModified {
                 path: path(p),
                 source: source(s),
@@ -1540,6 +1556,10 @@ pub(crate) struct DirObject {
     pub(crate) name: String,
     pub(crate) size: u64,
     pub(crate) modified: chrono::DateTime<chrono::Utc>,
+    /// Whether it can be read now; stores that do not report it say `Online`.
+    pub(crate) state: crate::backend::ObjectState,
+    /// The storage class or access tier, when the store reports one.
+    pub(crate) class: Option<String>,
 }
 
 /// The name of `location` relative to `prefix`, or `None` when it is not
@@ -2123,6 +2143,47 @@ mod tests {
     }
 
     #[test]
+    fn archived_provider_errors_are_typed() {
+        use object_store::Error as E;
+        let denied = |text: &str| E::PermissionDenied {
+            path: "k".into(),
+            source: text.into(),
+        };
+        let s3 = "<Error><Code>InvalidObjectState</Code><Message>x\u{1b}[2J</Message></Error>";
+        let err = Error::from(denied(s3));
+        assert!(
+            matches!(&err, Error::Archived(m) if m.contains("restored")),
+            "{err:?}"
+        );
+        assert!(
+            !err.to_string().chars().any(crate::text::is_unsafe_char),
+            "{err}"
+        );
+        let err = Error::from(E::Unauthenticated {
+            path: "k".into(),
+            source: s3.into(),
+        });
+        assert!(matches!(err, Error::Archived(_)), "{err:?}");
+        let err = Error::from(denied("<Code>AccessDenied</Code>"));
+        assert!(matches!(err, Error::Denied(_)), "{err:?}");
+
+        let conflict = |text: &str| E::AlreadyExists {
+            path: "k".into(),
+            source: text.into(),
+        };
+        let err = Error::from(conflict("<Code>BlobArchived</Code>"));
+        assert!(
+            matches!(&err, Error::Archived(m) if m.contains("rehydrated")),
+            "{err:?}"
+        );
+        let err = Error::from(conflict("<Code>BlobAlreadyExists</Code>"));
+        assert!(
+            matches!(err, Error::ObjectStore(E::AlreadyExists { .. })),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn listing_errors_quote_keys_escaped() {
         let source = ObjectPath::parse("a\n\x1b[2Jb").expect_err("invalid key");
         let err = Error::from(object_store::Error::InvalidPath { source });
@@ -2497,6 +2558,115 @@ mod tests {
             let page = c.list_dir("s3:///", Some("t".into()), 10).await;
             assert_eq!(page.expect("ok"), DirPage::default());
             assert!(stub.requests().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_s3_listing_carries_the_object_states() {
+            use crate::backend::{
+                ObjectState,
+                stub::{Reply, serve},
+            };
+            let item = |key: &str, class: &str| {
+                format!(
+                    "<Contents><Key>{key}</Key><LastModified>2024-05-06T07:08:09.000Z</LastModified>\
+                     <Size>7</Size><StorageClass>{class}</StorageClass></Contents>"
+                )
+            };
+            let body = format!(
+                "<ListBucketResult><Prefix>d/</Prefix>{}{}{}\
+                 <CommonPrefixes><Prefix>d/sub/</Prefix></CommonPrefixes>\
+                 <IsTruncated>true</IsTruncated><NextContinuationToken>n</NextContinuationToken>\
+                 </ListBucketResult>",
+                item("d/", "STANDARD"),
+                item("d/cold &amp; deep", "DEEP_ARCHIVE"),
+                item("d/warm", "STANDARD"),
+            );
+            let stub = serve(vec![Reply::new(200, body)]).await;
+            let c = ObjectStorageClient::with_vars(std::collections::HashMap::from(
+                [
+                    ("S3_ENDPOINT", stub.base.as_str()),
+                    ("S3_ALLOW_HTTP", "true"),
+                    ("S3_REGION", "us-east-1"),
+                    ("S3_ACCESS_KEY_ID", "k"),
+                    ("S3_SECRET_ACCESS_KEY", "s"),
+                ]
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            ));
+            let page = c.list_dir("s3://bkt/d/", None, 3).await.expect("list");
+            assert_eq!(page.folders, ["sub"]);
+            let seen: Vec<_> = page
+                .objects
+                .iter()
+                .map(|o| (o.name.as_str(), o.size, o.state, o.class.as_deref()))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    (
+                        "cold & deep",
+                        7,
+                        ObjectState::Archived,
+                        Some("DEEP_ARCHIVE")
+                    ),
+                    ("warm", 7, ObjectState::Online, Some("STANDARD")),
+                ]
+            );
+            assert_eq!(page.next.as_deref(), Some("n"));
+            let line = &stub.requests()[0].line;
+            assert!(line.contains("prefix=d%2F&max-keys=3"), "{line}");
+        }
+
+        #[tokio::test]
+        async fn an_azure_listing_carries_the_object_states() {
+            use crate::backend::{
+                ObjectState,
+                stub::{Reply, serve},
+            };
+            let blob = |name: &str, props: &str| {
+                format!(
+                    "<Blob><Name>{name}</Name><Properties><Content-Length>7</Content-Length>\
+                     <Last-Modified>Mon, 06 May 2024 07:08:09 GMT</Last-Modified>{props}\
+                     </Properties></Blob>"
+                )
+            };
+            let body = format!(
+                "<EnumerationResults><Blobs>{}{}{}\
+                 <BlobPrefix><Name>d/sub/</Name></BlobPrefix></Blobs>\
+                 <NextMarker>m</NextMarker></EnumerationResults>",
+                blob("d/cold", "<AccessTier>Archive</AccessTier>"),
+                blob(
+                    "d/going",
+                    "<AccessTier>Archive</AccessTier>\
+                     <ArchiveStatus>rehydrate-pending-to-hot</ArchiveStatus>"
+                ),
+                blob("d/warm", "<AccessTier>Hot</AccessTier>"),
+            );
+            let stub = serve(vec![Reply::new(200, body)]).await;
+            let c = ObjectStorageClient::with_vars(std::collections::HashMap::from(
+                [
+                    ("AZURE_STORAGE_ENDPOINT", stub.base.as_str()),
+                    ("AZURE_ALLOW_HTTP", "true"),
+                    ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+                    ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
+                ]
+                .map(|(k, v)| (k.to_owned(), v.to_owned())),
+            ));
+            let page = c.list_dir("az://c/d/", None, 3).await.expect("list");
+            assert_eq!(page.folders, ["sub"]);
+            let seen: Vec<_> = page
+                .objects
+                .iter()
+                .map(|o| (o.name.as_str(), o.state, o.class.as_deref()))
+                .collect();
+            assert_eq!(
+                seen,
+                [
+                    ("cold", ObjectState::Archived, Some("Archive")),
+                    ("going", ObjectState::Restoring, Some("Archive")),
+                    ("warm", ObjectState::Online, Some("Hot")),
+                ]
+            );
+            assert_eq!(page.next.as_deref(), Some("m"));
         }
 
         #[tokio::test]

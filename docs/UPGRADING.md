@@ -1,19 +1,70 @@
 # Upgrading
 
-## From 0.4.1 to 0.5.0
+## From 0.4.3 to 0.4.4
+
+### Errors
+
+- New `Error::Archived(String)`: the object is archived and cannot be read or
+  copied until it is restored (S3) or rehydrated (Azure). S3
+  `InvalidObjectState` (Glacier Flexible Retrieval, Deep Archive and the
+  Intelligent-Tiering archive tiers) used to be `Error::Denied`. Azure
+  `BlobArchived` used to be `Error::ObjectStore(AlreadyExists { .. })`, or
+  `Error::Generic` from a server-side copy. Code that matched those for an
+  archived object must match `Error::Archived`. `Error` is
+  `#[non_exhaustive]`, so existing code still compiles.
+- Python raises `PermissionError` for it. That is unchanged for S3; for Azure
+  it was `RuntimeError`.
 
 ### `osc-gui`
 
-- The `--profile`, `left` and `right` arguments are removed. Both panels start
-  on Local, the current directory. Pick a connection (an AWS profile, gcloud
-  configuration or Azure storage account) in the selector at the left of each
-  panel's address bar, then type the address. Scripts that passed those
-  arguments must drop them.
+- An archived object (S3 `GLACIER` or `DEEP_ARCHIVE` without a restored copy,
+  Azure `Archive` tier) shows ❄, and one being restored or rehydrated shows ⌛.
+  Both are greyed, with the reason as hover text.
+- Copy, move and rename skip such a selected object and report it as failed
+  with the reason; the other selected entries still run. Delete is not
+  affected. An archived object inside a selected folder, or in an S3
+  Intelligent-Tiering archive tier (a listing does not show those), still
+  fails when the job reaches it, now with an "Archived" error.
+- An AWS profile connection is refused while `AWS_ENDPOINT_URL` is set in the
+  environment, as `osc --profile` already refused it: the SDK's SSO and STS
+  requests would send the profile's tokens to that endpoint. The panel shows
+  the error. Unset the variable, or set `S3_ENDPOINT` or `AWS_ENDPOINT_URL_S3`.
+
+## From 0.4.2 to 0.4.3
+
+### `osc-gui`
+
+- AWS profiles without credentials are no longer offered in the connection
+  selector; a grey note under the connections names them. A profile needs
+  keys, `credential_process`, `credential_source`, `role_arn`,
+  `web_identity_token_file`, `login_session` or SSO settings, in
+  `~/.aws/config` or `~/.aws/credentials`. One with only settings such as
+  `region` could not be used anyway. Add credentials and press "Rescan" to
+  list it.
+- The "Up" button is gone. Double-click the ".." row at the top of the list
+  to go up one level; Backspace still does the same.
+
+## From 0.4.1 to 0.4.2
+
+### `osc-gui`
+
+- The `--profile` option and the `LEFT` and `RIGHT` arguments are removed, and
+  passing them is a usage error. Both panels start on Local, the current
+  directory. Pick a connection (an AWS profile, gcloud configuration, Azure
+  storage account or a provider's environment variables) in the selector at
+  the left of each panel's address bar, then type the address. Scripts that
+  passed those arguments must drop them.
+- A connection uses only its own settings. An AWS profile connection no longer
+  reads `S3_ENDPOINT` and the other `S3_*` and `AWS_*` variables, which
+  `--profile` did; set `endpoint_url` in the profile, or use the
+  "AWS · environment" connection, which is offered when such variables are set.
 - Buckets are now listed: a cloud connection opens at its root, which shows the
   buckets as folders. Typing a bucket's URL still works.
-- The scheme of a typed address must match the panel's connection.
-- "Log in" on an AWS SSO error banner writes `~/.aws/sso/cache`, like the AWS
-  CLI, so osc-gui now writes that one file.
+- The scheme of a typed address must match the panel's connection: Local takes
+  paths, `file://` and `http(s)://`. Otherwise pick a matching connection.
+- "Log in" on the error banner of an AWS SSO profile writes the token to
+  `~/.aws/sso/cache` (mode 0600), as the AWS CLI does, so osc-gui now writes
+  to that directory.
 
 ## From 0.3.0 to 0.4.0
 

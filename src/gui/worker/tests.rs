@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::ObjectStorageClient;
+use crate::backend::ObjectState;
 use crate::connection::{Connection, Provider, Source};
 use crate::gui::model::{Batch, Item, OnExisting, OpKind, Plan};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -236,6 +237,8 @@ async fn a_job_reads_through_the_source_and_writes_through_the_destination() {
             name: "x".to_owned(),
             size: 1,
             modified: chrono::Utc::now(),
+            state: ObjectState::Online,
+            class: None,
         }],
         dst_dir: Location::parse("s3://b/d/").expect("parses"),
         rename_to: None,

@@ -38,9 +38,11 @@ The options are the ones `osc` takes:
 |                        | `OSC_KEYRING_COMMAND`    | A command that prints the keyring (instead of a file)     |
 | `--require-encryption` | `OSC_REQUIRE_ENCRYPTION` | Refuse to start without a key source                      |
 
-Keys are loaded once, at launch. The toolbar shows whether encryption is on and
-where the keys came from. With encryption on, every copy and move encrypts
-what it writes and decrypts what it reads, as `osc cp` and `osc mv` do.
+The key source is opened once, at launch; a keyring file then reloads itself
+when it changes, while a key command is not run again. The toolbar shows
+whether encryption is on and where the keys came from. With encryption on,
+every copy and move encrypts what it writes and decrypts what it reads, as `osc
+cp` and `osc mv` do.
 
 If the keys cannot be loaded, `osc-gui` prints the error and
 shows it in a small window, then exits with status 1.
@@ -53,31 +55,47 @@ local files and variables and never asks you to log in; for Azure it also asks
 `az` for a token and lists the storage accounts of each subscription:
 
 - AWS profiles from `~/.aws/config` and `~/.aws/credentials`, and the
-  `AWS_*` variables;
-- gcloud configurations and Google application default credentials;
+  `AWS_*` and `S3_*` variables. A profile without credentials (only settings
+  such as `region`) is left out and named in a note;
+- gcloud configurations, with their own credentials file or the application
+  default credentials, and the `GOOGLE_*` variables;
 - Azure CLI subscriptions (the storage accounts of each are looked up through
-  Azure while the selector shows "Searching…") and the `AZURE_STORAGE_*`
-  variables.
+  Azure while the selector shows "Searching…") and the
+  `AZURE_STORAGE_ACCOUNT_NAME` variable.
 
 Anything it could not use is listed under the connections as a small grey
-note. "Rescan" searches again. A connection uses only its
-own settings, so one panel can use another account than the other, and copies
-between panels stream through the app.
+note. An AWS profile is refused while `AWS_ENDPOINT_URL` is set, and a panel on
+it shows that error (see CONFIGURATION.md). "Rescan" searches again. A
+connection uses only its own settings, so one panel can use another account than
+the other, and copies between panels on different connections stream through
+the app.
 
-Type an address into a panel's address bar and press Enter: any URL `osc`
-accepts, or a local path. The scheme must match the panel's connection: Local
-takes `file://`, `http(s)://` and paths, S3 `s3://`, GCS `gs://`, Azure `az://`
-and its aliases; otherwise pick a matching connection. The address is always
-opened as a folder. Selecting a cloud connection opens its root, which lists
-the buckets (or containers) as folders; open one to browse it. Going up from a
-bucket returns to that list. Copy, move, rename and delete are refused at the
-list itself.
+Type an address into a panel's address bar and press Enter or click "Go": any
+URL `osc` accepts, or a local path. The scheme must match the panel's
+connection: Local takes `file://`, `http(s)://` and paths, S3 `s3://`, GCS
+`gs://` and `gcs://`, Azure `az://` and its aliases; otherwise pick a matching
+connection. The address is always opened as a folder. Selecting a cloud
+connection opens its root, which lists the buckets (or containers) as folders;
+open one to browse it. Going up from a bucket returns to that list. Copy, move,
+rename and delete are refused at the list itself, and so are copies and moves
+into it.
 
-If a connection cannot authenticate, the error banner says so. For an AWS SSO
-profile it has a "Log in" button: it shows a code, "Open browser" opens the
-approval page, and the token is written to `~/.aws/sso/cache` like the AWS CLI
-does, so both share it. For gcloud and Azure the banner shows the command to run
-in a terminal (`gcloud auth application-default login`, `az login`); run it, then press
+Archived objects (S3 Glacier Flexible Retrieval and Deep Archive, Azure Archive
+tier) show ❄, and objects being restored or rehydrated show ⌛. Both are greyed
+with a hover text. Copying, moving or renaming them is skipped with that
+reason; deleting them works. Inside a selected folder their state is not known,
+so copying such an object fails with an "Archived" error, as it does for the S3
+Intelligent-Tiering archive tiers, which are not visible in a listing. See
+"Archived objects" in BEHAVIOR.md.
+
+If a listing fails, the panel shows the error, wrapped to the panel's width,
+with "Retry" on a row below it. If a connection cannot authenticate, the error
+says so. For an AWS SSO profile (or a role profile that takes its credentials
+from one) that row has a "Log in" button: it shows a code, "Open browser" opens
+the approval page, and the token is written to `~/.aws/sso/cache` like the AWS
+CLI does, so both share it; the panel then lists again. For gcloud and Azure
+the row shows the command to run in a terminal
+(`gcloud auth application-default login`, `az login`); run it, then press
 "Rescan" in the selector.
 
 | Key                               | Action                                         |
@@ -99,9 +117,13 @@ in a terminal (`gcloud auth application-default login`, `az login`); run it, the
 | Ctrl+R                            | Refresh                                        |
 | Ctrl+L                            | Edit the address                               |
 
-The cursor is the outlined row: the arrow keys move it, and Enter opens it if
-it is a folder. A click moves the cursor to the clicked row. Click, Ctrl-click
-and Shift-click select entries; double-click opens a folder.
+The cursor is the row last moved to with the keys or clicked; it has no mark of
+its own. The arrow keys move it, and Enter opens it if it is a folder. Click,
+Ctrl-click and Shift-click select entries; double-click opens a folder. A ".."
+row at the top of the list goes up one level on double-click, as Backspace
+does; there is none on the list of buckets or at the top of the file system (or
+of an `http(s)://` server). In a dialog, Enter takes the answer that cannot
+lose data, and Esc cancels.
 
 ## Operations
 
@@ -131,8 +153,8 @@ and Shift-click select entries; double-click opens a folder.
   job is not checked; you are warned that existing objects will be overwritten.
 - **Moves and deletes ask first.** Deleting at a bucket root also asks you to
   type the bucket name.
-- **Copying a folder into itself is refused.** So is copying onto the folder it
-  already is in.
+- **Copying or moving a folder into itself is refused.** So is copying or
+  moving onto the folder the selection already is in.
 - **Empty directories can stay behind.** Moving or deleting a local folder can
   leave empty directories behind, as deleting a prefix with the client does.
 - **Console-created cloud folders can stay listed.** The S3 and GCS consoles
@@ -148,7 +170,8 @@ and Shift-click select entries; double-click opens a folder.
   incomplete; open a deeper folder to see the rest.
 - Copying, moving or renaming folders plans at most 1,000,000 objects in all.
   A larger job fails before anything runs; select a deeper folder.
-- Local folders and `http(s)://` listings arrive in one page.
+- Local folders, `http(s)://` listings and the list of buckets arrive in one
+  page.
 - After a job, only the panels it can have changed are listed again: a copy
   changes its destination folder, a move its source and destination, a rename
   or delete its source. A panel inside or above such a folder is refreshed and
@@ -169,4 +192,5 @@ SIGTERM in the terminal that started `osc-gui` does the same without asking.
 
 `osc-gui` bundles egui's default fonts (the `epaint_default_fonts` crate):
 Ubuntu Light under the Ubuntu Font Licence 1.0, Noto Emoji under the SIL Open
-Font Licence 1.1, and Hack and emoji-icon-font under the MIT licence.
+Font Licence 1.1, Hack under the MIT licence and the Bitstream Vera licence,
+and emoji-icon-font under the MIT licence.

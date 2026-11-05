@@ -107,6 +107,7 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
                 name: name.to_owned(),
                 config: config.clone(),
                 credentials: credentials.clone(),
+                process_endpoint: host.any(&["AWS_ENDPOINT_URL"]),
             },
             login: sso_login(&set, name).map(Login::AwsSso),
         });
@@ -370,6 +371,28 @@ aws_secret_access_key = minio123
                 ("aws-env", Provider::S3)
             );
         }
+    }
+
+    #[test]
+    fn a_process_endpoint_is_recorded_on_each_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(
+            &dir.path().join(".aws/config"),
+            "[profile dev]\nregion = us-east-1\naws_access_key_id = AKID\naws_secret_access_key = s\n",
+        );
+        let recorded = |extra: &[(&str, &str)]| {
+            let found = scan(&host(dir.path(), extra));
+            let Source::AwsProfile {
+                process_endpoint, ..
+            } = &find(&found, "dev").source
+            else {
+                panic!("not a profile");
+            };
+            *process_endpoint
+        };
+        assert!(!recorded(&[]));
+        assert!(recorded(&[("AWS_ENDPOINT_URL", "http://127.0.0.1:3900")]));
+        assert!(!recorded(&[("AWS_ENDPOINT_URL", "")]));
     }
 
     #[test]

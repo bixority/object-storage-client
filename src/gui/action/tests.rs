@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::ObjectState;
 
 mod close;
 mod conn;
@@ -44,6 +45,8 @@ fn obj(name: &str) -> Entry {
         name: name.to_owned(),
         size: 1,
         modified: DateTime::UNIX_EPOCH,
+        state: ObjectState::Online,
+        class: None,
     }
 }
 

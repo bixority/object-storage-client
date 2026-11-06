@@ -171,7 +171,7 @@
   .checks span { color: var(--muted); }
 
   /* FAQ */
-  .faq { display: grid; gap: 10px; max-width: 52em; }
+  .faq { display: grid; gap: 10px; }
   .faq details { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 0 20px; }
   .faq summary {
     cursor: pointer; list-style: none; padding: 18px 0; font-weight: 600;
@@ -309,8 +309,6 @@
         <li><strong>Pre-signed links</strong><span>osc sign makes download and upload URLs, with length and type checks on S3 uploads.</span></li>
         <li><strong>Encryption and profiles on the flag</strong><span>--keyring encrypts and decrypts; --profile picks an AWS profile.</span></li>
       </ul>
-      <pre class="sample"><span class="c"># copy between providers, encrypted</span>
-<span class="k">osc</span> --keyring keyring cp s3://src/report.csv az://dst/report.csv</pre>
       <div class="lane-cta"><a href="#install">Install the CLI →</a></div>
     </div>
 
@@ -324,10 +322,6 @@
         <li><strong>Encryption you can audit</strong><span>Authenticated encryption, self-reloading keyrings and key rotation. Python never sees the key bytes.</span></li>
         <li><strong>Install from the registry</strong><span>pip for Python wheels, or a Cargo dependency. Leave out the CLI with default-features = false.</span></li>
       </ul>
-      <pre class="sample"><span class="k">from</span> object_storage_client <span class="k">import</span> ObjectStorageClient
-
-client = ObjectStorageClient()
-<span class="k">await</span> client.copy_object(<span class="c">"s3://a/x.bin"</span>, <span class="c">"gs://b/x.bin"</span>)</pre>
       <div class="lane-cta"><a href="https://github.com/bixority/object-storage-client#python">Python guide →</a><a href="https://github.com/bixority/object-storage-client#rust">Rust guide →</a></div>
     </div>
 

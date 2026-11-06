@@ -44,7 +44,7 @@ delete objects and whole folders within a panel or between the two, also across
 accounts and providers. It finds the connections already set up on the machine
 and takes the same encryption options as `osc`.
 
-![osc-gui with Local in the left panel and an S3 bucket in the right panel, where archived (❄) and restoring (⌛) objects are greyed out](docs/images/osc-gui.png)
+![osc-gui with two panels side by side, each with a connection selector, an address bar and a file list](docs/images/osc-gui.png)
 
 ### Install
 

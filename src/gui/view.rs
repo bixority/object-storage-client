@@ -6,6 +6,7 @@
 mod address_bar;
 mod dialogs;
 mod panel;
+mod security;
 mod startup_error;
 mod status;
 #[cfg(test)]

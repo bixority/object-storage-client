@@ -5,7 +5,7 @@ mod close;
 mod conn;
 mod jobs;
 mod nav;
-use crate::connection::{Provider, Source};
+use crate::gui::connection::{Provider, Source};
 use crate::gui::model::{Entry, Item, MAX_ENTRIES};
 use chrono::DateTime;
 use std::sync::Arc;

@@ -26,6 +26,8 @@ pub mod stub;
 use crate::client::{Error, Result};
 use crate::sign::{SignMethod, SignOptions};
 pub use aws_profile::AwsProfile;
+#[cfg(feature = "gui")]
+pub use aws_profile::{files as profile_files, settings as profile_settings};
 pub use body::FILE_BUF;
 pub use body::body_stream;
 #[cfg(feature = "gui")]
@@ -173,6 +175,35 @@ impl Vars {
                 .collect(),
         }
     }
+}
+
+/// What a provider's settings say about TLS, read without building a store or
+/// contacting a server.
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tls {
+    /// The endpoint is `https` (the default of every provider), not plain `http`.
+    pub https: bool,
+    /// Certificate verification is switched off (`*_ALLOW_INVALID_CERTIFICATES`).
+    pub allow_invalid_certificates: bool,
+}
+
+/// The TLS settings of the store `vars` configure for `scheme` (`s3`, `gs` or
+/// `az`), resolved as [`build`] resolves them. `None` for another scheme.
+#[cfg(feature = "gui")]
+pub fn tls(scheme: &str, vars: &Vars) -> Option<Tls> {
+    match scheme {
+        "s3" => Some(s3::tls(vars)),
+        "gs" | "gcs" => Some(gcs::tls(vars)),
+        "az" | "wasb" | "wasbs" | "abfs" | "abfss" => Some(azure::tls(vars)),
+        _ => None,
+    }
+}
+
+/// Whether `endpoint` is a plain `http://` URL, as every backend decides it.
+#[cfg(feature = "gui")]
+fn is_plain(endpoint: &str) -> bool {
+    endpoint.starts_with("http://")
 }
 
 /// How long an object request may stay silent: the time to the response

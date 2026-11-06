@@ -4,9 +4,9 @@ use super::panel::{
 };
 use super::*;
 use crate::backend::ObjectState;
-use crate::connection::sso::SsoLogin;
-use crate::connection::{Connection, Login, Provider, Source};
 use crate::gui::action::{Answer, Event, Motion, Msg, SelectOp, update};
+use crate::gui::connection::sso::SsoLogin;
+use crate::gui::connection::{Connection, Login, Provider, Source};
 use crate::gui::location::Location;
 use crate::gui::model::{
     Closing, Dialog, Encryption, Entry, Failure, Job, JobId, JobPhase, Outcome, Page, Plan,

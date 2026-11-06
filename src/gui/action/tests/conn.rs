@@ -1,9 +1,9 @@
 //! Connection rules: choosing, scanning, scheme checks, roots, SSO login.
 
 use super::{act, dir, loc, obj, page, plan, planned, s3, s3_state, state};
-use crate::connection::sso::SsoLogin;
-use crate::connection::{Connection, Discovery, Login, Provider, Source};
 use crate::gui::action::{Action, Answer, Command, Event, Msg, SelectOp, update};
+use crate::gui::connection::sso::SsoLogin;
+use crate::gui::connection::{Connection, Discovery, Login, Provider, Source};
 use crate::gui::model::{AppState, Dialog, Entry, Item, OpKind, Outcome, Side};
 use std::sync::Arc;
 

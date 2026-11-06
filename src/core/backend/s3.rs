@@ -379,7 +379,7 @@ impl S3Backend {
     /// own `S3_ENDPOINT`, then `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT` and
     /// `AWS_ENDPOINT_URL`; empty values are ignored. `None` means "no custom
     /// endpoint" — i.e. real AWS, where the IMDS credential fallback is valid.
-    fn configured_endpoint(vars: &Vars) -> Option<String> {
+    pub(super) fn configured_endpoint(vars: &Vars) -> Option<String> {
         [
             "S3_ENDPOINT",
             "AWS_ENDPOINT_URL_S3",
@@ -578,6 +578,29 @@ impl S3Backend {
 
 /// The key of `path` as a URI path: everything but unreserved characters and
 /// `/` is percent-encoded, as `object_store` does for its own requests.
+/// The TLS settings `vars` give an S3 store: the endpoint [`S3Backend::with_shared`]
+/// picks from the variables, and the builder's certificate setting. An endpoint
+/// that only an AWS profile names is not read here (that takes file I/O).
+#[cfg(feature = "gui")]
+pub(super) fn tls(vars: &Vars) -> super::Tls {
+    let builder = match vars {
+        Vars::Env => AmazonS3Builder::from_env(),
+        Vars::Map { .. } => vars
+            .config_entries::<AmazonS3ConfigKey>("AWS_")
+            .into_iter()
+            .fold(AmazonS3Builder::new(), |b, (k, v)| b.with_config(k, v)),
+    };
+    super::Tls {
+        https: !S3Backend::configured_endpoint(vars).is_some_and(|ep| super::is_plain(&ep)),
+        allow_invalid_certificates: builder
+            .get_config_value(&AmazonS3ConfigKey::Client(
+                object_store::ClientConfigKey::AllowInvalidCertificates,
+            ))
+            .and_then(|v| parse_bool(&v))
+            .unwrap_or(false),
+    }
+}
+
 fn encode_key(path: &ObjectPath) -> String {
     const KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
         .remove(b'-')

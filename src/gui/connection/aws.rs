@@ -1,10 +1,12 @@
 //! AWS connections: the environment and the profiles in `~/.aws`.
 
 use super::{Connection, Discovery, Host, Login, Provider, Source, SsoLogin};
+use crate::backend::{Vars, profile_files, profile_settings};
 use aws_config::profile::ProfileSet;
 use aws_runtime::env_config::file::EnvConfigFiles;
 use aws_types::os_shim_internal::Fs;
 use futures::FutureExt;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// The scope the AWS CLI registers a session with when it names none.
@@ -129,6 +131,7 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
                     .iter()
                     .filter_map(|key| Some(((*key).to_owned(), host.var(key)?)))
                     .collect(),
+                endpoint: profile_endpoint(name, config.as_ref(), credentials.as_ref()),
             },
             login: sso_login(&set, name).map(Login::AwsSso),
         });
@@ -139,6 +142,30 @@ pub(super) fn profiles(host: &Host, out: &mut Discovery) {
             without.join(", ")
         ));
     }
+}
+
+/// The S3 `endpoint_url` of `name`, read now from the files the connection's
+/// client will read (the same `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`
+/// paths), so the TLS indicator never reads files while drawing.
+fn profile_endpoint(
+    name: &str,
+    config: Option<&PathBuf>,
+    credentials: Option<&PathBuf>,
+) -> Option<String> {
+    let mut paths = HashMap::new();
+    if let Some(path) = config {
+        paths.insert("AWS_CONFIG_FILE".to_owned(), path.display().to_string());
+    }
+    if let Some(path) = credentials {
+        paths.insert(
+            "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
+            path.display().to_string(),
+        );
+    }
+    let vars = Vars::map(paths);
+    profile_settings(name, profile_files(&vars), false)
+        .ok()
+        .and_then(|settings| settings.s3_endpoint)
 }
 
 /// The device-login settings of an SSO profile, or of the SSO profile a role
@@ -429,6 +456,26 @@ aws_secret_access_key = minio123
     /// Several profiles on one start URL, the common multi-account setup: each
     /// is its own connection, and those that share a login share one token
     /// cache entry (the identifier names the file, as with the AWS CLI).
+    #[test]
+    fn a_profile_endpoint_is_read_once_at_discovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(&dir.path().join(".aws/config"), CONFIG);
+        write(
+            &dir.path().join(".aws/credentials"),
+            "[extra]\naws_access_key_id = AKIDEXTRA\naws_secret_access_key = s\n",
+        );
+        let found = scan(&host(dir.path(), &[]));
+        let endpoint = |name: &str| match &find(&found, name).source {
+            Source::AwsProfile { endpoint, .. } => endpoint.clone(),
+            other => panic!("not a profile: {other:?}"),
+        };
+        assert_eq!(
+            endpoint("minio").as_deref(),
+            Some("http://minio.local:9000")
+        );
+        assert_eq!(endpoint("extra"), None);
+    }
+
     #[test]
     fn profiles_sharing_a_start_url_each_get_a_connection_and_share_the_login() {
         let dir = tempfile::tempdir().expect("tempdir");

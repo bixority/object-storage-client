@@ -281,6 +281,22 @@ fn base_url(vars: &Vars, builder: &GoogleCloudStorageBuilder) -> String {
         )
 }
 
+/// The TLS settings `vars` give a GCS store: the JSON API origin and the
+/// builder's certificate setting.
+#[cfg(feature = "gui")]
+pub(super) fn tls(vars: &Vars) -> super::Tls {
+    let builder = configured("", vars);
+    super::Tls {
+        https: !super::is_plain(&base_url(vars, &builder)),
+        allow_invalid_certificates: builder
+            .get_config_value(&GoogleConfigKey::Client(
+                object_store::ClientConfigKey::AllowInvalidCertificates,
+            ))
+            .and_then(|v| super::parse_bool(&v))
+            .unwrap_or(false),
+    }
+}
+
 /// Attaches the bearer token to `request`, but only when `base` is an https
 /// origin so a token is never sent in clear text to a custom `GCS_BASE_URL`.
 /// `disable_oauth` (emulators) yields an empty bearer: no header is sent.

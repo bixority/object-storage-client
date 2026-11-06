@@ -39,8 +39,14 @@ The options are the ones `osc` takes:
 | `--require-encryption` | `OSC_REQUIRE_ENCRYPTION` | Refuse to start without a key source                      |
 
 The key source is opened once, at launch; a keyring file then reloads itself
-when it changes, while a key command is not run again. The toolbar shows
-whether encryption is on and where the keys came from. With encryption on,
+when it changes, while a key command is not run again. The top right of the
+toolbar shows a key (🔑) when client-side encryption is on and ⊘ when it is
+off; hover it to see whether the keys came from a keyring file or a key
+command. Next to each connection selector, a shield (🛡️) means the endpoint
+uses HTTPS and its certificate is verified, a warning sign (⚠️) means HTTPS with
+certificate verification turned off for that connection, and ◌ means no TLS
+(a plain `http` endpoint, or Local). An AWS profile's `endpoint_url` is read when
+the connections are found, so "Rescan" picks up a change. Hover an icon for its text. With encryption on,
 every copy and move encrypts what it writes and decrypts what it reads, as `osc
 cp` and `osc mv` do.
 

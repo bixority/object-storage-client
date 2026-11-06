@@ -1,7 +1,7 @@
 //! Job and dialog rules: starting operations, planning, confirming, progress.
 
 use super::{Answer, Command, nav};
-use crate::connection::Connection;
+use crate::gui::connection::Connection;
 use crate::gui::location::Location;
 use crate::gui::model::{
     AppState, Batch, Closing, Dialog, Entry, Item, Job, JobId, JobPhase, OnExisting, OpKind,

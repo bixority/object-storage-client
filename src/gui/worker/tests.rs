@@ -4,7 +4,7 @@
 use super::*;
 use crate::ObjectStorageClient;
 use crate::backend::ObjectState;
-use crate::connection::{Connection, Provider, Source};
+use crate::gui::connection::{Connection, Provider, Source};
 use crate::gui::model::{Batch, Item, OnExisting, OpKind, Plan};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

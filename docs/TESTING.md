@@ -29,7 +29,7 @@ through `object_store`'s clients, which always honour system proxies and cannot
 turn them off. The clients the crate builds itself ignore proxies in tests
 (injected variables).
 
-Backend unit tests that talk to a loopback stub (`src/backend/stub.rs`) run on
+Backend unit tests that talk to a loopback stub (`src/core/backend/stub.rs`) run on
 the real tokio clock, not `start_paused`: on macOS a paused clock can jump to
 the HTTP timeouts while a loopback connect is still pending.
 `stub::closed_port()` keeps its port bound, so a concurrent test's stub cannot

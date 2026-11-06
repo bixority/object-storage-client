@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::backend::ObjectState;
-use crate::connection::Connection;
+use crate::gui::connection::Connection;
 
 /// How the opened client encrypts, and where its keys came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

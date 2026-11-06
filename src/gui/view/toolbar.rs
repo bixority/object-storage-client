@@ -1,7 +1,8 @@
 //! Operation buttons and the encryption indicator.
 
+use super::security;
 use crate::gui::action::Action;
-use crate::gui::model::{AppState, Closing, Encryption};
+use crate::gui::model::{AppState, Closing};
 use eframe::egui;
 
 pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action>) {
@@ -29,11 +30,8 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(match state.encryption {
-                Encryption::Off => "Encryption off",
-                Encryption::File => "Encryption on · keyring file",
-                Encryption::Command => "Encryption on · keyring command",
-            });
+            ui.label(security::encryption_icon(state.encryption))
+                .on_hover_text(security::encryption_hover(state.encryption));
         });
     });
 }

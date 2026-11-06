@@ -76,6 +76,9 @@ pub enum Source {
         /// `AWS_DEFAULT_REGION`) of the process environment at discovery, as
         /// (name, value). They take precedence over the profile's region.
         regions: Vec<(String, String)>,
+        /// The profile's S3 `endpoint_url`, read once at discovery from the
+        /// same files the client reads. The environment's endpoint still wins.
+        endpoint: Option<String>,
     },
     Gcs {
         credentials: PathBuf,
@@ -131,7 +134,7 @@ impl Connection {
     /// The settings of an isolated client: only what the connection names, so
     /// the process environment (`S3_ENDPOINT`, `AWS_PROFILE`, ...) cannot leak
     /// in. `None` for [`Source::Env`], which is the process environment.
-    fn vars(&self) -> Option<HashMap<String, String>> {
+    pub(crate) fn vars(&self) -> Option<HashMap<String, String>> {
         let mut vars = HashMap::new();
         let mut set = |key: &str, value: String| vars.insert(key.to_owned(), value);
         match &self.source {
@@ -378,6 +381,7 @@ mod tests {
                 credentials: None,
                 process_endpoint: false,
                 regions: Vec::new(),
+                endpoint: None,
             },
             login: None,
         }

@@ -107,13 +107,16 @@ otherwise a `--locked` check of the fuzz crate fails.
 
 ## Layout
 
-- `src/client.rs`, `src/codec.rs`: the `Client` API and the plain codec
-- `src/backend/`: one module per storage provider
-- `src/encryption/`: message format, framing, keyrings and the encrypting codec
-- `src/cli.rs`, `src/cli/`, `src/main.rs`: the `osc` binary
-- `src/gui.rs`, `src/gui/`, `src/bin/osc-gui.rs`: the `osc-gui` binary;
-  `src/connection/`: its connection discovery and SSO login
-- `src/python/`, `python/object_storage_client/`: the bindings and their type stubs
+- `src/core/`: the library shared by both binaries. `src/core/client.rs` and
+  `src/core/codec.rs` hold the `Client` API and the plain codec;
+  `src/core/backend/` has one module per storage provider;
+  `src/core/encryption/` has the message format, framing, keyrings and the
+  encrypting codec; `src/core/python/` the bindings. `lib.rs` re-exports
+  `core` under the module names the library has always had.
+- `src/cli.rs`, `src/cli/`, `src/cli/main.rs`: the `osc` binary
+- `src/gui.rs`, `src/gui/`, `src/gui/main.rs`: the `osc-gui` binary;
+  `src/gui/connection/`: its connection discovery and SSO login
+- `python/object_storage_client/`: the Python package and its type stubs
 - `tests/`, `benches/`, `fuzz/`, `scripts/`: see [Testing](TESTING.md)
 - `compose.yml`: Garage and Azurite for manual exploration (`docker compose up`)
 

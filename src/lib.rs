@@ -3,32 +3,29 @@
 //!
 //! Items marked `#[doc(hidden)]` are test hooks: they are not part of the
 //! public API and may change in any release, outside semver.
+//!
+//! Layout: `core` holds the library shared by every front end; `cli` is the
+//! `osc` binary's code and `gui` the `osc-gui` binary's. `core` is re-exported
+//! under the module names the library has always had, so its paths are the
+//! same for users and inside the crate.
 
-#[cfg(test)]
-#[macro_use]
-mod forward;
+mod core;
 
-mod backend;
 #[cfg(feature = "cli")]
 #[doc(hidden)]
 pub mod cli;
-pub mod client;
-pub mod codec;
-#[cfg(feature = "gui")]
-mod connection;
-#[cfg(feature = "encryption")]
-pub mod encryption;
-mod fsmode;
 #[cfg(feature = "gui")]
 #[doc(hidden)]
 pub mod gui;
-pub(crate) mod hex;
+
+pub use core::client;
+pub use core::codec;
+#[cfg(feature = "encryption")]
+pub use core::encryption;
 #[cfg(feature = "python")]
-mod python;
-mod registry;
-pub mod sign;
-mod text;
-mod upload;
+pub(crate) use core::python;
+pub use core::sign;
+pub(crate) use core::{backend, fsmode, hex, registry, text, upload};
 
 #[cfg(feature = "encryption")]
 pub use client::EncryptedObjectStorageClient;

@@ -2,8 +2,8 @@
 
 use super::address_bar;
 use crate::backend::ObjectState;
-use crate::connection::Login;
 use crate::gui::action::{Action, SelectOp};
+use crate::gui::connection::Login;
 use crate::gui::display;
 use crate::gui::model::{AppState, Entry, MAX_ENTRIES, PanelState, Side, unavailable_reason};
 use eframe::egui;

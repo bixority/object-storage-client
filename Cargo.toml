@@ -9,7 +9,7 @@ license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
 repository = "https://github.com/bixority/object-storage-client"
-version = "0.4.7"
+version = "0.4.8"
 
 [lib]
 # maturin adds the cdylib crate type itself; do not list it here.
@@ -67,12 +67,12 @@ python = ["dep:pyo3", "dep:pyo3-async-runtimes", "encryption"]
 
 [[bin]]
 name = "osc"
-path = "src/main.rs"
+path = "src/cli/main.rs"
 required-features = ["cli"]
 
 [[bin]]
 name = "osc-gui"
-path = "src/bin/osc-gui.rs"
+path = "src/gui/main.rs"
 required-features = ["gui"]
 
 [[bench]]

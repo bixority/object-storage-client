@@ -4,6 +4,7 @@
 mod action;
 mod app;
 pub mod args;
+mod connection;
 mod display;
 mod keys;
 pub mod location;
@@ -13,7 +14,7 @@ mod startup;
 mod view;
 mod worker;
 
-use crate::connection::Connection;
+use crate::gui::connection::Connection;
 use app::{App, StartupErrorApp};
 use args::Args;
 use model::{AppState, Encryption};
@@ -51,7 +52,7 @@ pub fn run(args: &Args) -> ExitCode {
         Box::new(move |cc| {
             let ctx = cc.egui_ctx.clone();
             let repaint: Repaint = Arc::new(move || ctx.request_repaint());
-            let host = crate::connection::Host::real();
+            let host = crate::gui::connection::Host::real();
             let worker = match keys {
                 None => {
                     let factory: Factory<crate::codec::Plain> = Box::new(Connection::client);

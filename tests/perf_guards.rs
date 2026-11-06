@@ -10,7 +10,7 @@
 //! Not covered here because the public API cannot reach it: request counts per
 //! operation (encrypted get is one GET, a re-encrypting copy at most two) and
 //! the multipart part count and buffering of `upload_stream`; `file://` has
-//! neither. The `src/upload.rs` and `src/encryption/envelope.rs` tests pin
+//! neither. The `src/core/upload.rs` and `src/core/encryption/envelope.rs` tests pin
 //! those with instrumented stores.
 //!
 //! Two blind spots to keep in mind:
@@ -21,7 +21,7 @@
 //! - `file://` writes never take the multipart path and `file://` reads arrive
 //!   in 512 KiB chunks, not the ~16 KiB HTTP chunks. Multipart bytes in flight
 //!   and small-chunk decoding are guarded by the `src/upload.rs` and
-//!   `src/encryption/frame.rs` unit tests instead.
+//!   `src/core/encryption/frame.rs` unit tests instead.
 
 #[path = "../benches/common/mod.rs"]
 mod common;

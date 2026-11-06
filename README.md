@@ -76,6 +76,22 @@ cargo install --path . --features gui
 
 On Linux, `osc-gui` needs a Wayland session; X11 is not supported.
 
+#### Build for this machine
+
+The release packages and a plain `cargo install` target a generic CPU, so they
+run on any x86-64 (or aarch64) machine. To build for the CPU you have, set
+`target-cpu=native` in `RUSTFLAGS`. The binary then uses that CPU's extensions
+and will not run on older CPUs, so do not copy it to other machines:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo install object-storage-client --registry bixority --features gui
+# or, from a checkout:
+RUSTFLAGS="-C target-cpu=native" cargo install --path . --features gui
+```
+
+The same works for `osc` (drop `--features gui`). The repository does not set
+this flag itself, so it applies only when you set it.
+
 ### Run
 
 ```bash
@@ -105,6 +121,9 @@ cargo install object-storage-client --registry bixority
 # or: cargo install --git https://codeberg.org/bixority/object-storage-client
 # or, from a checkout: cargo install --path .
 ```
+
+To tune the build for your CPU, see [Build for this machine](#build-for-this-machine)
+(`RUSTFLAGS="-C target-cpu=native"`).
 
 ### Run
 

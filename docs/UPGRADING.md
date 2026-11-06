@@ -1,9 +1,13 @@
 # Upgrading
 
-## From 0.4.4 to 0.4.7
+## From 0.4.4 to 0.4.8
 
 ### `osc-gui`
 
+- The toolbar shows a key icon (🔑) when encryption is on and ⊘ when it is off,
+  in place of the "Encryption on/off" text; hover it for where the keys came
+  from. Each panel shows a TLS icon left of its connection selector: 🛡️
+  verified HTTPS, ⚠️ HTTPS without certificate verification, ◌ no TLS.
 - An AWS profile connection now takes `S3_REGION`, `AWS_REGION` and
   `AWS_DEFAULT_REGION` from the environment, before the profile's `region`, as
   the AWS CLI does. They used to be ignored, so a profile without `region`

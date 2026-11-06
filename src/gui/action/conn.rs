@@ -1,7 +1,7 @@
 //! Connection rules: choosing a panel's connection, scanning, SSO login.
 
 use super::{Command, nav};
-use crate::connection::{Connection, Discovery, Login};
+use crate::gui::connection::{Connection, Discovery, Login};
 use crate::gui::location::Location;
 use crate::gui::model::{AppState, Closing, Dialog, Side};
 use std::sync::Arc;

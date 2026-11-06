@@ -12,7 +12,7 @@ use super::model::{
     AppState, Batch, Closing, Dialog, Encryption, EntryKey, JobId, OnExisting, OpKind, Outcome,
     Page, PanelState, Plan, Side,
 };
-use crate::connection::{Connection, Discovery};
+use crate::gui::connection::{Connection, Discovery};
 use std::sync::Arc;
 
 /// A change to the selection of one panel. Rows are named by their key.

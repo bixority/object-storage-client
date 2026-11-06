@@ -1,5 +1,6 @@
 //! The connection list, the address field and Go.
 
+use super::security;
 use crate::gui::action::Action;
 use crate::gui::display;
 use crate::gui::model::{AppState, Side};
@@ -13,6 +14,9 @@ pub(in crate::gui) fn address_id(side: Side) -> egui::Id {
 pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mut Vec<Action>) {
     let panel = &state.panels[side.index()];
     ui.horizontal(|ui| {
+        let tls = security::tls_state(&panel.connection);
+        ui.label(security::tls_icon(tls))
+            .on_hover_text(security::tls_hover(tls));
         egui::ComboBox::from_id_salt(("osc-gui connection", side.index()))
             .selected_text(display::text(&panel.connection.label))
             .show_ui(ui, |ui| {

@@ -644,6 +644,31 @@ fn configured(container: &str, vars: &Vars) -> MicrosoftAzureBuilder {
     builder.with_container_name(container)
 }
 
+/// The TLS settings `vars` give an Azure store: the blob endpoint (the
+/// storage emulator is plain `http`) and the builder's certificate setting.
+#[cfg(feature = "gui")]
+pub(super) fn tls(vars: &Vars) -> super::Tls {
+    let builder = configured("", vars);
+    let flag = |key: &AzureConfigKey| {
+        builder
+            .get_config_value(key)
+            .and_then(|v| super::parse_bool(&v))
+            .unwrap_or(false)
+    };
+    let plain = builder
+        .get_config_value(&AzureConfigKey::Endpoint)
+        .map_or_else(
+            || flag(&AzureConfigKey::UseEmulator),
+            |endpoint| super::is_plain(&endpoint),
+        );
+    super::Tls {
+        https: !plain,
+        allow_invalid_certificates: flag(&AzureConfigKey::Client(
+            ClientConfigKey::AllowInvalidCertificates,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

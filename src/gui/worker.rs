@@ -11,7 +11,7 @@ use super::display;
 use super::location::Location;
 use super::model::{Batch, DRAIN_TIMEOUT, Failure, JobId, Outcome, Plan, Side};
 use super::ops::{self, Progress};
-use crate::connection::{self, Connection, Discovery, Host, Login, azure, sso};
+use crate::gui::connection::{self, Connection, Discovery, Host, Login, azure, sso};
 use crate::upload::drain_pending_aborts;
 use crate::{Client, Codec};
 use std::collections::HashMap;

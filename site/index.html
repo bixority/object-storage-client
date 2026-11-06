@@ -1,0 +1,424 @@
+<title>Object Storage Client</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: nav, hero with routing card, trust strip, screenshot, routing table,
+     three audience lanes with their own CTAs, encryption band, FAQ, install with copy buttons. */
+  :root {
+    --bg: #0c0f14;
+    --surface: #141a22;
+    --line: #242d39;
+    --fg: #e8edf3;
+    --muted: #8d99aa;
+    --accent: #ffb84d;
+    --accent-ink: #1a1203;
+    --ok: #7fe3b4;
+    --display: "Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+    --text: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f5f6f8;
+      --surface: #ffffff;
+      --line: #d9dee6;
+      --fg: #10141a;
+      --muted: #5a6474;
+      --accent: #a85e00;
+      --accent-ink: #ffffff;
+      --ok: #137a50;
+      color-scheme: light;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --line: #d9dee6;
+    --fg: #10141a;
+    --muted: #5a6474;
+    --accent: #a85e00;
+    --accent-ink: #ffffff;
+    --ok: #137a50;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 17px/1.6 var(--text);
+    padding-left: max(20px, env(safe-area-inset-left, 0px));
+    padding-right: max(20px, env(safe-area-inset-right, 0px));
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  h1, h2, h3 { font-family: var(--display); letter-spacing: -0.02em; line-height: 1.08; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(2.5rem, 6.4vw, 4.6rem); font-weight: 700; }
+  h2 { font-size: clamp(1.9rem, 3.6vw, 2.8rem); font-weight: 700; }
+  h3 { font-size: 1.45rem; font-weight: 500; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+  .eyebrow {
+    font: 500 0.8rem/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 18px; display: block;
+  }
+  .muted { color: var(--muted); }
+  code, pre, .mono { font-family: var(--mono); font-size: 0.88em; }
+  code { background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; }
+
+  /* Nav */
+  .nav {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 12px 24px; padding: 18px 0; border-bottom: 1px solid var(--line);
+  }
+  .brand { font-family: var(--display); font-weight: 700; font-size: 1.1rem; color: var(--fg); text-decoration: none; }
+  .nav-links { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.95rem; }
+  .nav-links a { color: var(--muted); text-decoration: none; }
+  .nav-links a:hover { color: var(--fg); }
+
+  /* Buttons */
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+  .btn {
+    display: inline-block; padding: 13px 22px; border-radius: 999px;
+    font-weight: 600; text-decoration: none; border: 1px solid var(--accent);
+  }
+  .btn-solid { background: var(--accent); color: var(--accent-ink); }
+  .btn-ghost { color: var(--fg); border-color: var(--line); }
+  .btn:focus-visible, .copy:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+
+  /* Hero */
+  header.hero { padding: 64px 0 48px; }
+  .hero-grid { display: grid; gap: 48px; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr); align-items: center; }
+  .lede { font-size: 1.2rem; color: var(--muted); max-width: 34em; margin-top: 22px; }
+  .route {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 22px; min-width: 0;
+  }
+  .route-head { font: 500 0.78rem/1 var(--mono); color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 14px; }
+  .route-row {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center;
+    gap: 12px; padding: 11px 0; border-top: 1px solid var(--line); min-width: 0;
+  }
+  .route-row:first-of-type { border-top: 0; }
+  .route-url { font: 500 0.9rem/1.3 var(--mono); overflow-wrap: anywhere; }
+  .route-arrow { color: var(--accent); font-family: var(--mono); }
+  .route-to { font-size: 0.95rem; color: var(--muted); }
+
+  /* Trust strip: the stores the client works with, from the README */
+  .trust {
+    display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: center;
+    padding: 22px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+    color: var(--muted); font-size: 0.95rem;
+  }
+  .trust b { font-family: var(--mono); font-weight: 500; color: var(--fg); font-size: 0.9rem; }
+
+  /* Screenshot */
+  .shot { margin: 56px 0 0; }
+  .shot-frame {
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    background: var(--surface); box-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.6);
+  }
+  .shot-frame img { display: block; width: 100%; max-width: 100%; height: auto; }
+  .shot figcaption { color: var(--muted); font-size: 0.95rem; margin-top: 14px; max-width: 46em; }
+
+  section { padding: 88px 0 0; }
+  .section-head { display: grid; gap: 14px; margin-bottom: 36px; max-width: 46em; }
+  .section-head p { color: var(--muted); font-size: 1.1rem; }
+
+  /* Routing table */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+  table { width: 100%; border-collapse: collapse; min-width: 560px; background: var(--surface); }
+  th, td { text-align: left; padding: 15px 18px; border-top: 1px solid var(--line); vertical-align: top; }
+  th { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); border-top: 0; }
+  td:first-child { font-family: var(--mono); font-size: 0.92rem; }
+
+  /* Lanes */
+  .lanes { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
+  .lane {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 28px; display: flex; flex-direction: column; gap: 18px; min-width: 0;
+  }
+  .lane .who { font: 500 0.78rem/1 var(--mono); color: var(--accent); letter-spacing: 0.1em; text-transform: uppercase; }
+  .lane ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 14px; }
+  .lane li { padding-left: 22px; position: relative; }
+  .lane li::before {
+    content: ""; position: absolute; left: 0; top: 0.62em; width: 9px; height: 9px;
+    border-radius: 2px; background: var(--accent);
+  }
+  .lane li strong { display: block; font-weight: 600; }
+  .lane li span { color: var(--muted); font-size: 0.97rem; }
+  .sample {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; overflow-x: auto; font: 400 0.84rem/1.6 var(--mono); margin: 0;
+  }
+  .sample .c { color: var(--muted); }
+  .sample .k { color: var(--accent); }
+  .lane-cta { margin-top: auto; display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 0.95rem; }
+  .lane-cta a { text-decoration: none; font-weight: 600; }
+
+  /* Encryption band */
+  .band {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 18px;
+    padding: clamp(28px, 5vw, 56px); display: grid; gap: 36px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .checks { display: grid; gap: 16px; margin: 0; padding: 0; list-style: none; }
+  .checks li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 12px; }
+  .checks li::before { content: "✓"; color: var(--ok); font-weight: 700; }
+  .checks strong { display: block; font-weight: 600; }
+  .checks span { color: var(--muted); }
+
+  /* FAQ */
+  .faq { display: grid; gap: 10px; max-width: 52em; }
+  .faq details { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 0 20px; }
+  .faq summary {
+    cursor: pointer; list-style: none; padding: 18px 0; font-weight: 600;
+    display: flex; justify-content: space-between; gap: 16px;
+  }
+  .faq summary::-webkit-details-marker { display: none; }
+  .faq summary::after { content: "+"; color: var(--accent); font-family: var(--mono); }
+  .faq details[open] summary::after { content: "–"; }
+  .faq details p { color: var(--muted); padding: 0 0 18px; }
+
+  /* Install with copy buttons */
+  .install { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }
+  .install-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; min-width: 0; }
+  .install-card h3 { font-size: 1.15rem; font-weight: 600; margin-bottom: 12px; font-family: var(--text); }
+  .install-card pre {
+    margin: 0 0 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px; overflow-x: auto; line-height: 1.7; white-space: pre;
+  }
+  .copy {
+    font: 500 0.85rem/1 var(--text); padding: 9px 14px; border-radius: 8px; cursor: pointer;
+    background: transparent; color: var(--fg); border: 1px solid var(--line);
+  }
+  .copy:hover { border-color: var(--accent); }
+  .notes { color: var(--muted); font-size: 0.95rem; margin-top: 18px; max-width: 52em; }
+
+  footer { margin-top: 96px; padding: 32px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.95rem; }
+  footer a { color: var(--fg); }
+
+  @media (max-width: 860px) {
+    .hero-grid, .band { grid-template-columns: minmax(0, 1fr); }
+    header.hero { padding: 40px 0 32px; }
+    section { padding-top: 64px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="wrap">
+
+<nav class="nav" aria-label="Page">
+  <a class="brand" href="#top">Object Storage Client</a>
+  <div class="nav-links">
+    <a href="#routes">Routes</a>
+    <a href="#ways">Ways in</a>
+    <a href="#encryption">Encryption</a>
+    <a href="#faq">FAQ</a>
+    <a href="#install">Install</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="hero-grid">
+    <div>
+      <span class="eyebrow">Open source · Rust · Python</span>
+      <h1>One URL for every object store.</h1>
+      <p class="lede">Copy, move, stream and sign objects across AWS S3, Google Cloud Storage,
+        Azure Blob Storage and local disks. Turn on encryption and the provider stores only ciphertext.</p>
+      <div class="actions">
+        <a class="btn btn-solid" href="https://github.com/bixority/object-storage-client/releases">Download</a>
+        <a class="btn btn-ghost" href="https://github.com/bixority/object-storage-client#readme">Read the docs</a>
+      </div>
+    </div>
+    <div class="route" aria-label="URL schemes and the backends they reach">
+      <div class="route-head">Scheme decides the backend</div>
+      <div class="route-row"><span class="route-url">s3://bucket/key</span><span class="route-arrow">→</span><span class="route-to">AWS S3 and S3-compatible stores</span></div>
+      <div class="route-row"><span class="route-url">gs://bucket/key</span><span class="route-arrow">→</span><span class="route-to">Google Cloud Storage</span></div>
+      <div class="route-row"><span class="route-url">az://container/key</span><span class="route-arrow">→</span><span class="route-to">Azure Blob Storage</span></div>
+      <div class="route-row"><span class="route-url">https://host/path</span><span class="route-arrow">→</span><span class="route-to">HTTP and HTTPS</span></div>
+      <div class="route-row"><span class="route-url">~/path/file</span><span class="route-arrow">→</span><span class="route-to">Local filesystem</span></div>
+    </div>
+  </div>
+
+  <div class="trust" style="margin-top:48px">
+    <span>Works with</span>
+    <b>AWS S3</b><b>Garage</b><b>SeaweedFS</b><b>Google Cloud Storage</b><b>Azure Blob</b><b>HTTP(S)</b><b>local disk</b>
+  </div>
+
+  <figure class="shot">
+    <div class="shot-frame">
+      <img src="images/osc-gui.png" alt="osc-gui with Local in the left panel and an S3 bucket in the right panel, archived objects greyed out">
+    </div>
+    <figcaption>Two panels, any two connections. Copy from a bucket to a laptop folder, or across clouds, with the
+      key and TLS state of each panel in view. Archived objects are greyed out until they are restored.</figcaption>
+  </figure>
+</header>
+
+<section id="routes">
+  <div class="section-head">
+    <span class="eyebrow">Routes</span>
+    <h2>Move data between clouds without changing tools.</h2>
+    <p>One client reads and writes every backend. The same calls work whichever store sits behind the URL,
+      so a migration is a loop, not a rewrite.</p>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>URL</th><th>Backend</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>s3://bucket/key</td><td>AWS S3 and S3-compatible stores</td><td>AWS profiles and SSO, plus Garage or SeaweedFS endpoints</td></tr>
+        <tr><td>gs:// or gcs://</td><td>Google Cloud Storage</td><td>Application default credentials and service accounts</td></tr>
+        <tr><td>az://, wasb(s)://, abfs(s)://</td><td>Azure Blob Storage</td><td>Container and key in the path</td></tr>
+        <tr><td>http:// and https://</td><td>HTTP and HTTPS</td><td>Any web endpoint, addressed by URL</td></tr>
+        <tr><td>file:///path, /path, ~/path</td><td>Local filesystem</td><td>The same API for a working copy on disk</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="ways">
+  <div class="section-head">
+    <span class="eyebrow">Three ways in</span>
+    <h2>Point and click, script it, or build on it.</h2>
+    <p>Pick the surface that fits your work. Each one reaches the same stores with the same encryption.</p>
+  </div>
+  <div class="lanes">
+
+    <div class="lane">
+      <span class="who">osc-gui · desktop</span>
+      <h3>Browse and copy in two panels.</h3>
+      <ul>
+        <li><strong>Two panels, any pair of connections</strong><span>Copy, move, rename and delete objects and whole folders within a panel or between clouds.</span></li>
+        <li><strong>Your connections are already there</strong><span>AWS profiles and SSO sessions, Google credentials and Azure CLI logins are found at startup.</span></li>
+        <li><strong>Security at a glance</strong><span>A key icon for encryption, and a shield, warning or dot for each panel's TLS state.</span></li>
+        <li><strong>Storage class in view</strong><span>Archived objects are greyed out and restoring ones are marked.</span></li>
+        <li><strong>Installs like an app</strong><span>A macOS disk image, a .deb for Debian and Ubuntu, an .rpm for Fedora and RHEL.</span></li>
+      </ul>
+      <div class="lane-cta"><a href="https://github.com/bixority/object-storage-client/releases">Download the app →</a></div>
+    </div>
+
+    <div class="lane">
+      <span class="who">osc · command line</span>
+      <h3>The same commands on every provider.</h3>
+      <ul>
+        <li><strong>One command set everywhere</strong><span>put, get, ls, cp, mv, rm, exists and mb on s3://, gs://, az://, HTTP and local paths.</span></li>
+        <li><strong>Copy between clouds in one step</strong><span>Source and destination can be different providers.</span></li>
+        <li><strong>Large files through a pipe</strong><span>get-stream writes to stdout in bounded memory.</span></li>
+        <li><strong>Pre-signed links</strong><span>osc sign makes download and upload URLs, with length and type checks on S3 uploads.</span></li>
+        <li><strong>Encryption and profiles on the flag</strong><span>--keyring encrypts and decrypts; --profile picks an AWS profile.</span></li>
+      </ul>
+      <pre class="sample"><span class="c"># copy between providers, encrypted</span>
+<span class="k">osc</span> --keyring keyring cp s3://src/report.csv az://dst/report.csv</pre>
+      <div class="lane-cta"><a href="#install">Install the CLI →</a></div>
+    </div>
+
+    <div class="lane">
+      <span class="who">Rust · Python</span>
+      <h3>One API in your code.</h3>
+      <ul>
+        <li><strong>One API, many backends</strong><span>The URL scheme picks the backend. put, get and list work everywhere.</span></li>
+        <li><strong>Streams without holding the file</strong><span>get_stream feeds put_stream, so large objects never sit in memory whole.</span></li>
+        <li><strong>Cross-provider copy and move</strong><span>One client moves an object from S3 to GCS to Azure.</span></li>
+        <li><strong>Encryption you can audit</strong><span>Authenticated encryption, self-reloading keyrings and key rotation. Python never sees the key bytes.</span></li>
+        <li><strong>Install from the registry</strong><span>pip for Python wheels, or a Cargo dependency. Leave out the CLI with default-features = false.</span></li>
+      </ul>
+      <pre class="sample"><span class="k">from</span> object_storage_client <span class="k">import</span> ObjectStorageClient
+
+client = ObjectStorageClient()
+<span class="k">await</span> client.copy_object(<span class="c">"s3://a/x.bin"</span>, <span class="c">"gs://b/x.bin"</span>)</pre>
+      <div class="lane-cta"><a href="https://github.com/bixority/object-storage-client#python">Python guide →</a><a href="https://github.com/bixority/object-storage-client#rust">Rust guide →</a></div>
+    </div>
+
+  </div>
+</section>
+
+<section id="encryption">
+  <div class="band">
+    <div>
+      <span class="eyebrow">Encryption</span>
+      <h2>Encrypted before it leaves your machine.</h2>
+      <p class="muted" style="margin-top:18px">Keys stay with you, and the provider stores only ciphertext.
+        Rotation adds the new key first, then moves objects over.</p>
+    </div>
+    <ul class="checks">
+      <li><div><strong>Authenticated encryption</strong><span>Every object is checked before it is returned. A tampered object fails.</span></div></li>
+      <li><div><strong>Keyrings that reload themselves</strong><span>Add or retire a key without restarting the app or the service.</span></div></li>
+      <li><div><strong>Refuse plaintext</strong><span>--require-encryption makes put, get and sign fail when no keyring is set.</span></div></li>
+      <li><div><strong>Keys from a file or a command</strong><span>A keyring can come from a command, so it never touches disk.</span></div></li>
+    </ul>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="section-head">
+    <span class="eyebrow">FAQ</span>
+    <h2>Questions before you install.</h2>
+  </div>
+  <div class="faq">
+    <details>
+      <summary>Is encryption on by default?</summary>
+      <p>No. Encryption needs a keyring. Create one with <code>osc keyring new</code>, or point the client at a keyring file or command. Without one, objects are stored as sent.</p>
+    </details>
+    <details>
+      <summary>Which platforms are supported?</summary>
+      <p>The CLI and Python wheels cover Linux on x86_64 and aarch64, macOS on Apple silicon, and Windows on x86_64. The GUI runs on macOS (Apple silicon) and on Linux with a Wayland session; X11 is not supported.</p>
+    </details>
+    <details>
+      <summary>Does it work with S3-compatible stores?</summary>
+      <p>Yes. Any S3-compatible endpoint works through the s3:// scheme, including Garage and SeaweedFS.</p>
+    </details>
+    <details>
+      <summary>Do pre-signed links keep working after my SSO session ends?</summary>
+      <p>No. A link signed with temporary credentials stops working when that session ends, whatever expiry was requested.</p>
+    </details>
+    <details>
+      <summary>Is the macOS app signed?</summary>
+      <p>Not with an Apple Developer ID. On first launch, open System Settings, go to Privacy &amp; Security, and choose Open Anyway.</p>
+    </details>
+  </div>
+</section>
+
+<section id="install">
+  <div class="section-head">
+    <span class="eyebrow">Get it</span>
+    <h2>Install in one line.</h2>
+  </div>
+  <div class="install">
+    <div class="install-card">
+      <h3>Command line and GUI</h3>
+      <pre><code id="cmd-cargo">export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
+cargo install object-storage-client --registry bixority --features gui</code></pre>
+      <button class="copy" type="button" data-target="cmd-cargo">Copy</button>
+    </div>
+    <div class="install-card">
+      <h3>Python</h3>
+      <pre><code id="cmd-pip">pip install object-storage-client</code></pre>
+      <button class="copy" type="button" data-target="cmd-pip">Copy</button>
+    </div>
+  </div>
+  <p class="notes">The GUI needs a Wayland session on Linux. The macOS disk image is not signed with an Apple Developer ID.</p>
+</section>
+
+<footer>
+  Object Storage Client is open source. Releases on
+  <a href="https://github.com/bixority/object-storage-client/releases">GitHub</a>,
+  source on <a href="https://codeberg.org/bixority/object-storage-client">Codeberg</a>.
+</footer>
+
+</div>
+
+<script>
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var text = document.getElementById(btn.dataset.target).textContent;
+      var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1600); };
+      try {
+        navigator.clipboard.writeText(text).then(done, function () { btn.textContent = "Select and copy"; });
+      } catch (e) {
+        btn.textContent = "Select and copy";
+      }
+    });
+  });
+</script>

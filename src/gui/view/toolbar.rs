@@ -30,7 +30,7 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(security::encryption_icon(state.encryption))
+            ui.label(egui::RichText::new(security::encryption_icon(state.encryption)).monospace())
                 .on_hover_text(security::encryption_hover(state.encryption));
         });
     });

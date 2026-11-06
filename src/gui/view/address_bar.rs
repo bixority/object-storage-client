@@ -15,7 +15,7 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, side: Side, actions: &mu
     let panel = &state.panels[side.index()];
     ui.horizontal(|ui| {
         let tls = security::tls_state(&panel.connection);
-        ui.label(security::tls_icon(tls))
+        ui.label(egui::RichText::new(security::tls_icon(tls)).monospace())
             .on_hover_text(security::tls_hover(tls));
         egui::ComboBox::from_id_salt(("osc-gui connection", side.index()))
             .selected_text(display::text(&panel.connection.label))

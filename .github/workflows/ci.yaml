@@ -17,6 +17,21 @@ concurrency:
 
 jobs:
 
+  # Advisories and yanks change over time, so a release re-checks them.
+  deny:
+    name: cargo deny (advisories, bans, sources)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans sources
+          arguments: --all-features
+
   test:
     # Stable only: a beta or nightly compiler problem must not block a release.
     name: Test
@@ -61,21 +76,6 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-  # Advisories and yanks change over time, so a release re-checks them.
-  deny:
-    name: cargo deny (advisories, bans, sources)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check advisories bans sources
-          arguments: --all-features
 
   build-wheels:
     name: Build wheels (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }} / py${{ matrix.python }})
@@ -305,11 +305,32 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download artifacts
+      # Only the wheels and the sdist: the desktop packages from build-linux
+      # and build-macos are in this run too, and must not reach PyPI.
+      - name: Download wheels
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: wheels-*
           path: dist
           merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sdist
+          path: dist
+          merge-multiple: true
+
+      - name: Check that only Python distributions are present
+        run: |
+          set -euo pipefail
+          extra=$(find dist -type f ! -name '*.whl' ! -name '*.tar.gz')
+          if [ -n "$extra" ]; then
+            echo "error: non-Python files in dist/, refusing to publish:" >&2
+            echo "$extra" >&2
+            exit 1
+          fi
+          ls -l dist
 
       # Trusted Publishing (OIDC): no stored token. Also uploads PEP 740 attestations.
       - name: Publish to PyPI

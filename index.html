@@ -1,4 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Object Storage Client</title>
+<meta name="description" content="Copy, move, stream and sign objects across S3, Google Cloud Storage, Azure Blob Storage and local disks, with optional client-side encryption.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Object Storage Client">
+<meta property="og:title" content="Object Storage Client: one URL for every object store">
+<meta property="og:description" content="Copy, move, stream and sign objects across S3, Google Cloud Storage, Azure Blob Storage and local disks, with optional client-side encryption.">
+<meta property="og:url" content="https://bixority.github.io/object-storage-client/">
+<meta property="og:image" content="https://bixority.github.io/object-storage-client/images/osc-gui.png">
+<meta property="og:image:alt" content="osc-gui with Local in the left panel and an S3 bucket in the right panel">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Object Storage Client: one URL for every object store">
+<meta name="twitter:description" content="Copy, move, stream and sign objects across S3, Google Cloud Storage, Azure Blob Storage and local disks, with optional client-side encryption.">
+<meta name="twitter:image" content="https://bixority.github.io/object-storage-client/images/osc-gui.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -182,19 +199,27 @@
   .faq details[open] summary::after { content: "–"; }
   .faq details p { color: var(--muted); padding: 0 0 18px; }
 
-  /* Install with copy buttons */
+  /* Install: command blocks with a copy icon in the corner */
   .install { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }
-  .install-card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 20px; min-width: 0; }
-  .install-card h3 { font-size: 1.15rem; font-weight: 600; margin-bottom: 12px; font-family: var(--text); }
-  .install-card pre {
-    margin: 0 0 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 14px; overflow-x: auto; line-height: 1.7; white-space: pre;
+  .cmd { min-width: 0; }
+  .cmd-label { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
+  .cmd-box {
+    position: relative; background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .cmd-box pre {
+    margin: 0; padding: 18px 64px 18px 18px; overflow-x: auto; white-space: pre;
+    font: 400 0.9rem/1.7 var(--mono); color: var(--fg);
   }
   .copy {
-    font: 500 0.85rem/1 var(--text); padding: 9px 14px; border-radius: 8px; cursor: pointer;
-    background: transparent; color: var(--fg); border: 1px solid var(--line);
+    position: absolute; top: 10px; right: 10px; width: 36px; height: 36px; border-radius: 8px;
+    display: grid; place-items: center; cursor: pointer; padding: 0;
+    background: var(--bg); color: var(--muted); border: 1px solid var(--line);
   }
-  .copy:hover { border-color: var(--accent); }
+  .copy:hover { color: var(--fg); border-color: var(--accent); }
+  .copy svg { width: 16px; height: 16px; }
+  .copy .ok { display: none; color: var(--ok); }
+  .copy.done .ok { display: block; }
+  .copy.done .clip { display: none; }
   .notes { color: var(--muted); font-size: 0.95rem; margin-top: 18px; max-width: 52em; }
 
   footer { margin-top: 96px; padding: 32px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.95rem; }
@@ -207,6 +232,8 @@
   }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
+</head>
+<body>
 
 <div class="wrap">
 
@@ -217,7 +244,6 @@
     <a href="#ways">Ways in</a>
     <a href="#encryption">Encryption</a>
     <a href="#faq">FAQ</a>
-    <a href="#install">Install</a>
   </div>
 </nav>
 
@@ -309,7 +335,7 @@
         <li><strong>Pre-signed links</strong><span>osc sign makes download and upload URLs, with length and type checks on S3 uploads.</span></li>
         <li><strong>Encryption and profiles on the flag</strong><span>--keyring encrypts and decrypts; --profile picks an AWS profile.</span></li>
       </ul>
-      <div class="lane-cta"><a href="#install">Install the CLI →</a></div>
+      <div class="lane-cta"><a href="https://github.com/bixority/object-storage-client#cli-osc">Install the CLI →</a></div>
     </div>
 
     <div class="lane">
@@ -374,26 +400,6 @@
   </div>
 </section>
 
-<section id="install">
-  <div class="section-head">
-    <span class="eyebrow">Get it</span>
-    <h2>Install in one line.</h2>
-  </div>
-  <div class="install">
-    <div class="install-card">
-      <h3>Command line and GUI</h3>
-      <pre><code id="cmd-cargo">export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
-cargo install object-storage-client --registry bixority --features gui</code></pre>
-      <button class="copy" type="button" data-target="cmd-cargo">Copy</button>
-    </div>
-    <div class="install-card">
-      <h3>Python</h3>
-      <pre><code id="cmd-pip">pip install object-storage-client</code></pre>
-      <button class="copy" type="button" data-target="cmd-pip">Copy</button>
-    </div>
-  </div>
-  <p class="notes">The GUI needs a Wayland session on Linux. The macOS disk image is not signed with an Apple Developer ID.</p>
-</section>
 
 <footer>
   Object Storage Client is open source. Releases on
@@ -407,12 +413,18 @@ cargo install object-storage-client --registry bixority --features gui</code></p
   document.querySelectorAll(".copy").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var text = document.getElementById(btn.dataset.target).textContent;
-      var done = function () { btn.textContent = "Copied"; setTimeout(function () { btn.textContent = "Copy"; }, 1600); };
+      var done = function () {
+        btn.classList.add("done");
+        setTimeout(function () { btn.classList.remove("done"); }, 1600);
+      };
       try {
-        navigator.clipboard.writeText(text).then(done, function () { btn.textContent = "Select and copy"; });
+        navigator.clipboard.writeText(text).then(done, function () { btn.setAttribute("aria-label", "Select the command and copy it"); });
       } catch (e) {
-        btn.textContent = "Select and copy";
+        btn.setAttribute("aria-label", "Select the command and copy it");
       }
     });
   });
 </script>
+
+</body>
+</html>

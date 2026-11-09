@@ -12,113 +12,127 @@
 <meta property="og:url" content="https://bixority.github.io/object-storage-client/">
 <meta property="og:image" content="https://bixority.github.io/object-storage-client/images/osc-gui.png">
 <meta property="og:image:alt" content="osc-gui with two panels side by side, each with a connection selector">
+<meta name="theme-color" content="#001b35" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#e3e6e9" media="(prefers-color-scheme: light)">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Object Storage Client: one URL for every object store">
 <meta name="twitter:description" content="Copy, move, stream and sign objects across S3, Google Cloud Storage, Azure Blob Storage and local disks, with optional client-side encryption.">
 <meta name="twitter:image" content="https://bixority.github.io/object-storage-client/images/osc-gui.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="preload" href="fonts/geist-latin.woff2" as="font" type="font/woff2" crossorigin>
 <style>
-  /* Layout: nav, hero with routing card, trust strip, screenshot, routing table,
-     three audience lanes with their own CTAs, encryption band, FAQ, install with copy buttons. */
-  :root {
-    --bg: #0c0f14;
-    --surface: #141a22;
-    --line: #242d39;
-    --fg: #e8edf3;
-    --muted: #8d99aa;
-    --accent: #ffb84d;
-    --accent-ink: #1a1203;
-    --ok: #7fe3b4;
-    --display: "Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
-    --text: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
-    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    color-scheme: dark;
+  /* The Bixority theme, as on www.bixority.com: brand navy (dark) or the "aluminium room" (light), chosen by the
+     system; Geist and Geist Mono, self-hosted (SIL Open Font License 1.1, see fonts/OFL-*.txt); no third-party
+     requests. Space separates the parts, not rules. */
+  @font-face {
+    font-family: "Geist"; font-style: normal; font-weight: 100 900; font-display: swap;
+    src: url("fonts/geist-latin-ext.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
   }
+  @font-face {
+    font-family: "Geist"; font-style: normal; font-weight: 100 900; font-display: swap;
+    src: url("fonts/geist-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+  @font-face {
+    font-family: "Geist Mono"; font-style: normal; font-weight: 100 900; font-display: swap;
+    src: url("fonts/geist-mono-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+  }
+
+  /* role tokens; default: the stage (brand navy) */
+  :root {
+    color-scheme: dark;
+    --bg: #001b35;       /* the ground */
+    --surface: #062745;  /* a panel or a code box, one step up from the ground */
+    --well: #001427;     /* a code sample inside a panel */
+    --fg: #eef2f6;       /* ink: 15.45 : 1 */
+    --muted: #8aa0b6;    /* the second voice: 6.44 : 1 */
+    --accent: #00ccff;   /* hover underline, focus ring, arrows: 9.17 : 1 */
+    --line: #0097c2;     /* resting link underline: 5.14 : 1 */
+    --lime: #ccff00;     /* the mark's lime: the primary button, the checks */
+    --lime-ink: #001b35;
+    --ok: #ccff00;
+    --logo-dark: block; --logo-light: none;
+    --sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+    --mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  /* the light variant, "the aluminium room" */
   @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      --bg: #f5f6f8;
-      --surface: #ffffff;
-      --line: #d9dee6;
-      --fg: #10141a;
-      --muted: #5a6474;
-      --accent: #a85e00;
-      --accent-ink: #ffffff;
-      --ok: #137a50;
+    :root {
       color-scheme: light;
+      --bg: #e3e6e9; --surface: #d6dbe0; --well: #eef1f3;
+      --fg: #001b35; --muted: #4a5664; --accent: #006b85; --line: #006b85;
+      --lime: #ccff00; --lime-ink: #001b35; --ok: #4d6b00;
+      --logo-dark: none; --logo-light: block;
     }
   }
-  :root[data-theme="light"] {
-    --bg: #f5f6f8;
-    --surface: #ffffff;
-    --line: #d9dee6;
-    --fg: #10141a;
-    --muted: #5a6474;
-    --accent: #a85e00;
-    --accent-ink: #ffffff;
-    --ok: #137a50;
-    color-scheme: light;
+  @media (prefers-contrast: more) {
+    :root:root:root { --muted: var(--fg); }
+    a { text-decoration-thickness: 2px; }
   }
+
   * { box-sizing: border-box; }
+  html { background: var(--bg); -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--fg);
-    font: 17px/1.6 var(--text);
+    font: 400 17px/1.55 var(--sans);
+    font-kerning: normal;
     padding-left: max(20px, env(safe-area-inset-left, 0px));
     padding-right: max(20px, env(safe-area-inset-right, 0px));
     -webkit-font-smoothing: antialiased;
   }
   .wrap { max-width: 1120px; margin: 0 auto; }
-  h1, h2, h3 { font-family: var(--display); letter-spacing: -0.02em; line-height: 1.08; text-wrap: balance; margin: 0; }
-  h1 { font-size: clamp(2.5rem, 6.4vw, 4.6rem); font-weight: 700; }
-  h2 { font-size: clamp(1.9rem, 3.6vw, 2.8rem); font-weight: 700; }
-  h3 { font-size: 1.45rem; font-weight: 500; }
+  h1, h2, h3 { font-family: var(--sans); font-weight: 600; letter-spacing: -0.03em; line-height: 1.06; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(2.5rem, 6.2vw, 4.5rem); letter-spacing: -0.045em; line-height: .98; }
+  h2 { font-size: clamp(1.9rem, 3.4vw, 2.75rem); }
+  h3 { font-size: 1.4rem; font-weight: 500; letter-spacing: -0.02em; line-height: 1.15; }
   p { margin: 0; }
-  a { color: var(--accent); }
-  .eyebrow {
-    font: 500 0.8rem/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase;
-    color: var(--accent); margin-bottom: 18px; display: block;
+  a {
+    color: inherit; text-decoration: underline; text-decoration-color: var(--line);
+    text-decoration-thickness: 1px; text-underline-offset: .22em;
   }
+  a:hover { text-decoration-color: var(--accent); text-decoration-thickness: 2px; }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; border-radius: 2px; }
+  /* a section's name: a quiet word above its heading, in the text's own case */
+  .eyebrow { display: block; font: 500 1rem/1.3 var(--sans); color: var(--muted); margin-bottom: 14px; }
   .muted { color: var(--muted); }
   code, pre, .mono { font-family: var(--mono); font-size: 0.88em; }
-  code { background: var(--surface); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; }
+  code { background: var(--surface); padding: 1px 6px; border-radius: 3px; }
 
   /* Nav */
   .nav {
     display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
-    gap: 12px 24px; padding: 18px 0; border-bottom: 1px solid var(--line);
+    gap: 12px 28px; padding: 22px 0;
   }
-  .brand { font-family: var(--display); font-weight: 700; font-size: 1.1rem; color: var(--fg); text-decoration: none; }
-  .nav-links { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.95rem; }
-  .nav-links a { color: var(--muted); text-decoration: none; }
-  .nav-links a:hover { color: var(--fg); }
+  .brand { font-weight: 600; font-size: 1.1rem; letter-spacing: -0.02em; color: var(--fg); text-decoration: none; }
+  .nav-links { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 0.95rem; }
+  .nav-links a { color: var(--fg); text-decoration: none; }
+  .nav-links a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
 
-  /* Buttons */
-  .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
-  .btn {
-    display: inline-block; padding: 13px 22px; border-radius: 999px;
-    font-weight: 600; text-decoration: none; border: 1px solid var(--accent);
+  /* Buttons: the primary in the mark's lime, the secondary a plain link */
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 28px; margin-top: 36px; }
+  .btn { display: inline-block; font-weight: 600; text-decoration: none; }
+  .btn-solid {
+    padding: 13px 24px; border-radius: 2px;
+    background: var(--lime); color: var(--lime-ink);
   }
-  .btn-solid { background: var(--accent); color: var(--accent-ink); }
-  .btn-ghost { color: var(--fg); border-color: var(--line); }
-  .btn:focus-visible, .copy:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+  .btn-solid:hover { background: #e2ff66; }
+  .btn-ghost { color: var(--fg); text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: .22em; }
+  .btn-ghost:hover { text-decoration-color: var(--accent); text-decoration-thickness: 2px; }
+  .btn:focus-visible, .copy:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 4px; }
 
   /* Hero */
-  header.hero { padding: 64px 0 48px; }
-  .hero-grid { display: grid; gap: 48px; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr); align-items: center; }
-  .lede { font-size: 1.2rem; color: var(--muted); max-width: 34em; margin-top: 22px; }
-  .route {
-    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
-    padding: 22px; min-width: 0;
-  }
-  .route-head { font: 500 0.78rem/1 var(--mono); color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 14px; }
+  header.hero { padding: 72px 0 48px; }
+  .hero-grid { display: grid; gap: 56px; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr); align-items: center; }
+  .lede { font-size: clamp(1.125rem, 1rem + .45vw, 1.375rem); line-height: 1.45; color: var(--muted); max-width: 34ch; margin-top: 24px; text-wrap: pretty; }
+  .route { background: var(--surface); border-radius: 4px; padding: 24px; min-width: 0; }
+  .route-head { font: 500 0.95rem/1.3 var(--sans); color: var(--muted); margin-bottom: 10px; }
   .route-row {
     display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center;
-    gap: 12px; padding: 11px 0; border-top: 1px solid var(--line); min-width: 0;
+    gap: 12px; padding: 10px 0; min-width: 0;
   }
-  .route-row:first-of-type { border-top: 0; }
   .route-url { font: 500 0.9rem/1.3 var(--mono); overflow-wrap: anywhere; }
   .route-arrow { color: var(--accent); font-family: var(--mono); }
   .route-to { font-size: 0.95rem; color: var(--muted); }
@@ -126,58 +140,57 @@
   /* Trust strip: the stores the client works with, from the README */
   .trust {
     display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: center;
-    padding: 22px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
-    color: var(--muted); font-size: 0.95rem;
+    padding: 8px 0; color: var(--muted); font-size: 0.95rem;
   }
   .trust b { font-family: var(--mono); font-weight: 500; color: var(--fg); font-size: 0.9rem; }
 
   /* Screenshot */
   .shot { margin: 56px 0 0; }
-  .shot-frame {
-    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
-    background: var(--surface); box-shadow: 0 30px 80px -40px rgba(0, 0, 0, 0.6);
-  }
+  .shot-frame { border-radius: 6px; overflow: hidden; background: var(--surface); box-shadow: 0 30px 80px -40px rgba(0, 9, 19, 0.7); }
   .shot-frame img { display: block; width: 100%; max-width: 100%; height: auto; }
-  .shot figcaption { color: var(--muted); font-size: 0.95rem; margin-top: 14px; max-width: 46em; }
+  .shot figcaption { color: var(--muted); font-size: 0.95rem; margin-top: 16px; max-width: 46em; }
 
-  section { padding: 88px 0 0; }
-  .section-head { display: grid; gap: 14px; margin-bottom: 36px; max-width: 46em; }
+  section { padding: 104px 0 0; }
+  .section-head { display: grid; gap: 14px; margin-bottom: 40px; max-width: 46em; }
+  .section-head .eyebrow { margin-bottom: 0; }
   .section-head p { color: var(--muted); font-size: 1.1rem; }
 
   /* Routing table */
-  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+  .table-wrap { overflow-x: auto; border-radius: 4px; }
   table { width: 100%; border-collapse: collapse; min-width: 560px; background: var(--surface); }
-  th, td { text-align: left; padding: 15px 18px; border-top: 1px solid var(--line); vertical-align: top; }
-  th { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); border-top: 0; }
+  th, td { text-align: left; padding: 15px 20px; vertical-align: top; }
+  tbody tr:nth-child(odd) td { background: color-mix(in srgb, var(--surface) 70%, var(--bg)); }
+  th { font: 500 0.95rem/1.3 var(--sans); color: var(--muted); }
   td:first-child { font-family: var(--mono); font-size: 0.92rem; }
 
   /* Lanes */
   .lanes { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); }
   .lane {
-    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    background: var(--surface); border-radius: 4px;
     padding: 28px; display: flex; flex-direction: column; gap: 18px; min-width: 0;
   }
-  .lane .who { font: 500 0.78rem/1 var(--mono); color: var(--accent); letter-spacing: 0.1em; text-transform: uppercase; }
+  .lane .who { font: 500 0.95rem/1.3 var(--mono); color: var(--accent); }
   .lane ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 14px; }
   .lane li { padding-left: 22px; position: relative; }
+  /* the up-right corner of the website's lists */
   .lane li::before {
-    content: ""; position: absolute; left: 0; top: 0.62em; width: 9px; height: 9px;
-    border-radius: 2px; background: var(--accent);
+    content: ""; position: absolute; left: 0; top: 0.5em; width: 8px; height: 8px;
+    border-top: 2px solid var(--accent); border-right: 2px solid var(--accent);
   }
   .lane li strong { display: block; font-weight: 600; }
   .lane li span { color: var(--muted); font-size: 0.97rem; }
   .sample {
-    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+    background: var(--well); border-radius: 3px;
     padding: 14px 16px; overflow-x: auto; font: 400 0.84rem/1.6 var(--mono); margin: 0;
   }
   .sample .c { color: var(--muted); }
   .sample .k { color: var(--accent); }
-  .lane-cta { margin-top: auto; display: flex; flex-wrap: wrap; gap: 10px 16px; font-size: 0.95rem; }
-  .lane-cta a { text-decoration: none; font-weight: 600; }
+  .lane-cta { margin-top: auto; display: flex; flex-wrap: wrap; gap: 10px 20px; font-size: 0.95rem; }
+  .lane-cta a { font-weight: 600; }
 
   /* Encryption band */
   .band {
-    background: var(--surface); border: 1px solid var(--line); border-radius: 18px;
+    background: var(--surface); border-radius: 4px;
     padding: clamp(28px, 5vw, 56px); display: grid; gap: 36px;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   }
@@ -188,8 +201,8 @@
   .checks span { color: var(--muted); }
 
   /* FAQ */
-  .faq { display: grid; gap: 10px; }
-  .faq details { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 0 20px; }
+  .faq { display: grid; gap: 8px; }
+  .faq details { background: var(--surface); border-radius: 4px; padding: 0 22px; }
   .faq summary {
     cursor: pointer; list-style: none; padding: 18px 0; font-weight: 600;
     display: flex; justify-content: space-between; gap: 16px;
@@ -202,33 +215,41 @@
   /* Install: command blocks with a copy icon in the corner */
   .install { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); }
   .cmd { min-width: 0; }
-  .cmd-label { font: 500 0.78rem/1 var(--mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; }
-  .cmd-box {
-    position: relative; background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
-  }
+  .cmd-label { font: 500 0.95rem/1.3 var(--sans); color: var(--muted); margin-bottom: 12px; }
+  .cmd-box { position: relative; background: var(--surface); border-radius: 4px; }
   .cmd-box pre {
     margin: 0; padding: 18px 64px 18px 18px; overflow-x: auto; white-space: pre;
     font: 400 0.9rem/1.7 var(--mono); color: var(--fg);
   }
   .copy {
-    position: absolute; top: 10px; right: 10px; width: 36px; height: 36px; border-radius: 8px;
+    position: absolute; top: 10px; right: 10px; width: 36px; height: 36px; border-radius: 3px;
     display: grid; place-items: center; cursor: pointer; padding: 0;
-    background: var(--bg); color: var(--muted); border: 1px solid var(--line);
+    background: var(--well); color: var(--muted); border: 0;
   }
-  .copy:hover { color: var(--fg); border-color: var(--accent); }
+  .copy:hover { color: var(--accent); }
   .copy svg { width: 16px; height: 16px; }
   .copy .ok { display: none; color: var(--ok); }
   .copy.done .ok { display: block; }
   .copy.done .clip { display: none; }
   .notes { color: var(--muted); font-size: 0.95rem; margin-top: 18px; max-width: 52em; }
 
-  footer { margin-top: 96px; padding: 32px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.95rem; }
+  /* Footer: the full Bixority logo with its tagline, as on the website */
+  footer {
+    margin-top: 112px; padding: 40px 0 56px; color: var(--muted); font-size: 0.95rem;
+    display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 20px 40px; align-items: center;
+  }
+  footer p { max-width: 52em; }
   footer a { color: var(--fg); }
+  .by { display: block; border-radius: 2px; }
+  .by img { width: 172px; height: auto; display: block; }
+  .by .logo-dark { display: var(--logo-dark); }
+  .by .logo-light { display: var(--logo-light); }
 
   @media (max-width: 860px) {
     .hero-grid, .band { grid-template-columns: minmax(0, 1fr); }
     header.hero { padding: 40px 0 32px; }
-    section { padding-top: 64px; }
+    section { padding-top: 72px; }
+    footer { grid-template-columns: minmax(0, 1fr); }
   }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
@@ -402,10 +423,14 @@
 
 
 <footer>
-  Object Storage Client is open source under the
+  <a class="by" href="https://www.bixority.com/">
+    <img class="logo-dark" src="images/bixority-logo.svg" alt="Bixority: because quality matters" width="172" height="64">
+    <img class="logo-light" src="images/bixority-logo-ink.svg" alt="Bixority: because quality matters" width="172" height="64">
+  </a>
+  <p>Object Storage Client is made by Bixority and is open source under the
   <a href="https://codeberg.org/bixority/object-storage-client/src/branch/main/LICENSE">GPL-3.0-only license</a>.
   Releases on <a href="https://github.com/bixority/object-storage-client/releases">GitHub</a>,
-  source on <a href="https://codeberg.org/bixority/object-storage-client">Codeberg</a>.
+  source on <a href="https://codeberg.org/bixority/object-storage-client">Codeberg</a>.</p>
 </footer>
 
 </div>

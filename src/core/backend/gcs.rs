@@ -1,8 +1,9 @@
 //! Google Cloud Storage backend.
 
 use super::{
-    Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response, create_failed,
-    default_timeouts, encode, error_body, request_failed, send_with_retry,
+    Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response,
+    conditional_delete_outcome, create_failed, default_timeouts, delete_plain, encode, error_body,
+    request_failed, send_with_retry,
 };
 #[cfg(feature = "gui")]
 use super::{collect_pages, read_listing};
@@ -473,6 +474,57 @@ impl Backend for GcsBackend {
         Err(Error::Generic(format!(
             "GCS objects.rewrite was not done after {REWRITE_CALLS_MAX} calls; the source was kept"
         )))
+    }
+
+    /// The JSON API `objects.delete`
+    /// (`DELETE /storage/v1/b/<bucket>/o/<object>`) with the backend's bearer
+    /// token and `ifGenerationMatch`, the generation in `read`. A `412` is
+    /// [`Error::SourceChanged`], and `404` is success. Without a generation
+    /// (`0` means "no live object" and is never sent), or on a `501` answer,
+    /// the delete is the plain one of the store. Transient failures are
+    /// retried, see [`send_with_retry`].
+    async fn delete_if_unchanged(&self, path: &ObjectPath, read: &ObjectMeta) -> Result<()> {
+        let Some(generation) = read
+            .version
+            .as_deref()
+            .filter(|v| v.parse::<u64>().is_ok_and(|g| g > 0))
+        else {
+            return delete_plain(self.store().as_ref(), path).await;
+        };
+        let bearer = self.bearer().await?;
+        let uri = format!(
+            "{}/storage/v1/b/{}/o/{}?ifGenerationMatch={}",
+            self.base_url,
+            encode(&self.bucket),
+            encode(path.as_ref()),
+            encode(generation),
+        );
+        let client = self.http.get()?;
+        let response = send_with_retry(|| async {
+            with_bearer(client.delete(&uri), &self.base_url, &bearer)
+                .send()
+                .await
+                .map_err(|e| request_failed("GCS objects.delete request", e))
+        })
+        .await?;
+        let status = response.status();
+        let text = if status.is_success() || status.as_u16() == 404 {
+            String::new()
+        } else {
+            error_body(response).await
+        };
+        let done = conditional_delete_outcome(
+            "GCS objects.delete",
+            status,
+            status.as_u16() == 412,
+            false,
+            &text,
+        )?;
+        if done {
+            Ok(())
+        } else {
+            delete_plain(self.store().as_ref(), path).await
+        }
     }
 
     /// `None` under `skip_signature`: the store's signer would read the
@@ -1059,6 +1111,81 @@ mod tests {
                 .expect_err("no project");
             assert!(err.to_string().contains("GOOGLE_CLOUD_PROJECT"), "{err}");
             assert!(stub.requests().is_empty());
+        }
+    }
+
+    /// `delete_if_unchanged` of `a b/c` against a stub answering `replies`.
+    async fn conditional_delete(
+        replies: Vec<Reply>,
+        read: &ObjectMeta,
+    ) -> (Result<()>, Vec<Request>) {
+        let stub = serve(replies).await;
+        // The store, which a plain delete goes through, talks to the stub too.
+        let mut pairs = rewrite_vars(&stub.base);
+        pairs.push(("GOOGLE_BASE_URL", &stub.base));
+        let dst = GcsBackend::with_shared(
+            "gs",
+            Some("bkt"),
+            &Vars::from_pairs(&pairs),
+            &Shared::default(),
+        )
+        .expect("build");
+        let result = dst
+            .delete_if_unchanged(&ObjectPath::from("a b/c"), read)
+            .await;
+        (result, stub.requests())
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_carries_the_generation() {
+        let (done, requests) =
+            conditional_delete(vec![Reply::new(204, "")], &meta(Some("1234"))).await;
+        done.expect("delete");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].line,
+            "DELETE /storage/v1/b/bkt/o/a%20b%2Fc?ifGenerationMatch=1234 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_maps_the_answers() {
+        let read = meta(Some("7"));
+        let (done, requests) = conditional_delete(vec![Reply::new(412, "{}")], &read).await;
+        let err = done.expect_err("changed");
+        assert!(
+            matches!(&err, Error::SourceChanged { url } if url.is_empty()),
+            "{err:?}"
+        );
+        assert_eq!(requests.len(), 1);
+        let (done, _) = conditional_delete(vec![Reply::new(404, "{}")], &read).await;
+        done.expect("gone");
+        let (done, _) = conditional_delete(vec![Reply::new(409, "{}")], &read).await;
+        assert!(matches!(done.expect_err("409"), Error::Generic(_)));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_conditional_deletes_gets_a_plain_delete() {
+        let replies = vec![Reply::new(501, ""), Reply::new(204, "")];
+        let (done, requests) = conditional_delete(replies, &meta(Some("7"))).await;
+        done.expect("fallback");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].line.contains("ifGenerationMatch=7"));
+        assert!(!requests[1].line.contains("ifGenerationMatch"));
+    }
+
+    #[tokio::test]
+    async fn a_delete_without_a_usable_generation_is_plain() {
+        for version in [None, Some("0"), Some("abc")] {
+            let (done, requests) =
+                conditional_delete(vec![Reply::new(204, "")], &meta(version)).await;
+            done.expect("delete");
+            assert_eq!(requests.len(), 1, "{version:?}");
+            assert!(requests[0].line.starts_with("DELETE "), "{version:?}");
+            assert!(
+                !requests[0].line.contains("ifGenerationMatch"),
+                "{version:?}"
+            );
         }
     }
 }

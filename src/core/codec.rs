@@ -401,10 +401,13 @@ fn copied_attributes(
 /// alone; one that differs in any metadata field the store provides is kept
 /// and reported as [`Error::SourceChanged`].
 ///
-/// This is a best effort: a rewrite with identical bytes, in the same second,
-/// on a store that reports neither e-tag nor version is indistinguishable
-/// from the original, and a writer can still land between the HEAD and the
-/// delete.
+/// On S3, Azure and GCS the delete itself is conditional on the e-tag (S3,
+/// Azure) or generation (GCS) that was read ([`Backend::delete_if_unchanged`]),
+/// so the gap between the HEAD and the delete is closed there when the store
+/// reported one. Elsewhere, and on servers that answer `501` to the condition,
+/// this is a best effort: a writer can still land between the HEAD and the
+/// delete. A rewrite with identical bytes, in the same second, on a store that
+/// reports neither e-tag nor version is indistinguishable from the original.
 pub(crate) async fn delete_unchanged_source(src: &Resolved, read: &ObjectMeta) -> Result<()> {
     let store = src.backend.store();
     match store.head(&src.loc.path).await {
@@ -417,9 +420,11 @@ pub(crate) async fn delete_unchanged_source(src: &Resolved, read: &ObjectMeta) -
         Err(object_store::Error::NotFound { .. }) => return Ok(()),
         Err(e) => return Err(e.into()),
     }
-    match store.delete(&src.loc.path).await {
-        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-        Err(e) => Err(e.into()),
+    match src.backend.delete_if_unchanged(&src.loc.path, read).await {
+        Err(Error::SourceChanged { .. }) => Err(Error::SourceChanged {
+            url: redacted(&src.loc.url),
+        }),
+        done => done,
     }
 }
 

@@ -1,8 +1,9 @@
 //! Azure Blob Storage backend.
 
 use super::{
-    Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response, create_failed,
-    default_timeouts, error_body, ms_error_code, send_signed, send_with_retry,
+    Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response,
+    conditional_delete_outcome, create_failed, default_timeouts, delete_plain, error_body,
+    ms_error_code, send_signed, send_with_retry,
 };
 #[cfg(feature = "gui")]
 use super::{
@@ -600,6 +601,52 @@ impl Backend for AzureBackend {
         ))
     }
 
+    /// A `Delete Blob` with `If-Match: <e-tag>`, the e-tag in `read`. A `412`
+    /// with the error code `ConditionNotMet` is [`Error::SourceChanged`] (other
+    /// `412`s are lease errors, and a `409` means snapshots exist: errors), and
+    /// `404` is success. No snapshot header is sent, as `object_store`'s own
+    /// delete sends none. Without an e-tag, with
+    /// one that is no header value, or on a `501` or `NotImplemented` answer
+    /// the delete is the plain one of the store. Transient failures are
+    /// retried, see [`send_with_retry`].
+    async fn delete_if_unchanged(&self, path: &ObjectPath, read: &ObjectMeta) -> Result<()> {
+        let Some(etag) = read
+            .e_tag
+            .as_deref()
+            .and_then(|etag| http::HeaderValue::from_str(etag).ok())
+        else {
+            return delete_plain(self.store().as_ref(), path).await;
+        };
+        let headers = [("If-Match", etag)];
+        let client = self.http.get()?;
+        let response = send_with_retry(|| async {
+            let request = self
+                .blob_request_with(Method::DELETE, path, &headers)
+                .await?;
+            send_signed(client, request).await
+        })
+        .await?;
+        let status = response.status();
+        let code = crate::text::escape(ms_error_code(response.headers()).unwrap_or_default(), 64);
+        let text = if status.is_success() || status.as_u16() == 404 {
+            String::new()
+        } else {
+            format!("{code} {}", error_body(response).await)
+        };
+        let done = conditional_delete_outcome(
+            "Azure Delete Blob",
+            status,
+            status.as_u16() == 412 && code == "ConditionNotMet",
+            code == "NotImplemented",
+            &text,
+        )?;
+        if done {
+            Ok(())
+        } else {
+            delete_plain(self.store().as_ref(), path).await
+        }
+    }
+
     /// Waits for the `Copy Blob` that wrote `path` to finish. Azure may answer
     /// it `202` with `x-ms-copy-status: pending` and finish later, which
     /// `object_store` does not see. The destination is polled with
@@ -985,7 +1032,7 @@ mod tests {
                 "HEAD /acct/c/d/e",
                 "HEAD /acct/c/d/e",
                 "HEAD /acct/c/a%20b",
-                "POST /acct/c?restype=container&comp=batch"
+                "DELETE /acct/c/a%20b"
             ]
         );
     }
@@ -1325,7 +1372,7 @@ mod tests {
                 "HEAD /acct/dst/d/e",
                 "HEAD /acct/dst/d/e",
                 "HEAD /acct/src/a",
-                "POST /acct/src?restype=container&comp=batch"
+                "DELETE /acct/src/a"
             ]
         );
     }
@@ -1632,5 +1679,78 @@ mod tests {
             let err = pages.remove(0).expect_err("denied");
             assert!(matches!(err, Error::Denied(_)), "{err:?}");
         }
+    }
+
+    /// `delete_if_unchanged` of `a b` against a stub answering `replies`.
+    async fn conditional_delete(
+        replies: Vec<Reply>,
+        read: &ObjectMeta,
+    ) -> (Result<()>, Vec<crate::backend::stub::Request>) {
+        let stub = serve(replies).await;
+        let (dst, _) = copy_pair(&stub.base);
+        let result = dst
+            .delete_if_unchanged(&ObjectPath::from("a b"), read)
+            .await;
+        (result, stub.requests())
+    }
+
+    fn no_match(headers: &str) -> bool {
+        !headers.to_ascii_lowercase().contains("if-match")
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_carries_the_etag() {
+        let (done, requests) =
+            conditional_delete(vec![Reply::new(202, "")], &known("\"0x1\"")).await;
+        done.expect("delete");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].line, "DELETE /acct/dst/a%20b HTTP/1.1");
+        let headers = requests[0].headers.to_ascii_lowercase();
+        assert!(headers.contains("if-match: \"0x1\""), "{headers}");
+        assert!(headers.contains("authorization: sharedkey"), "{headers}");
+        assert!(!headers.contains("x-ms-delete-snapshots"), "{headers}");
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_maps_the_answers() {
+        let read = known("\"0x1\"");
+        let code = |status, code| Reply::new(status, "").header("x-ms-error-code", code);
+        let (done, requests) = conditional_delete(vec![code(412, "ConditionNotMet")], &read).await;
+        let err = done.expect_err("changed");
+        assert!(
+            matches!(&err, Error::SourceChanged { url } if url.is_empty()),
+            "{err:?}"
+        );
+        assert_eq!(requests.len(), 1);
+        let (done, _) = conditional_delete(vec![code(404, "BlobNotFound")], &read).await;
+        done.expect("gone");
+        // A lease error and a blob with snapshots are plain errors.
+        let (done, _) = conditional_delete(vec![code(412, "LeaseIdMissing")], &read).await;
+        assert!(matches!(done.expect_err("lease"), Error::Generic(_)));
+        let (done, _) = conditional_delete(vec![code(409, "SnapshotsPresent")], &read).await;
+        assert!(matches!(done.expect_err("409"), Error::Generic(_)));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_conditional_deletes_gets_a_plain_delete() {
+        let read = known("\"0x1\"");
+        let (done, requests) =
+            conditional_delete(vec![Reply::new(501, ""), batch_deleted()], &read).await;
+        done.expect("fallback");
+        assert_eq!(requests.len(), 2);
+        assert!(!no_match(&requests[0].headers));
+        assert!(requests[1].line.starts_with("POST "));
+        assert!(no_match(&requests[1].headers));
+    }
+
+    #[tokio::test]
+    async fn a_delete_without_an_etag_is_plain() {
+        let mut read = known("x");
+        read.e_tag = None;
+        let (done, requests) = conditional_delete(vec![batch_deleted()], &read).await;
+        done.expect("delete");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].line.starts_with("POST "));
+        assert!(no_match(&requests[0].headers));
     }
 }

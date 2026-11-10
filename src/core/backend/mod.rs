@@ -40,7 +40,7 @@ use object_store::client::HttpRequest;
 use object_store::gcp::{GcpCredentialProvider, GcpSigningCredentialProvider};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
-use object_store::{ClientConfigKey, ObjectMeta, ObjectStore};
+use object_store::{ClientConfigKey, ObjectMeta, ObjectStore, ObjectStoreExt};
 #[cfg(feature = "gui")]
 pub use s3::{PROFILE_ENDPOINT_REFUSED, S3Backend};
 use std::collections::HashMap;
@@ -378,6 +378,24 @@ pub trait Backend: Send + Sync {
         _known: Option<&ObjectMeta>,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Deletes `path`, but only if it is still the object that `read` describes:
+    /// the provider rejects the `DELETE` when the e-tag (S3, Azure) or the
+    /// generation (GCS) differs, which closes the gap between the caller's
+    /// `HEAD` and this call. An object that is gone is not an error.
+    ///
+    /// The default, and the fallback of the overrides when `read` has no e-tag
+    /// or generation, or the server does not support the condition, is the
+    /// plain `delete` of the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provider refused or failed the delete, and
+    /// [`Error::SourceChanged`] (with an empty URL, which the caller fills in)
+    /// if the object no longer matches `read`.
+    async fn delete_if_unchanged(&self, path: &ObjectPath, _read: &ObjectMeta) -> Result<()> {
+        delete_plain(self.store().as_ref(), path).await
     }
 
     /// The `object_store` signer for host-only pre-signing, if the store has one.
@@ -827,6 +845,40 @@ fn xml_unescape(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The plain, unconditional delete of `path`; an object that is gone is fine.
+async fn delete_plain(store: &dyn ObjectStore, path: &ObjectPath) -> Result<()> {
+    match store.delete(path).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// What a conditional `DELETE` (see [`Backend::delete_if_unchanged`]) was
+/// answered with: `true` when the object is deleted or already gone (`2xx`,
+/// `404`), `false` when the server does not support the condition (`501`, or
+/// `unsupported`, an error code saying so) and the caller falls back to a plain
+/// delete. A failed condition (`changed`, which the provider's answer decides)
+/// is [`Error::SourceChanged`] with an empty URL. `text` is the escaped error
+/// body, for the other errors of `what`.
+fn conditional_delete_outcome(
+    what: &str,
+    status: reqwest::StatusCode,
+    changed: bool,
+    unsupported: bool,
+    text: &str,
+) -> Result<bool> {
+    if status.is_success() || status.as_u16() == 404 {
+        return Ok(true);
+    }
+    if status.as_u16() == 501 || unsupported {
+        return Ok(false);
+    }
+    if changed {
+        return Err(Error::SourceChanged { url: String::new() });
+    }
+    Err(create_failed(what, status, text))
 }
 
 /// How many times a copy request is sent at most.

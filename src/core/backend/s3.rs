@@ -3,8 +3,8 @@
 use super::aws_profile;
 use super::{
     AwsProfile, Backend, BucketClient, Shared, Transport, Vars, bucket_exists_from_response,
-    create_failed, default_timeouts, error_body, parse_bool, read_document, redact_error_body,
-    send_signed, send_with_retry,
+    conditional_delete_outcome, create_failed, default_timeouts, delete_plain, error_body,
+    parse_bool, read_document, redact_error_body, send_signed, send_with_retry,
 };
 #[cfg(feature = "gui")]
 use super::{
@@ -827,6 +827,52 @@ impl Backend for S3Backend {
             error_body(response).await
         };
         copy_outcome(status, &text)
+    }
+
+    /// A signed `DELETE` of the object with `If-Match: <e-tag>`, the e-tag in
+    /// `read`, signed with the other headers (unsigned when the store skips
+    /// signing). The server rejects it when the object changed: `412`, or `409`
+    /// when a concurrent write or delete won, is [`Error::SourceChanged`], and
+    /// `404` is success. Without an e-tag, with one that is no header value, or
+    /// on a `501` or `NotImplemented` answer (a server without conditional
+    /// deletes) the delete is the plain one of the store. Transient failures
+    /// are retried, see [`send_with_retry`].
+    async fn delete_if_unchanged(&self, path: &ObjectPath, read: &ObjectMeta) -> Result<()> {
+        let Some(etag) = read
+            .e_tag
+            .as_deref()
+            .filter(|etag| http::HeaderValue::from_str(etag).is_ok())
+        else {
+            return delete_plain(self.store().as_ref(), path).await;
+        };
+        let uri = self.object_uri(path);
+        let client = self.http.get()?;
+        let response = send_with_retry(|| async {
+            let request = self
+                .signed_request_with(Method::DELETE, &uri, Bytes::new(), &[("if-match", etag)])
+                .await?;
+            send_signed(client, request).await
+        })
+        .await?;
+        let status = response.status();
+        let text = if status.is_success() || status.as_u16() == 404 {
+            String::new()
+        } else {
+            crate::text::escape(&error_body(response).await, 4096)
+        };
+        let code = |code: &str| text.contains(&format!("<Code>{code}</Code>"));
+        let done = conditional_delete_outcome(
+            "S3 DeleteObject",
+            status,
+            matches!(status.as_u16(), 409 | 412) || code("PreconditionFailed"),
+            code("NotImplemented"),
+            &text,
+        )?;
+        if done {
+            Ok(())
+        } else {
+            delete_plain(self.store().as_ref(), path).await
+        }
     }
 
     /// Issues an S3 `CreateBucket` request, signed with `object_store`'s
@@ -2300,10 +2346,7 @@ mod tests {
             Reply::new(200, COPY_RESULT),
             head_reply(),
             head_reply(),
-            Reply::new(
-                200,
-                "<DeleteResult><Deleted><Key>a</Key></Deleted></DeleteResult>",
-            ),
+            Reply::new(204, ""),
         ];
         let (done, lines) = copy_through_codec(replies, true).await;
         assert!(done.expect("move"));
@@ -2314,7 +2357,7 @@ mod tests {
                 "PUT /bkt/b",
                 "HEAD /bkt/b",
                 "HEAD /src/a",
-                "POST /src?delete"
+                "DELETE /src/a"
             ]
         );
     }
@@ -2811,5 +2854,126 @@ mod tests {
             let err = stubbed(&stub.base).list_page(&dir(""), 10, None).await;
             assert!(matches!(err, Err(Error::Generic(_))));
         }
+    }
+
+    /// The answer to the multi-object delete a plain delete of the store sends.
+    fn delete_result() -> Reply {
+        Reply::new(
+            200,
+            "<DeleteResult><Deleted><Key>a</Key></Deleted></DeleteResult>",
+        )
+    }
+
+    /// `delete_if_unchanged` of `a b/c` against a stub answering `replies`.
+    async fn conditional_delete(
+        replies: Vec<Reply>,
+        read: &ObjectMeta,
+    ) -> (Result<()>, Vec<Request>) {
+        let stub = serve(replies).await;
+        let (dst, _) = copy_pair(&stub.base);
+        let result = dst
+            .delete_if_unchanged(&ObjectPath::from("a b/c"), read)
+            .await;
+        (result, stub.requests())
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_signs_the_if_match_header() {
+        let (done, requests) =
+            conditional_delete(vec![Reply::new(204, "")], &meta(Some("\"abc\""))).await;
+        done.expect("delete");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].line, "DELETE /bkt/a%20b/c HTTP/1.1");
+        let headers = requests[0].headers.to_ascii_lowercase();
+        assert!(headers.contains("if-match: \"abc\""), "{headers}");
+        let auth = headers
+            .lines()
+            .find(|l| l.starts_with("authorization:"))
+            .expect("authorization");
+        let signed = auth.split("signedheaders=").nth(1).expect("signed headers");
+        assert!(
+            signed
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .contains("if-match"),
+            "{auth}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_delete_maps_the_answers() {
+        let read = meta(Some("\"abc\""));
+        let failed = error_document("PreconditionFailed", "no");
+        for status in [412, 409] {
+            let (done, requests) =
+                conditional_delete(vec![Reply::new(status, failed.clone())], &read).await;
+            let err = done.expect_err("changed");
+            assert!(
+                matches!(&err, Error::SourceChanged { url } if url.is_empty()),
+                "{err:?}"
+            );
+            assert_eq!(requests.len(), 1);
+        }
+        let (done, _) = conditional_delete(
+            vec![Reply::new(404, error_document("NoSuchKey", "x"))],
+            &read,
+        )
+        .await;
+        done.expect("gone");
+        let denied = error_document("AccessDenied", "no");
+        let (done, _) = conditional_delete(vec![Reply::new(403, denied)], &read).await;
+        assert!(matches!(done.expect_err("403"), Error::Denied(_)));
+    }
+
+    #[tokio::test]
+    async fn a_server_without_conditional_deletes_gets_a_plain_delete() {
+        let read = meta(Some("\"abc\""));
+        let replies = vec![Reply::new(501, ""), delete_result()];
+        let (done, requests) = conditional_delete(replies, &read).await;
+        done.expect("fallback");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0]
+                .headers
+                .to_ascii_lowercase()
+                .contains("if-match")
+        );
+        assert!(requests[1].line.starts_with("POST /bkt?delete"));
+        assert!(
+            !requests[1]
+                .headers
+                .to_ascii_lowercase()
+                .contains("if-match")
+        );
+
+        let not_implemented = error_document("NotImplemented", "no");
+        let replies = vec![Reply::new(400, not_implemented), delete_result()];
+        let (done, requests) = conditional_delete(replies, &read).await;
+        done.expect("fallback");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_delete_without_an_etag_is_plain() {
+        let (done, requests) = conditional_delete(vec![delete_result()], &meta(None)).await;
+        done.expect("delete");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0]
+                .headers
+                .to_ascii_lowercase()
+                .contains("if-match")
+        );
+        let (done, requests) =
+            conditional_delete(vec![delete_result()], &meta(Some("bad\nvalue"))).await;
+        done.expect("delete");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !requests[0]
+                .headers
+                .to_ascii_lowercase()
+                .contains("if-match")
+        );
     }
 }

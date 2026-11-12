@@ -24,9 +24,9 @@ classifiers = [
 keywords = ["object-store", "s3", "gcs", "azure", "python"]
 
 [project.urls]
-Homepage = "https://github.com/bixority/object-storage-client"
-Repository = "https://github.com/bixority/object-storage-client"
-Documentation = "https://github.com/bixority/object-storage-client/blob/main/README.md"
+Homepage = "https://codeberg.org/bixority/object-storage-client"
+Repository = "https://codeberg.org/bixority/object-storage-client"
+Documentation = "https://codeberg.org/bixority/object-storage-client/src/branch/main/README.md"
 
 [tool.maturin]
 # Explicit: with a [[bin]] target and no cdylib in [lib], maturin would guess bin bindings.

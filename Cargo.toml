@@ -8,7 +8,7 @@ keywords = ["object-store", "s3", "gcs", "azure", "python"]
 license = "GPL-3.0-only"
 name = "object-storage-client"
 readme = "README.md"
-repository = "https://github.com/bixority/object-storage-client"
+repository = "https://codeberg.org/bixority/object-storage-client"
 version = "0.4.10"
 
 [lib]

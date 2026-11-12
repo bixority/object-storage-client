@@ -1,0 +1,16 @@
+name: Pages
+on:
+  push:
+    branches: [main]
+jobs:
+  publish:
+    runs-on: codeberg-tiny
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/git-pages@v2
+        with:
+          site: https://bixority.codeberg.page/object-storage-client/
+          token: ${{ forgejo.token }}
+          source: site/
+          strict: true
+          comment: ${{ forgejo.sha }}

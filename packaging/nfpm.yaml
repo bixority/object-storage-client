@@ -11,7 +11,7 @@ maintainer: Olegs Korsaks <olegs.korsaks@bixority.com>
 description: |
   Client for S3-compatible object storage (osc command line tool and osc-gui).
 vendor: Bixority
-homepage: https://github.com/bixority/object-storage-client
+homepage: https://codeberg.org/bixority/object-storage-client
 license: GPL-3.0-only
 
 contents:

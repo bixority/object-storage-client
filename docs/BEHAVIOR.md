@@ -475,7 +475,7 @@ below describe Unix.
   forked after the runtime started raises `RuntimeError` instead of hanging.
 - Platforms: wheels exist for GIL CPython 3.13-3.15 on manylinux
   x86_64/aarch64, macOS arm64 and Windows x86_64. Other platforms build the
-  sdist with Rust 1.99 or newer. Free-threaded CPython is unsupported: 3.13t
+  sdist with Rust 1.100 or newer. Free-threaded CPython is unsupported: 3.13t
   does not build, and on 3.14t and later importing the module re-enables the
   GIL with a `RuntimeWarning` (the module declares `gil_used`; `ByteStream`'s
   overlap check relies on the GIL).

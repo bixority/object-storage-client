@@ -86,7 +86,7 @@ def rm(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("--osc", default="target/release/osc")
     ap.add_argument("--size-mib", type=int, default=512)
     ap.add_argument("--runs", type=int, default=3)
@@ -129,8 +129,7 @@ def measure(osc, work, args):
     src = work / "big.bin"
     block = os.urandom(MIB)
     with open(src, "wb") as f:
-        for _ in range(args.size_mib):
-            f.write(block)
+        f.writelines(block for _ in range(args.size_mib))
     store, out = work / "store", work / "out"
     store.mkdir()
     out.mkdir()

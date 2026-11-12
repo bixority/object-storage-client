@@ -28,7 +28,6 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Starts the GUI: opens the key source, then the window. Returns 1 when the
 /// keys or the window could not be opened.
-#[must_use]
 pub fn run(args: &Args) -> ExitCode {
     let runtime = match crate::cli::build_runtime() {
         Ok(runtime) => runtime,

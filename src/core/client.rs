@@ -1626,7 +1626,7 @@ async fn delete_batch(
     for (index, path) in targets {
         let indexes = waiting.entry(path.clone()).or_default();
         if indexes.is_empty() {
-            order.push(path.clone());
+            order.push(path);
         }
         indexes.push(index);
     }

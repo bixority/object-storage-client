@@ -316,7 +316,7 @@ pip install object-storage-client
 ```
 
 Wheels exist for GIL CPython 3.13-3.15 on manylinux x86_64/aarch64, macOS arm64
-and Windows x86_64; other platforms build the sdist and need Rust 1.99 or
+and Windows x86_64; other platforms build the sdist and need Rust 1.100 or
 newer. Free-threaded CPython is unsupported: 3.13t does not build, and on 3.14t
 and later importing the module re-enables the GIL with a `RuntimeWarning`.
 

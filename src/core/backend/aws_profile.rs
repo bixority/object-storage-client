@@ -713,8 +713,7 @@ mod tests {
             let body = request
                 .body()
                 .bytes()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default();
+                .map_or_else(String::new, |b| String::from_utf8_lossy(b).into_owned());
             self.seen.lock().expect("lock").push(Seen {
                 authorization,
                 body,

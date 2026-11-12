@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.99+ (edition 2024)
+- Rust 1.100+ (edition 2024)
 - Python 3.13.9 to 3.15 and [uv](https://docs.astral.sh/uv/) for the bindings;
   `uv sync --group dev` installs maturin 1.15+, pytest, testcontainers, ruff,
   ty and pyright
@@ -129,7 +129,7 @@ otherwise a `--locked` check of the fuzz crate fails.
   lockfile fails the PR; the fuzz crate check does not (see [Fuzzing](#fuzzing)).
   Further jobs:
   - `msrv` runs `cargo check --locked --all-features --all-targets` with Rust
-    1.99, the `rust-version` in `Cargo.toml`.
+    1.100, the `rust-version` in `Cargo.toml`.
   - `tests` runs the Rust suite on Linux and macOS, and on Windows the library
     tests plus a check of every target.
   - `integration` runs the Rust container tests (Garage, Azurite,

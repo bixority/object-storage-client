@@ -27,13 +27,20 @@ import json
 import struct
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 import aws_encryption_sdk
 from aws_encryption_sdk import CommitmentPolicy
-from aws_encryption_sdk.identifiers import Algorithm, EncryptionKeyType, WrappingAlgorithm
-from aws_encryption_sdk.internal.formatting import deserialize
-from aws_encryption_sdk.internal.formatting.encryption_context import serialize_encryption_context
+from aws_encryption_sdk.identifiers import (
+    Algorithm,
+    EncryptionKeyType,
+    WrappingAlgorithm,
+)
 from aws_encryption_sdk.internal.crypto.wrapping_keys import WrappingKey
+from aws_encryption_sdk.internal.formatting import deserialize
+from aws_encryption_sdk.internal.formatting.encryption_context import (
+    serialize_encryption_context,
+)
 from aws_encryption_sdk.key_providers.raw import RawMasterKey
 
 ALGORITHM = Algorithm.AES_256_GCM_HKDF_SHA512_COMMIT_KEY
@@ -90,7 +97,7 @@ def do_encrypt(key_hex, key_name, namespace, frame_length, context, data):
     return ct
 
 
-def fail(msg):
+def fail(msg) -> NoReturn:
     raise SystemExit(f"esdk_oracle: {msg}")
 
 
@@ -165,7 +172,8 @@ def check_edk(edk, key_name, namespace):
 def inspect(data, key_name=None, namespace=DEFAULT_NAMESPACE):
     stream = io.BytesIO(data)
     try:
-        header, _raw = deserialize.deserialize_header(stream)
+        # The SDK returns (MessageHeader, raw bytes); its type comment says otherwise.
+        header, _raw = deserialize.deserialize_header(stream)  # pyright: ignore
         auth = deserialize.deserialize_header_auth(
             header.version, stream, header.algorithm
         )
@@ -237,6 +245,7 @@ def make_vectors(out_dir, append=False):
     out.mkdir(parents=True, exist_ok=True)
     manifest_path = out / "manifest.json"
     entries = []
+    manifest: dict = {}
     if append:
         manifest = json.loads(manifest_path.read_text())
         entries = manifest["vectors"]
@@ -280,7 +289,7 @@ def make_vectors(out_dir, append=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):

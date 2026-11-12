@@ -161,6 +161,10 @@ fn ensure_main_interpreter(py: Python<'_>) -> PyResult<()> {
 /// wait (10 s). Does nothing in a forked child, and
 /// builds no runtime when no call ever started one.
 #[pyfunction]
+#[expect(
+    clippy::used_underscore_items,
+    reason = "the name is the one registered with the module"
+)]
 fn _drain_aborts_at_exit(py: Python<'_>) {
     if RUNTIME_PID.get() != Some(&std::process::id()) {
         return;
@@ -175,6 +179,10 @@ fn _drain_aborts_at_exit(py: Python<'_>) {
 // Built and tested only with the GIL: ByteStream's overlap check is not atomic
 // across threads.
 #[pymodule(gil_used = true)]
+#[expect(
+    clippy::used_underscore_items,
+    reason = "the module name must match the extension file name"
+)]
 fn _object_storage_client(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ensure_main_interpreter(m.py())?;
     m.add_class::<client::ObjectStorageClient>()?;

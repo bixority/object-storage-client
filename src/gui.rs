@@ -11,6 +11,7 @@ pub mod location;
 pub mod model;
 pub mod ops;
 mod startup;
+mod theme;
 mod view;
 mod worker;
 
@@ -49,6 +50,7 @@ pub fn run(args: &Args) -> ExitCode {
         "osc-gui",
         options([1280.0, 760.0]),
         Box::new(move |cc| {
+            style(&cc.egui_ctx);
             let ctx = cc.egui_ctx.clone();
             let repaint: Repaint = Arc::new(move || ctx.request_repaint());
             let host = crate::gui::connection::Host::real();
@@ -85,12 +87,20 @@ fn startup_error(message: &str) -> ExitCode {
     let result = eframe::run_native(
         "osc-gui",
         options([560.0, 240.0]),
-        Box::new(|_| Ok(Box::new(StartupErrorApp { message }))),
+        Box::new(|cc| {
+            style(&cc.egui_ctx);
+            Ok(Box::new(StartupErrorApp { message }))
+        }),
     );
     if let Err(err) = result {
         report(&crate::cli::sanitize(&err.to_string()));
     }
     ExitCode::FAILURE
+}
+
+/// Installs the palette.
+fn style(ctx: &eframe::egui::Context) {
+    theme::install(ctx);
 }
 
 /// Window options; eframe's persistence stays off.

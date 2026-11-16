@@ -5,6 +5,7 @@
 
 mod address_bar;
 mod dialogs;
+mod highlight;
 mod panel;
 mod security;
 mod startup_error;

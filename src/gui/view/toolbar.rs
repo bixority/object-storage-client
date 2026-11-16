@@ -25,7 +25,8 @@ pub(super) fn draw(ui: &mut egui::Ui, state: &AppState, actions: &mut Vec<Action
             ),
         ];
         for (label, enabled, action) in buttons {
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            let response = ui.add_enabled(enabled, egui::Button::new(label));
+            if response.clicked() {
                 actions.push(action);
             }
         }

@@ -322,7 +322,7 @@ fn panel_border_width_does_not_depend_on_focus() {
         let inactive = panel_stroke(&visuals, false);
         assert!((active.width - inactive.width).abs() < f32::EPSILON);
         assert!((active.width - 2.0).abs() < f32::EPSILON);
-        assert_eq!(active.color, visuals.selection.bg_fill);
+        assert_eq!(active.color, visuals.selection.stroke.color);
         assert_eq!(
             inactive.color,
             visuals.widgets.noninteractive.bg_stroke.color
@@ -825,4 +825,23 @@ fn each_object_state_has_its_own_icon_and_hover_text() {
     assert!(hover("❄ blue.bin").contains("Archived (Archive tier): rehydrate it before copying"));
     assert!(hover("⌛ thaw.bin").contains("Restore in progress (GLACIER)"));
     assert!(!hover("🗋 warm.bin").contains("before copying"));
+}
+
+/// Whether a frame painted a band over the full width of a table (wider than
+/// 100 px) filled with `color`: the band of the cursor row.
+fn bar_painted(shapes: &[egui::epaint::ClippedShape], color: egui::Color32) -> bool {
+    shapes.iter().any(|clipped| match &clipped.shape {
+        egui::Shape::Rect(rect) => rect.fill == color && rect.rect.width() > 100.0,
+        _ => false,
+    })
+}
+
+#[test]
+fn the_cursor_band_marks_the_cursor_row_only() {
+    let accent = egui::Visuals::dark().selection.stroke.color;
+    let band = crate::gui::theme::with_alpha(accent, 72);
+    let (_, without) = settled(&state());
+    assert!(!bar_painted(&without, band));
+    let (_, with) = settled(&moved_state());
+    assert!(bar_painted(&with, band));
 }

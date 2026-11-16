@@ -1,6 +1,7 @@
 //! One panel: address bar, banners, the listing table and its footer.
 
 use super::address_bar;
+use super::highlight;
 use crate::backend::ObjectState;
 use crate::gui::action::{Action, SelectOp};
 use crate::gui::connection::Login;
@@ -50,7 +51,7 @@ pub(super) fn desaturate(color: egui::Color32) -> egui::Color32 {
 /// The border of a panel. Only the colour shows which one is active.
 pub(super) fn panel_stroke(visuals: &egui::Visuals, active: bool) -> egui::Stroke {
     let color = if active {
-        visuals.selection.bg_fill
+        visuals.selection.stroke.color
     } else {
         visuals.widgets.noninteractive.bg_stroke.color
     };
@@ -157,14 +158,14 @@ fn table(
     let offset = usize::from(parent);
     // Keyboard motion since the last frame: bring the cursor into view.
     // Clicks never scroll, since they do not count as moves.
+    let cursor_at = panel
+        .cursor
+        .as_ref()
+        .and_then(|cursor| panel.entries.iter().position(|e| e.is(cursor)));
     let mut builder = TableBuilder::new(ui).id_salt(("panel", side.index()));
     if seen_moves(&ctx, side) != Some(panel.cursor_moves) {
         ctx.data_mut(|d| d.insert_temp(seen_moves_id(side), panel.cursor_moves));
-        let at = panel
-            .cursor
-            .as_ref()
-            .and_then(|cursor| panel.entries.iter().position(|e| e.is(cursor)));
-        if let (Some(at), true) = (at, panel.cursor_moves > 0) {
+        if let (Some(at), true) = (cursor_at, panel.cursor_moves > 0) {
             builder = builder.scroll_to_row(at + offset, None);
         }
     }
@@ -208,21 +209,7 @@ fn table(
                 let entry = &panel.entries[index];
                 let name = entry.name();
                 let key = entry.key();
-                row.set_selected(panel.selection.contains(&key));
-                row.col(|ui| name_cell(ui, entry));
-                let (size_text, modified_text) = match entry {
-                    Entry::Folder { .. } | Entry::Link { .. } => (String::new(), String::new()),
-                    Entry::Object { size, modified, .. } => (
-                        human_size(*size),
-                        modified.format("%Y-%m-%d %H:%M").to_string(),
-                    ),
-                };
-                row.col(|ui| {
-                    ui.label(size_text);
-                });
-                row.col(|ui| {
-                    ui.label(modified_text);
-                });
+                entry_cells(&mut row, entry, panel.selection.contains(&key));
                 let response = row.response();
                 if let Entry::Object { state, class, .. } = entry
                     && let Some(reason) = unavailable_reason(*state, class.as_deref())
@@ -247,11 +234,48 @@ fn table(
             });
         });
     let body = output.inner_rect;
+    highlight::draw_cursor_band(
+        ui,
+        cursor_at.map(|at| at + offset),
+        (body, output.state.clamped_offset().y),
+        ROW_HEIGHT,
+        ui.visuals().selection.stroke.color,
+    );
     let rows = (body.height() / (ROW_HEIGHT + spacing)).floor();
     // Truncation is the point: whole rows only, at least one.
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let rows = rows.max(1.0) as usize;
     ctx.data_mut(|d| d.insert_temp(page_rows_id(side), rows));
+}
+
+/// The three cells of the row of `entry`, with the selection fill behind them
+/// when `selected`. egui's own selection fill is off.
+fn entry_cells(row: &mut egui_extras::TableRow<'_, '_>, entry: &Entry, selected: bool) {
+    row.set_selected(false);
+    row.col(|ui| {
+        highlight::draw_row_fill(ui, selected);
+        name_cell(ui, entry);
+    });
+    let (size_text, modified_text) = size_and_modified(entry);
+    row.col(|ui| {
+        highlight::draw_row_fill(ui, selected);
+        ui.label(size_text);
+    });
+    row.col(|ui| {
+        highlight::draw_row_fill(ui, selected);
+        ui.label(modified_text);
+    });
+}
+
+/// The text of the Size and Modified cells of `entry`: empty for a folder.
+fn size_and_modified(entry: &Entry) -> (String, String) {
+    match entry {
+        Entry::Folder { .. } | Entry::Link { .. } => (String::new(), String::new()),
+        Entry::Object { size, modified, .. } => (
+            human_size(*size),
+            modified.format("%Y-%m-%d %H:%M").to_string(),
+        ),
+    }
 }
 
 /// The name cell of a row: icon and name; an archived or restoring object

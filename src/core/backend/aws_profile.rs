@@ -928,6 +928,7 @@ mod tests {
         assert!(!text.contains("169.254.169.254"), "{text}");
     }
 
+    #[cfg(feature = "aws-profile")]
     #[tokio::test]
     async fn an_incomplete_sso_profile_names_the_missing_settings() {
         let creds = creds(
@@ -1048,6 +1049,7 @@ mod tests {
         assert_eq!(capture.0.lock().expect("lock").len(), 0);
     }
 
+    #[cfg(feature = "aws-profile")]
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_stderr_never_reaches_tracing() {
@@ -1118,7 +1120,7 @@ mod tests {
 
     /// A profile whose `credential_process` runs the shell script `body`,
     /// which first creates `<dir>/ran`. Returns the provider and the marker.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "aws-profile"))]
     fn process_profile(
         dir: &std::path::Path,
         body: &str,
@@ -1134,6 +1136,7 @@ mod tests {
         (creds("proc", files(&config)), marker)
     }
 
+    #[cfg(feature = "aws-profile")]
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_success() {
@@ -1149,6 +1152,7 @@ mod tests {
         assert!(marker.exists(), "the helper did not run");
     }
 
+    #[cfg(feature = "aws-profile")]
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_process_failure_is_redacted() {

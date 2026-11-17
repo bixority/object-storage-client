@@ -332,6 +332,7 @@ impl Body for Clamped {
 mod tests {
     use super::*;
     use object_store::aws::AmazonS3Builder;
+    #[cfg(feature = "http")]
     use object_store::http::HttpBuilder;
     use object_store::path::Path;
     use object_store::{ObjectStore, ObjectStoreExt, RetryConfig};
@@ -490,6 +491,7 @@ mod tests {
             .with_http_connector(bounded(403))
             .build()
             .expect("s3");
+        #[cfg(feature = "http")]
         let http = HttpBuilder::new()
             .with_url("http://example.invalid")
             .with_client_options(ClientOptions::new().with_allow_http(true))
@@ -497,7 +499,10 @@ mod tests {
             .with_http_connector(bounded(403))
             .build()
             .expect("http");
-        let stores: [&dyn ObjectStore; 2] = [&s3, &http];
+        #[cfg_attr(not(feature = "http"), allow(unused_mut))]
+        let mut stores: Vec<&dyn ObjectStore> = vec![&s3];
+        #[cfg(feature = "http")]
+        stores.push(&http);
         for store in stores {
             let path = Path::from("k");
             let errors = [

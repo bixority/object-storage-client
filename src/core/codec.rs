@@ -1002,6 +1002,7 @@ mod tests {
     /// A same-origin http copy sends `Overwrite: F`, so a server never
     /// replaces a destination collection; a 412 means the destination exists
     /// and the caller must stream.
+    #[cfg(feature = "http")]
     #[tokio::test]
     async fn http_copy_never_overwrites_and_streams_onto_an_existing_destination() {
         use crate::backend::stub::{Reply, serve};

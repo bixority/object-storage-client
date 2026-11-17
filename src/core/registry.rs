@@ -493,6 +493,7 @@ mod tests {
         assert_eq!(got, ["tmp", "dir a", "x %\u{fc}.bin"]);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn backends_are_keyed_on_scheme_userinfo_host_and_port() {
         let registry = StoreRegistry::default();
@@ -627,6 +628,7 @@ mod tests {
         assert_eq!((a.len(), b.len(), plain.len()), (1, 1, 0));
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn a_pair_of_one_origin_shares_a_backend_in_a_full_cache() {
         let registry = StoreRegistry::with_capacity(1, Vars::map(HashMap::new()));
@@ -648,6 +650,7 @@ mod tests {
         assert_eq!(registry.len(), 1);
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn lru_evicts_the_least_recently_used_backend() {
         let registry = StoreRegistry::with_capacity(2, Vars::map(HashMap::new()));

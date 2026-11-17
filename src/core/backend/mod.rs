@@ -13,10 +13,13 @@
 //! every request.
 
 mod aws_profile;
+#[cfg(feature = "azure")]
 mod azure;
 mod body;
 mod connector;
+#[cfg(feature = "gcs")]
 mod gcs;
+#[cfg(feature = "http")]
 mod http;
 mod local;
 mod s3;
@@ -35,8 +38,10 @@ pub use connector::http_client;
 use connector::{BoundedConnector, BucketClient, ClientCache, SharedConnector, Transport};
 pub use local::fs_path;
 use object_store::aws::AwsCredentialProvider;
+#[cfg(feature = "azure")]
 use object_store::azure::AzureCredentialProvider;
 use object_store::client::HttpRequest;
+#[cfg(feature = "gcs")]
 use object_store::gcp::{GcpCredentialProvider, GcpSigningCredentialProvider};
 use object_store::path::Path as ObjectPath;
 use object_store::signer::Signer;
@@ -67,7 +72,9 @@ use url::Url;
 pub struct Shared {
     clients: Arc<ClientCache>,
     aws: OnceLock<AwsCredentialProvider>,
+    #[cfg(feature = "gcs")]
     gcs: OnceLock<(GcpCredentialProvider, GcpSigningCredentialProvider)>,
+    #[cfg(feature = "azure")]
     azure: OnceLock<AzureCredentialProvider>,
     /// The regions that S3 reported for buckets, see [`BucketRegions`].
     regions: Arc<BucketRegions>,
@@ -194,7 +201,9 @@ pub struct Tls {
 pub fn tls(scheme: &str, vars: &Vars) -> Option<Tls> {
     match scheme {
         "s3" => Some(s3::tls(vars)),
+        #[cfg(feature = "gcs")]
         "gs" | "gcs" => Some(gcs::tls(vars)),
+        #[cfg(feature = "azure")]
         "az" | "wasb" | "wasbs" | "abfs" | "abfss" => Some(azure::tls(vars)),
         _ => None,
     }
@@ -455,16 +464,43 @@ pub fn build(
 
     let backend: Arc<dyn Backend> = match scheme {
         "s3" => Arc::new(s3::S3Backend::with_shared(host, vars, profile, shared)?),
+        #[cfg(feature = "gcs")]
         "gs" | "gcs" => Arc::new(gcs::GcsBackend::with_shared(scheme, host, vars, shared)?),
+        #[cfg(feature = "azure")]
         "az" | "wasb" | "wasbs" | "abfs" | "abfss" => Arc::new(azure::AzureBackend::with_shared(
             scheme, host, vars, shared,
         )?),
+        #[cfg(feature = "http")]
         "http" | "https" => Arc::new(http::HttpBackend::with_shared(scheme, url, shared)?),
         "file" => Arc::new(local::LocalBackend::new()),
-        _ => return Err(Error::UnsupportedScheme(scheme.to_string())),
+        _ => return Err(unsupported_scheme(scheme)),
     };
 
     Ok(backend)
+}
+
+/// The backend feature that serves `scheme`, if any.
+const fn feature_of(scheme: &str) -> Option<&'static str> {
+    match scheme.as_bytes() {
+        b"s3" => Some("s3"),
+        b"gs" | b"gcs" => Some("gcs"),
+        b"az" | b"wasb" | b"wasbs" | b"abfs" | b"abfss" => Some("azure"),
+        b"http" | b"https" => Some("http"),
+        _ => None,
+    }
+}
+
+/// The error for `scheme` when no backend is built for it: an unknown scheme,
+/// or one whose Cargo feature this build leaves out (the error names it).
+fn unsupported_scheme(scheme: &str) -> Error {
+    feature_of(scheme).map_or_else(
+        || Error::UnsupportedScheme(scheme.to_string()),
+        |feature| {
+            Error::UnsupportedScheme(format!(
+                "{scheme} (this build lacks the `{feature}` feature of object-storage-client)"
+            ))
+        },
+    )
 }
 
 /// Interpret the HTTP response of a direct bucket / container existence probe,
@@ -597,17 +633,19 @@ pub async fn list_buckets(
                 .list_buckets()
                 .await
         }
+        #[cfg(feature = "gcs")]
         "gs" | "gcs" => {
             gcs::GcsBackend::with_shared(scheme, host, vars, shared)?
                 .list_buckets()
                 .await
         }
+        #[cfg(feature = "azure")]
         "az" | "wasb" | "wasbs" | "abfs" | "abfss" => {
             azure::AzureBackend::with_shared(scheme, host, vars, shared)?
                 .list_buckets()
                 .await
         }
-        _ => Err(Error::UnsupportedScheme(scheme.to_string())),
+        _ => Err(unsupported_scheme(scheme)),
     }
 }
 
@@ -771,6 +809,7 @@ where
 
 /// `text` as one path segment or query value: everything but unreserved
 /// characters is percent-encoded.
+#[cfg(any(feature = "gcs", all(feature = "azure", feature = "gui")))]
 pub fn encode(text: &str) -> String {
     percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
@@ -1049,6 +1088,18 @@ impl Backend for TestBackend {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_scheme_of_a_missing_backend_names_the_feature() {
+        for (scheme, feature) in [("gs", "gcs"), ("abfss", "azure"), ("https", "http")] {
+            let text = unsupported_scheme(scheme).to_string();
+            assert!(text.contains(&format!("`{feature}` feature")), "{text}");
+        }
+        assert_eq!(
+            unsupported_scheme("ftp").to_string(),
+            "Unsupported scheme: ftp"
+        );
+    }
     use super::*;
 
     #[cfg(feature = "gui")]

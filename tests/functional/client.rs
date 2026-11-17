@@ -18,6 +18,7 @@ fn offline_s3_client() -> ObjectStorageClient {
     ]))
 }
 
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn test_create_bucket_unsupported_scheme() {
     let client = ObjectStorageClient::new();
@@ -29,6 +30,7 @@ async fn test_create_bucket_unsupported_scheme() {
     assert!(matches!(err, Error::BucketCreationUnsupported(scheme) if scheme == "https"));
 }
 
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn test_bucket_exists_unsupported_scheme() {
     let client = ObjectStorageClient::new();
@@ -94,6 +96,7 @@ async fn test_get_pre_signed_urls_rejects_mixed_backends() {
     assert!(matches!(err, Error::InvalidInput(msg) if msg.contains("same backend")));
 }
 
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn test_get_pre_signed_urls_rejects_a_different_port_or_userinfo() {
     async fn sign(urls: &[&str]) -> Error {
@@ -174,6 +177,7 @@ async fn test_concurrent_first_use_builds_one_backend() -> Result<()> {
 
 /// Two names of one origin cannot be told apart by URL; the move streams the
 /// object onto itself and must then keep it, and say so.
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn move_between_two_names_of_one_origin_keeps_the_object() -> Result<()> {
     let server = crate::support::mini_http::Server::start().await;
@@ -195,6 +199,7 @@ async fn move_between_two_names_of_one_origin_keeps_the_object() -> Result<()> {
 }
 
 /// A move across origins still deletes the source.
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn move_between_origins_deletes_the_source() -> Result<()> {
     let (one, two) = (
@@ -1189,6 +1194,7 @@ async fn an_empty_url_list_is_invalid_input() {
     assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
 }
 
+#[cfg(feature = "azure")]
 #[tokio::test]
 async fn content_binding_on_a_non_s3_store_is_invalid_input() {
     use std::collections::HashMap;

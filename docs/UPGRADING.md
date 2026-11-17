@@ -1,5 +1,17 @@
 # Upgrading
 
+## From 0.4.12 to 0.4.13
+
+### Cargo features
+
+- New features `s3`, `gcs`, `azure`, `http` and `aws-profile`, all on by
+  default, and `cli` and `python` imply them, so a default build is unchanged.
+  With `default-features = false`, a build now has no GCS, Azure or HTTP backend
+  and no SSO or `credential_process` support unless you name the features
+  (`features = ["gcs", "azure", "http", "aws-profile"]`). A URL of a backend
+  that is not built fails with `Error::UnsupportedScheme`, which names the
+  missing feature. `s3` is a marker: S3 is always built in.
+
 ## From 0.4.4 to 0.4.9
 
 ### `osc-gui`

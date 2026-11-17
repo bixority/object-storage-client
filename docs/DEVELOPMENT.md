@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.100+ (edition 2024)
+- Rust 1.99+ (edition 2024)
 - Python 3.13.9 to 3.15 and [uv](https://docs.astral.sh/uv/) for the bindings;
   `uv sync --group dev` installs maturin 1.15+, pytest, testcontainers, ruff,
   ty and pyright
@@ -30,17 +30,29 @@ the crate, so CPU tuning (for example `-C target-cpu=native`) belongs in
 | Feature                | Purpose                                                          |
 |------------------------|------------------------------------------------------------------|
 | `encryption` (default) | Client-side encryption                                           |
-| `cli` (default)        | The `osc` binary and its `clap` dependency; implies `encryption` |
+| `cli` (default)        | The `osc` binary and its `clap` dependency; implies `encryption` and every backend |
+| `s3` (default)         | Marker for the S3 backend. `s3://` is always built in, S3 is the base of the crate |
+| `gcs` (default)        | The `gs://` and `gcs://` backend (`object_store/gcp`)            |
+| `azure` (default)      | The `az://`, `wasb(s)://` and `abfs(s)://` backend (`object_store/azure`) |
+| `http` (default)       | The `http://` and `https://` backend (`object_store/http`)       |
+| `aws-profile` (default)| SSO and `credential_process` for named AWS profiles (`aws-config/sso` and `aws-config/credentials-process`) |
 | `gui`                  | The `osc-gui` binary; implies `cli` and `encryption`             |
-| `python`               | The pyo3 bindings, built by maturin                              |
+| `python`               | The pyo3 bindings, built by maturin; implies every backend       |
 | `fuzzing`              | Exposes `encryption::fuzzing` entry points for the `fuzz/` crate |
 
-AWS profile and SSO support is always compiled in; do not gate it behind a
-feature. It is part of every build, the wheel and the
-`default-features = false` library builds included (there is still no `ring`).
+A library that needs one backend can turn the others off, for example
+`default-features = false, features = ["s3"]` links no GCS, Azure or HTTP code
+(and no SSO or `credential_process` support unless `aws-profile` is added). A
+URL whose backend is not compiled in fails with `Error::UnsupportedScheme`,
+which names the missing feature. `file://` is always built in.
+
+Profile support (named profiles with static keys, `role_arn` and the like) is
+always compiled in. Only the SSO and `credential_process` credential sources
+sit behind `aws-profile`; the wheel and the CLI have it on.
 The direct dependencies are
-`aws-config` (with `sso`, `rt-tokio`, `default-https-client` and
-`credentials-process`), `aws-credential-types`, `aws-runtime`, `aws-types` and
+`aws-config` (with `rt-tokio`, `default-https-client` and, behind
+`aws-profile`, `sso` and `credentials-process`), `aws-credential-types`,
+`aws-runtime`, `aws-types` and
 `tracing`; `aws-smithy-runtime-api` and `aws-smithy-types` are dev-dependencies
 of the tests.
 
@@ -66,6 +78,8 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo clippy --locked --all-targets --no-default-features -- -D warnings
 cargo clippy --locked --all-targets --no-default-features --features encryption -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --features s3 -- -D warnings
+cargo clippy --locked --all-targets --no-default-features --features s3,aws-profile -- -D warnings
 cargo clippy --locked --all-targets --no-default-features --features python -- -D warnings
 cargo clippy --locked --all-targets --no-default-features --features cli -- -D warnings
 cargo clippy --locked --all-targets --no-default-features --features gui -- -D warnings
@@ -129,7 +143,7 @@ otherwise a `--locked` check of the fuzz crate fails.
   lockfile fails the PR; the fuzz crate check does not (see [Fuzzing](#fuzzing)).
   Further jobs:
   - `msrv` runs `cargo check --locked --all-features --all-targets` with Rust
-    1.100, the `rust-version` in `Cargo.toml`.
+    1.99, the `rust-version` in `Cargo.toml`.
   - `tests` runs the Rust suite on Linux and macOS, and on Windows the library
     tests plus a check of every target.
   - `integration` runs the Rust container tests (Garage, Azurite,

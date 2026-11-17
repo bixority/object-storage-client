@@ -1714,6 +1714,7 @@ mod tests {
         client().with_s3_profile("dev").expect("a named profile");
     }
 
+    #[cfg(feature = "http")]
     mod webdav_guard {
         use super::*;
         use crate::backend::stub::{Reply, Stub, serve};

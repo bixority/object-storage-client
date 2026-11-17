@@ -200,11 +200,15 @@ object-storage-client = { version = "0.4", registry = "bixority" }
 tokio = { version = "1", features = ["full"] }
 ```
 
-The `encryption` and `cli` features are on by default. A library that does not
-need the CLI can drop `clap` and `tokio-util`:
+The `encryption`, `cli`, `s3`, `gcs`, `azure`, `http` and `aws-profile` features
+are on by default. A library that does not need the CLI can drop `clap` and
+`tokio-util`, and one that uses a single backend can leave the others out (a URL
+of a backend that is not built fails with an error naming the missing feature).
+`aws-profile` adds SSO and `credential_process` for named AWS profiles. S3-only,
+with SSO profiles:
 
 ```toml
-object-storage-client = { version = "0.4", registry = "bixority", default-features = false, features = ["encryption"] }
+object-storage-client = { version = "0.4", registry = "bixority", default-features = false, features = ["encryption", "s3", "aws-profile"] }
 ```
 
 ```rust
@@ -316,7 +320,7 @@ pip install object-storage-client
 ```
 
 Wheels exist for GIL CPython 3.13-3.15 on manylinux x86_64/aarch64, macOS arm64
-and Windows x86_64; other platforms build the sdist and need Rust 1.100 or
+and Windows x86_64; other platforms build the sdist and need Rust 1.99 or
 newer. Free-threaded CPython is unsupported: 3.13t does not build, and on 3.14t
 and later importing the module re-enables the GIL with a `RuntimeWarning`.
 

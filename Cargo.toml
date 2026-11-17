@@ -54,7 +54,7 @@ zeroize = { version = "1", optional = true }
 rustix = { version = "1", features = ["fs", "process"] }
 
 [features]
-default = ["encryption", "cli", "s3", "gcs", "azure", "http", "aws-profile"]
+default = ["encryption", "s3", "gcs", "azure", "http", "aws-profile"]
 # Storage backends. `s3://` and `file://` are always built in: S3 is the base
 # of the crate (pre-signing, AWS profiles, the HTTP connector), so `s3` is a
 # marker that names the backend a dependent uses and turns nothing on. The

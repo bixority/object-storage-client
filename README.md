@@ -89,7 +89,7 @@ RUSTFLAGS="-C target-cpu=native" cargo install object-storage-client --registry 
 RUSTFLAGS="-C target-cpu=native" cargo install --path . --features gui
 ```
 
-The same works for `osc` (drop `--features gui`). The repository does not set
+The same works for `osc` (use `--features cli` in place of `--features gui`). The repository does not set
 this flag itself, so it applies only when you set it.
 
 ### Run
@@ -117,9 +117,9 @@ covers limits and closing behaviour.
 
 ```bash
 export CARGO_REGISTRIES_BIXORITY_INDEX="sparse+https://codeberg.org/api/packages/bixority/cargo/"
-cargo install object-storage-client --registry bixority
-# or: cargo install --git https://codeberg.org/bixority/object-storage-client
-# or, from a checkout: cargo install --path .
+cargo install object-storage-client --registry bixority --features cli
+# or: cargo install --git https://codeberg.org/bixority/object-storage-client --features cli
+# or, from a checkout: cargo install --path . --features cli
 ```
 
 To tune the build for your CPU, see [Build for this machine](#build-for-this-machine)

@@ -11,6 +11,10 @@
   (`features = ["gcs", "azure", "http", "aws-profile"]`). A URL of a backend
   that is not built fails with `Error::UnsupportedScheme`, which names the
   missing feature. `s3` is a marker: S3 is always built in.
+- `cli` is no longer a default feature, so a library dependency no longer
+  pulls in `clap` and the CLI-only tokio features. To build or install the
+  `osc` binary, name it: `cargo install object-storage-client --features cli`
+  (`--features gui` still implies it).
 
 ## From 0.4.4 to 0.4.9
 

@@ -13,7 +13,7 @@
 ## Building
 
 - **Rust library**: `cargo build --release`
-- **CLI**: `cargo build --release --bin osc`
+- **CLI**: `cargo build --release --features cli --bin osc`
 - **Desktop browser**: `cargo build --release --features gui --bin osc-gui`
 - **Python wheel**: `maturin build --release`
 - **Python bindings into the project's virtualenv**:

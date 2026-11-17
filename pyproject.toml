@@ -42,6 +42,7 @@ oracle = ["aws-encryption-sdk>=4,<5"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests/python"]
 addopts = "-m 'not integration'"
 markers = [
@@ -58,4 +59,4 @@ markers = [
 include = ["python/object_storage_client/__init__.py"]
 
 [tool.ty.overrides.rules]
-unresolved-import = "ignore"
+import-not-found = "ignore"

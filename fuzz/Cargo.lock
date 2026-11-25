@@ -163,9 +163,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sigv4"
-version = "1.6.5"
+version = "1.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57a4393e6addc3380632887b0998d06ad5f099ab5c478be0a3eeedecf8604161"
+checksum = "6c5aa04c533733a77879294f1854c27b3715cc50ea71756d1f6a958702b1a9fb"
 dependencies = [
  "aws-credential-types",
  "aws-smithy-http",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "object-storage-client"
-version = "0.4.13"
+version = "0.4.14"
 dependencies = [
  "async-trait",
  "aws-config",
